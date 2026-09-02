@@ -58,6 +58,7 @@ class DenseMlaForwardKernel:
         num_heads: int,
         num_splits: int,
         chunks_per_split: int,
+        single_split_chunks: int,
         query_tile: int,
         uses_query_cache_seqlens: bool,
         sparse_stride: int,
@@ -73,6 +74,7 @@ class DenseMlaForwardKernel:
         self.head_tiles = (self.num_heads + HEADS_PER_TILE - 1) // HEADS_PER_TILE
         self.num_splits = int(num_splits)
         self.chunks_per_split = int(chunks_per_split)
+        self.single_split_chunks = int(single_split_chunks)
         self.query_tile = int(query_tile)
         self.uses_query_cache_seqlens = bool(uses_query_cache_seqlens)
         self.sparse_stride = int(sparse_stride)
@@ -503,19 +505,25 @@ class DenseMlaForwardKernel:
                     self.sparse_stride
                 )
                 selected_chunks = sink + middle_count + recent
-        # Balanced split ranges: the launched splits share this request's
-        # selected chunks evenly, so every launched CTA scans about
-        # selected_chunks / active_splits chunks whatever the live length.
-        # The planned chunks_per_split only sizes the scratch; a fixed range
-        # of chunks per split would leave all but the first
+        # Split ranges. A request whose selected chunks fit within
+        # single_split_chunks is scanned by split 0 alone: one online-softmax
+        # chain in chunk order, written once, which is the fixed-range
+        # association of a kernel that scans chunks_per_split chunks per
+        # split, so those results match it bit for bit. Longer requests share
+        # their chunks evenly over the launched splits, so every launched CTA
+        # scans about selected_chunks / active_splits chunks whatever the
+        # live length; a fixed range per split would leave all but the first
         # selected_chunks / chunks_per_split splits idle on sequences much
-        # shorter than the planned capacity. Splits past the selected
-        # chunks stay empty and publish -inf partials.
+        # shorter than the planned capacity. Splits past the selected chunks
+        # stay empty and publish -inf partials.
         balanced_chunks_per_split = (selected_chunks + active_splits - Int32(1)) // (
             active_splits
         )
         if balanced_chunks_per_split < Int32(1):
             balanced_chunks_per_split = Int32(1)
+        if cutlass.const_expr(self.single_split_chunks > 0):
+            if selected_chunks <= Int32(self.single_split_chunks):
+                balanced_chunks_per_split = Int32(self.single_split_chunks)
         split_first_chunk = split * balanced_chunks_per_split
         split_last_chunk = split_first_chunk + balanced_chunks_per_split
         if split_last_chunk > selected_chunks:
