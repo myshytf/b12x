@@ -503,8 +503,21 @@ class DenseMlaForwardKernel:
                     self.sparse_stride
                 )
                 selected_chunks = sink + middle_count + recent
-        split_first_chunk = split * Int32(self.chunks_per_split)
-        split_last_chunk = split_first_chunk + Int32(self.chunks_per_split)
+        # Balanced split ranges: the launched splits share this request's
+        # selected chunks evenly, so every launched CTA scans about
+        # selected_chunks / active_splits chunks whatever the live length.
+        # The planned chunks_per_split only sizes the scratch; a fixed range
+        # of chunks per split would leave all but the first
+        # selected_chunks / chunks_per_split splits idle on sequences much
+        # shorter than the planned capacity. Splits past the selected
+        # chunks stay empty and publish -inf partials.
+        balanced_chunks_per_split = (selected_chunks + active_splits - Int32(1)) // (
+            active_splits
+        )
+        if balanced_chunks_per_split < Int32(1):
+            balanced_chunks_per_split = Int32(1)
+        split_first_chunk = split * balanced_chunks_per_split
+        split_last_chunk = split_first_chunk + balanced_chunks_per_split
         if split_last_chunk > selected_chunks:
             split_last_chunk = selected_chunks
         active_chunks = split_last_chunk - split_first_chunk
