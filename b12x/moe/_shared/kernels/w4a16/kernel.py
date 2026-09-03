@@ -6598,11 +6598,15 @@ class W4A16FusedMoeKernel:
             self.shared_words = (
                 self.sqg_xor_cheb_t12_smem_off + self.sqg_xor_cheb_t12_smem_region_bytes
             ) // 4
-            if self.shared_words * 4 > int(self.fc1.max_shared_mem):
+            # The typed launch storage appends one 16-byte-aligned Uint64
+            # mbarrier after ``words``. Count that field in both launch
+            # metadata and the opt-in shared-memory capacity check.
+            shared_storage_bytes = self.shared_words * 4 + 16
+            if shared_storage_bytes > int(self.fc1.max_shared_mem):
                 raise ValueError(
                     "fused W4A16 trellis kernel shared memory "
-                    f"{self.shared_words * 4} > {int(self.fc1.max_shared_mem)} bytes "
-                    "with the staged SQG-XOR-Cheb-T12 table"
+                    f"{shared_storage_bytes} > {int(self.fc1.max_shared_mem)} bytes "
+                    "with the staged SQG-XOR-Cheb-T12 table and copy barrier"
                 )
             self.fc1.sqg_xor_cheb_t12_smem = True
             self.fc2.sqg_xor_cheb_t12_smem = True
@@ -10451,7 +10455,7 @@ def compile_w4a16_fused_moe(
         registers_per_thread=registers_per_thread,
         local_memory_bytes=local_memory_bytes,
         cta_threads=kernel.cta_threads,
-        shared_memory_bytes=kernel.shared_words * 4,
+        shared_memory_bytes=kernel.shared_words * 4 + 16,
     )
     _FUSED_CACHE[cache_key] = result
     return result
