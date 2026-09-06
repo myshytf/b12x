@@ -477,7 +477,7 @@ def _k3_fc1_kernel(block: int) -> W4A16GemmKernel:
         block,
         size_n=768,
         size_k=3584,
-        w13_layout="trellis3_t256_proj",
+        w13_layout="trellis_t256_proj",
         dual_a=True,
         route_major_a=True,
     )
@@ -525,7 +525,7 @@ def test_block_96_shared_memory_exceeds_the_sm120_limit_at_every_stage_count() -
     the 101,376 B opt-in limit, and no stage count above two fits once the
     4 KiB modal trellis table is added.
     """
-    two_bpw = _w4a16_b_unit_bytes(weight_layout="trellis3_t256", trellis_bits=2)
+    two_bpw = _w4a16_b_unit_bytes(weight_layout="trellis_t256", trellis_bits=2)
     assert _k3_footprint(96, b_unit_bytes=two_bpw) > _DEFAULT_MAX_SHARED_MEM
     # The kernel's own layout, recomputed for a hypothetical stage count:
     # 1,728 int4 of block metadata plus the aliased B/reduction region, and

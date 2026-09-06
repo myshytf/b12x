@@ -72,9 +72,9 @@ def _fused_kwargs(*, block: int, width: int) -> dict[str, Any]:
         max_m_blocks=2000,
         element_dtype="fp16",
         sms=K3_SMS,
-        weight_layout="trellis3_t256",
+        weight_layout="trellis_t256",
         scale_format="e4m3_k32",
-        w13_layout="trellis3_t256_proj",
+        w13_layout="trellis_t256_proj",
         trellis_bits=2,
         force_tile_config=K3_TILE,
         intermediate_rotation=True,
@@ -192,13 +192,13 @@ def route_block_budget(block: int) -> dict[str, Any]:
     accumulators = _w4a16_accumulator_regs_per_thread(
         cta_m_blocks=cta_m_blocks, tile_n=K3_TILE[1]
     )
-    two_bpw = _w4a16_b_unit_bytes(weight_layout="trellis3_t256", trellis_bits=2)
+    two_bpw = _w4a16_b_unit_bytes(weight_layout="trellis_t256", trellis_bits=2)
     planner_bytes = _shared_memory_footprint(
         cta_m_blocks=cta_m_blocks,
         tile_n=K3_TILE[1],
         tile_k=K3_TILE[0],
         scale_format="e4m3_k32",
-        weight_layout="trellis3_t256",
+        weight_layout="trellis_t256",
         b_unit_bytes=two_bpw,
     )
     # sh_block_route_indices + sh_rd_block_route_indices + sh_block_topk_weights

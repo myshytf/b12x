@@ -193,6 +193,9 @@ def _kernel_cases() -> list[tuple[str, object, dict[str, object], int]]:
                         "BLOCK_ROUTE_INIT": 2048,
                         "BLOCK_M": 128,
                         "SEARCH_STEPS": 8,
+                        # Both storages of the expert histogram: its own slice
+                        # and the packed-slot alias the non-stable layout uses.
+                        "COUNTS_ALIAS_PACKED": has_map,
                     },
                     8,
                 )
