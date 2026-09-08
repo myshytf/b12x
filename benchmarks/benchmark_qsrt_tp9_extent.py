@@ -312,10 +312,7 @@ def main():
         )
         spec = plan.scratch_specs()[0]
         scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-        output = torch.empty(
-            (args.max_tokens, HIDDEN), dtype=torch.float32, device="cuda"
-        )
-        runtimes[width] = (weights, plan, scratch, output, weight_bytes)
+        runtimes[width] = (weights, plan, scratch, weight_bytes)
         print(
             f"width={width} source=[{first},{first + atoms.shape[0]}) "
             f"weight_bytes={weight_bytes} scratch_bytes={scratch.numel() * scratch.element_size()}",
@@ -344,7 +341,7 @@ def main():
         _print_histogram(histogram, args.block_m)
         outputs = {}
         timings: dict[int, float] = {}
-        for width, (weights, plan, scratch, output, _) in runtimes.items():
+        for width, (weights, plan, scratch, _) in runtimes.items():
             binding = fused_moe.bind(
                 plan,
                 scratch=scratch,
@@ -353,7 +350,6 @@ def main():
                 topk_weights=routing,
                 topk_ids=ids,
                 route_expert_map=expert_map,
-                output=output[:m],
             )
             eager = fused_moe.run(binding=binding).clone()
             torch.cuda.synchronize()
