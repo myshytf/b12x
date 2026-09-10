@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -564,20 +565,16 @@ def test_w4a16_prefill_route_reduction_shrinks_caller_owned_scratch(
     routed_rows = 4096 * 16
     fc1_cols = 2 * 192
 
-    assert materialized_specs["intermediate_cache13"].shape == (
-        routed_rows * 7168,
-    )
+    assert materialized_specs["intermediate_cache13"].shape == (routed_rows * 7168,)
     assert "prefill_sum_accum" not in materialized_specs
-    assert fused_specs["intermediate_cache13"].shape == (
-        routed_rows * fc1_cols,
-    )
+    assert fused_specs["intermediate_cache13"].shape == (routed_rows * fc1_cols,)
     assert fused_specs["prefill_sum_accum"].shape == (4096 * 7168,)
     assert fused_specs["prefill_sum_accum"].dtype == torch.float32
-    assert calibrated_specs["intermediate_cache13"].shape == (
-        routed_rows * 7168,
-    )
+    assert calibrated_specs["intermediate_cache13"].shape == (routed_rows * 7168,)
     assert "prefill_sum_accum" not in calibrated_specs
-    assert fused.layout.core_workspace_nbytes < materialized.layout.core_workspace_nbytes
+    assert (
+        fused.layout.core_workspace_nbytes < materialized.layout.core_workspace_nbytes
+    )
 
 
 def test_trellis_scratch_plan_preserves_exact_fixed_capacity(
@@ -587,8 +584,7 @@ def test_trellis_scratch_plan_preserves_exact_fixed_capacity(
     monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 188)
     weight_plan = plan_b12x_fp4_moe_weights(
         quant_modes="w4a16",
-        source_format="btx",
-        trellis_codebook="mcg",
+        source_format="exl3_trellis_mcg",
         activation="silu",
         params_dtype=torch.bfloat16,
         num_experts=256,
@@ -626,6 +622,112 @@ def test_trellis_scratch_plan_preserves_exact_fixed_capacity(
     assert plan.layout.total_nbytes == plan.layout.core_workspace_nbytes
 
 
+def _coupled_qsrt_caps(*, tokens=8, width=384):
+    from b12x.moe._shared.execution import _QSRT_ATOMS_V2_PROFILE_COUPLED_K2
+
+    return TPMoEScratchCaps(
+        max_tokens=tokens,
+        core_token_counts=(tokens,),
+        num_topk=16,
+        route_num_experts=0,
+        device="cpu",
+        weight_plan=plan_b12x_fp4_moe_weights(
+            quant_modes="w4a16",
+            source_format="qsrt_sqg_e4m3",
+            activation="situ",
+            params_dtype=torch.bfloat16,
+            num_experts=16,
+            hidden_size=3584,
+            intermediate_size=width,
+            trellis_bits=2,
+            trellis_tile_config=(128, 128, 128, 128),
+            qsrt_storage_format="qsrt_atoms_v2",
+            qsrt_profile=_QSRT_ATOMS_V2_PROFILE_COUPLED_K2,
+        ),
+        quant_mode="w4a16",
+        w4a16_block_size_m=48,
+        w4a16_shared_input_rotation=True,
+    )
+
+
+@pytest.mark.parametrize("width", (256, 384))
+def test_coupled_qsrt_scratch_reuses_only_dead_fc1_storage(monkeypatch, width):
+    """Shared input rotation must be disjoint from FC1 and fit inside FC2 storage."""
+    monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 188)
+    monkeypatch.setenv("B12X_W4A16_TOKEN_MAJOR_ROTATION", "1")
+    caps = _coupled_qsrt_caps(width=width)
+    plan = plan_tp_moe_scratch(caps)
+    core = plan._core_workspace_plan
+    tensors = tp_moe_impl._map_core_workspace_views(core, _scratch_for_plan(plan)[0])
+    rotation = tensors["rotation_a_gate"]
+    cache = tensors["intermediate_cache13"]
+    assert rotation.shape == (8, 3584)
+    assert rotation.data_ptr() == cache.data_ptr() + 8 * 16 * 2 * width * 2
+    assert rotation.data_ptr() % 16 == 0
+    assert rotation.data_ptr() + rotation.nbytes <= cache.data_ptr() + cache.nbytes
+    cache.fill_(17)
+    rotation.fill_(23)
+    assert torch.all(cache[: 8 * 16 * 2 * width] == 17)
+
+    full = plan_tp_moe_scratch(
+        replace(caps, max_tokens=4608, core_token_counts=(4608,))
+    )
+    separate = plan_tp_moe_scratch(
+        replace(full.caps, w4a16_shared_input_rotation=False)
+    )
+    assert separate.layout.total_nbytes - full.layout.total_nbytes == 528482304
+    assert tp_moe_impl.tp_moe_required_nbytes(full.caps) == full.layout.total_nbytes
+
+
+@pytest.mark.parametrize(
+    "reason", ("disabled", "unknown_scales", "no_tail", "calibration")
+)
+def test_coupled_qsrt_keeps_separate_scratch_without_liveness_contract(
+    monkeypatch, reason
+):
+    monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 188)
+    monkeypatch.setenv("B12X_W4A16_TOKEN_MAJOR_ROTATION", "1")
+    caps = _coupled_qsrt_caps(width=1792 if reason == "no_tail" else 384)
+    if reason == "disabled":
+        monkeypatch.setenv("B12X_W4A16_TOKEN_MAJOR_ROTATION", "0")
+    elif reason == "unknown_scales":
+        caps = replace(caps, w4a16_shared_input_rotation=False)
+    elif reason == "calibration":
+        caps = replace(caps, collect_activation_amax=True)
+    core = plan_tp_moe_scratch(caps)._core_workspace_plan
+    assert core.rotation_a_offset is None
+    assert next(s for s in core.tensor_specs if s.name == "rotation_a_gate").shape == (
+        128,
+        3584,
+    )
+
+
+@pytest.mark.parametrize("reason", ("per_expert", "disabled", "valid"))
+def test_coupled_qsrt_binding_validates_shared_rotation_metadata(monkeypatch, reason):
+    monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 188)
+    monkeypatch.setenv("B12X_W4A16_TOKEN_MAJOR_ROTATION", "1")
+    plan = plan_tp_moe_scratch(_coupled_qsrt_caps())
+    tensors = _runtime_tensors(m=3, topk=16, experts=16, k=3584, n=384)
+    scales = torch.ones(
+        (16 if reason == "per_expert" else 1, 3584), dtype=torch.float16
+    )
+    payload = SimpleNamespace(coupled_hadamard=True, gate_suh=scales, up_suh=scales)
+    experts = _experts(tensors, plan.caps.weight_plan, payload)
+    if reason == "disabled":
+        monkeypatch.setenv("B12X_W4A16_TOKEN_MAJOR_ROTATION", "0")
+    if reason == "valid":
+        binding = plan.bind(
+            scratch=_scratch_for_plan(plan), **_binding_args(tensors, experts)
+        )
+        assert binding.rotation_a_gate.shape == (8, 3584)
+        assert binding.rotation_a_gate.data_ptr() == binding.rotation_a_up.data_ptr()
+    else:
+        with pytest.raises(ValueError, match="shared rotation scratch requires"):
+            plan.bind(
+                scratch=_scratch_for_plan(plan), **_binding_args(tensors, experts)
+            )
+
+
 def test_trellis_scratch_plan_resolves_default_route_block(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -637,8 +739,7 @@ def test_trellis_scratch_plan_resolves_default_route_block(
     )
     weight_plan = plan_b12x_fp4_moe_weights(
         quant_modes="w4a16",
-        source_format="btx",
-        trellis_codebook="mcg",
+        source_format="exl3_trellis_mcg",
         activation="silu",
         params_dtype=torch.bfloat16,
         num_experts=256,
@@ -669,8 +770,7 @@ def test_trellis_launch_planner_compiles_fixed_launch_matrix() -> None:
     """The real planner must cover every fixed decode and route-pack variant."""
     weight_plan = plan_b12x_fp4_moe_weights(
         quant_modes="w4a16",
-        source_format="btx",
-        trellis_codebook="mcg",
+        source_format="exl3_trellis_mcg",
         activation="silu",
         params_dtype=torch.bfloat16,
         num_experts=8,
@@ -726,8 +826,7 @@ def test_trellis_scratch_plan_prewarms_without_forcing_runtime_dispatch(
     )
     weight_plan = plan_b12x_fp4_moe_weights(
         quant_modes="w4a16",
-        source_format="btx",
-        trellis_codebook="mcg",
+        source_format="exl3_trellis_mcg",
         activation="silu",
         params_dtype=torch.bfloat16,
         num_experts=8,

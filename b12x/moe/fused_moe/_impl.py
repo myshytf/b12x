@@ -1320,6 +1320,7 @@ class _TPCoreWorkspacePlan:
     trellis_tile_config: tuple[int, int, int, int] | None = None
     qsrt_storage_format: str | None = None
     coupled_hadamard: bool = False
+    rotation_a_offset: int | None = None
     route_block_size_m: int | None = None
     prefill_fused_sum_fp32: bool = False
     tensor_specs: Tuple[_TensorAllocSpec, ...] = ()
@@ -1388,6 +1389,7 @@ class TPMoEScratchCaps:
     deterministic_output: bool | None = None
     prequantized_input: bool = False
     w4a16_block_size_m: int | None = None
+    w4a16_shared_input_rotation: bool = False
     w4a16_fast_math: bool = True
     frozen: bool = True
 
@@ -3097,6 +3099,20 @@ def _build_tp_moe_fp4_binding_from_views(
                 f"{name} must be contiguous int32[{plan.route_E}] on {a.device}"
             )
     if plan.full_rotation:
+        if plan.rotation_a_offset is not None:
+            prepared = experts.representation.value
+            if (
+                os.environ.get("B12X_W4A16_TOKEN_MAJOR_ROTATION", "0") != "1"
+                or not bool(getattr(prepared, "coupled_hadamard", False))
+                or prepared.gate_suh is None
+                or prepared.up_suh is None
+                or prepared.gate_suh.numel() != k
+                or prepared.up_suh.numel() != k
+            ):
+                raise ValueError(
+                    "shared rotation scratch requires enabled token-major "
+                    "coupled rotation and one shared input-scale row"
+                )
         if topk_weights.dtype != torch.float32:
             raise TypeError("full-rotation Trellis topk_weights must be float32")
         if topk_ids.dtype not in (torch.int32, torch.int64):
@@ -3300,6 +3316,7 @@ def _plan_core_workspace(
     w4a16_scale_format: str | None = None,
     route_num_experts: int | None = None,
     w4a16_block_size_m: int | None = None,
+    w4a16_shared_input_rotation: bool = False,
     trellis_bits: int = 3,
     trellis_tile_config: tuple[int, int, int, int] | None = None,
     qsrt_storage_format: str | None = None,
@@ -3575,22 +3592,38 @@ def _plan_core_workspace(
                     torch.float32,
                 )
             )
+        rotation_a_offset = None
         if full_rotation:
             max_tokens = max(routed_capacity // max(int(num_topk), 1), 1)
-            tensor_specs.extend(
-                (
-                    _TensorAllocSpec(
-                        "full_rotation_output",
-                        (max_tokens, int(k)),
-                        _rotation_output_dtype(),
-                    ),
-                    _TensorAllocSpec(
-                        "rotation_a_gate",
-                        (routed_capacity, int(k)),
-                        torch.float16,
-                    ),
-                    _TensorAllocSpec("kernel_workspace", (sms * 4 + 2,), torch.int32),
+            # The coupled input rotation is read only by FC1. FC1 writes the
+            # leading routed_rows * fc1_cols elements of cache13; its tail is
+            # unused until FC2, after the fused kernel's phase barrier. A
+            # shared-SUH token layout can therefore borrow this dead region.
+            rotation_elements = max_tokens * int(k)
+            fc1_end = routed_capacity * fc1_cols
+            if (
+                w4a16_shared_input_rotation
+                and coupled_hadamard
+                and not collect_activation_amax
+                and os.environ.get("B12X_W4A16_TOKEN_MAJOR_ROTATION", "0") == "1"
+                and fc1_end + rotation_elements <= intermediate_cache13_elements
+            ):
+                rotation_a_offset = fc1_end
+            tensor_specs.append(
+                _TensorAllocSpec(
+                    "full_rotation_output",
+                    (max_tokens, int(k)),
+                    _rotation_output_dtype(),
                 )
+            )
+            if rotation_a_offset is None:
+                tensor_specs.append(
+                    _TensorAllocSpec(
+                        "rotation_a_gate", (routed_capacity, int(k)), torch.float16
+                    )
+                )
+            tensor_specs.append(
+                _TensorAllocSpec("kernel_workspace", (sms * 4 + 2,), torch.int32)
             )
             if not coupled_hadamard:
                 tensor_specs.append(
@@ -3623,6 +3656,7 @@ def _plan_core_workspace(
             trellis_tile_config=trellis_tile_config,
             qsrt_storage_format=qsrt_storage_format,
             coupled_hadamard=bool(coupled_hadamard),
+            rotation_a_offset=rotation_a_offset,
             route_block_size_m=w4a16_block_size_m,
             prefill_fused_sum_fp32=bool(use_prefill_fused_sum),
             tensor_specs=tuple(tensor_specs),
@@ -3970,6 +4004,13 @@ def _map_core_workspace_views(
         )
         tensors[spec.name] = tensor
         relative_offset = absolute_next - offset_bytes
+    if plan.rotation_a_offset is not None:
+        rows = plan.routed_rows // plan.num_topk
+        tensors["rotation_a_gate"] = (
+            tensors["intermediate_cache13"]
+            .narrow(0, plan.rotation_a_offset, rows * plan.k)
+            .view(rows, plan.k)
+        )
     return tensors
 
 
@@ -7487,6 +7528,7 @@ def plan_tp_moe_arena_layout(
     deterministic_output: bool | None = None,
     prequantized_input: bool = False,
     w4a16_block_size_m: int | None = None,
+    w4a16_shared_input_rotation: bool = False,
 ) -> TPMoEArenaLayout:
     """Compute the byte layout needed by one lane-owned MoE pool."""
     if not isinstance(weight_plan, MoEWeightPreparationPlan):
@@ -7579,6 +7621,7 @@ def plan_tp_moe_arena_layout(
             w4a16_scale_format=w4a16_scale_format,
             route_num_experts=route_num_experts,
             w4a16_block_size_m=w4a16_block_size_m,
+            w4a16_shared_input_rotation=w4a16_shared_input_rotation,
             trellis_bits=weight_plan.trellis_bits or 3,
             trellis_tile_config=weight_plan.trellis_tile_config,
             qsrt_storage_format=weight_plan.qsrt_storage_format,
@@ -7882,6 +7925,7 @@ def _plan_tp_moe_arena_layout_from_caps(
         deterministic_output=deterministic_output,
         prequantized_input=caps.prequantized_input,
         w4a16_block_size_m=_resolve_trellis_route_block_size(caps),
+        w4a16_shared_input_rotation=caps.w4a16_shared_input_rotation,
     )
 
 
@@ -7931,6 +7975,7 @@ def plan_tp_moe_scratch(caps: TPMoEScratchCaps) -> TPMoEScratchPlan:
         w4a16_scale_format=caps.w4a16_scale_format,
         route_num_experts=caps.route_num_experts,
         w4a16_block_size_m=resolved_block_size_m,
+        w4a16_shared_input_rotation=caps.w4a16_shared_input_rotation,
         trellis_bits=caps.weight_plan.trellis_bits or 3,
         trellis_tile_config=caps.weight_plan.trellis_tile_config,
         qsrt_storage_format=caps.weight_plan.qsrt_storage_format,
@@ -8466,6 +8511,7 @@ def materialize_tp_moe_arena_workspaces(
             w4a16_scale_format=w4a16_scale_format,
             route_num_experts=caps.route_num_experts,
             w4a16_block_size_m=resolved_block_size_m,
+            w4a16_shared_input_rotation=caps.w4a16_shared_input_rotation,
             trellis_bits=weight_plan.trellis_bits or 3,
             trellis_tile_config=weight_plan.trellis_tile_config,
             qsrt_storage_format=weight_plan.qsrt_storage_format,

@@ -14108,7 +14108,13 @@ def run_w4a16_moe(
                     f"got {tuple(table.shape)}/{table.dtype}/{table.device}/"
                     f"contiguous={table.is_contiguous()}"
                 )
-        required_a = m * topk * hidden_size
+        token_major_rotation = bool(
+            coupled_hadamard
+            and suh_gate_table.numel() == hidden_size
+            and suh_up_table.numel() == hidden_size
+            and _w4a16_token_major_rotation_enabled()
+        )
+        required_a = m * hidden_size * (1 if token_major_rotation else topk)
         for name, scratch in (
             ("rotation_a_gate", rotation_a_gate),
             ("rotation_a_up", rotation_a_up),
