@@ -640,13 +640,16 @@ def test_reduce_scatter_schedule_orders_sends_against_the_partial_sums(
     assert not emu.conflicts, _conflict_report(emu)
 
 
-def test_all_reduce_and_gather_pair_schedules_reuse_nothing_unordered() -> None:
+@pytest.mark.parametrize("pipeline_gather", (False, True))
+def test_all_reduce_and_gather_pair_schedules_reuse_nothing_unordered(pipeline_gather) -> None:
     """Calibration for the reduce-scatter check: the two collectives that
     already qualify on nine GPUs reuse their buffers far enough apart that the
     schedule orders every overlapping pair."""
     hidden = _inputs(ORDERING_AR_ROWS, HIDDEN, seed=27, dtype=torch.bfloat16)
     firsts, seconds = _pair_inputs(ORDERING_AR_ROWS, seed=28)
     emu = EmulatedRing(WORLD, MAX_BYTES, model=True)
+    for ring in emu.rings:
+        ring._pipeline_all_gather = pipeline_gather
 
     def three_calls(ring, rank):
         reduced = [ring.all_reduce(hidden[rank]).clone() for _ in range(3)]
@@ -662,7 +665,8 @@ def test_all_reduce_and_gather_pair_schedules_reuse_nothing_unordered() -> None:
     assert not emu.conflicts, _conflict_report(emu)
 
 
-def test_layer_sequence_schedule_reuses_nothing_unordered() -> None:
+@pytest.mark.parametrize("pipeline_gather", (False, True))
+def test_layer_sequence_schedule_reuses_nothing_unordered(pipeline_gather) -> None:
     """The mixed sequence on one channel: the three ops share the scratch
     areas, the copy and flag streams and the piece events, and each op's
     closing handshake with its neighbour is what lets the next one reuse the
@@ -674,6 +678,8 @@ def test_layer_sequence_schedule_reuses_nothing_unordered() -> None:
     emu = EmulatedRing(WORLD, MAX_BYTES, model=True)
     expected_ar = ring_all_reduce_reference(hidden, WORLD)
     expected_rs = column_reduce_scatter_reference(latent, WORLD, "fp32", cols=LATENT_COLS)
+    for ring in emu.rings:
+        ring._pipeline_all_gather = pipeline_gather
 
     def layers(ring, rank):
         out = []
