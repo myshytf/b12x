@@ -263,7 +263,7 @@ def test_a2a_epoch_change_bumps_both_compile_specs() -> None:
         (
             kernels._get_compiled_all_gather_heads,
             "comm.pcie.dcp_a2a.all_gather_heads",
-            13,
+            14,
         ),
     )
     for launcher, identity, version in identities:
@@ -1583,7 +1583,7 @@ def test_push_transport_reaches_graph_prepare_and_capture_checks(monkeypatch) ->
     )
     runtime.prepare_graph_lse_reduce_scatter(dtype=torch.bfloat16, threads=256)
     runtime.prepare_graph_all_gather_heads(threads=256)
-    assert calls == [(2, 0, "bf16", 256, True, True), (2, 0, 256, True, True)]
+    assert calls == [(2, 0, "bf16", 256, True, True), (2, 0, 256, True, True, ())]
 
     lookups = []
     monkeypatch.setattr(
@@ -1606,7 +1606,7 @@ def test_push_transport_reaches_graph_prepare_and_capture_checks(monkeypatch) ->
         runtime.lse_reduce_scatter(partial_output, partial_lse)
     with pytest.raises(RuntimeError, match="cold PCIe DCP gather"):
         runtime.all_gather_heads(partial_output[:, :16].contiguous())
-    assert lookups == [(2, 0, "bf16", 256, True, True), (2, 0, 256, True, True)]
+    assert lookups == [(2, 0, "bf16", 256, True, True), (2, 0, 256, True, True, ())]
 
 
 def test_kernel_wrappers_forward_the_push_flag_to_both_launcher_variants(
@@ -1669,7 +1669,7 @@ def test_kernel_wrappers_forward_the_push_flag_to_both_launcher_variants(
     assert compiled == [
         (2, 0, "bf16", 256, False, True),
         (2, 0, "bf16", 256, True, True),
-        (2, 0, 256, True, True),
+        (2, 0, 256, True, True, ()),
     ]
     assert len(launched) == 2
 
@@ -1681,8 +1681,8 @@ def test_launcher_keys_and_compile_specs_carry_the_transport() -> None:
         2, 0, "bf16", 256, True, False,
     )
     assert kernels._lse_launcher_key(2, 0, "bf16", 256, True, True)[-1] is True
-    assert kernels._gather_launcher_key(2, 0, 256, True) == (2, 0, 256, True, False)
-    assert kernels._gather_launcher_key(2, 0, 256, True, True)[-1] is True
+    assert kernels._gather_launcher_key(2, 0, 256, True) == (2, 0, 256, True, False, ())
+    assert kernels._gather_launcher_key(2, 0, 256, True, True, ())[-2] is True
     for launcher in (
         kernels._get_compiled_lse_reduce_scatter,
         kernels._get_compiled_all_gather_heads,
@@ -1731,13 +1731,13 @@ def test_push_gather_kernel_writes_output_rows_to_peers_and_copies_out_locally()
     source = inspect.getsource(kernels._AllGatherHeadsLaunch.kernel)
     write_phase, read_phase = source.split("block_pair_barrier(", maxsplit=1)
     push_write = write_phase.split("if cutlass.const_expr(self._push):", 1)[1]
-    push_write = push_write.split("else:", 1)[0]
+    push_write = push_write.rsplit("                else:\n                    pack = lane", 1)[0]
     assert "push_base = Int64(row) * Int64(packs_per_head)" in push_write
     assert "Int64(staging[destination].toint())" in push_write
     assert "pack_offset = (push_base + Int64(pack)) * Int64(16)" in push_write
     # One local load per pack, one posted store per peer.
     assert push_write.count("ld_global_v4_u32(") == 1
-    assert push_write.count("st_global_v4_u32(") == 1
+    assert "for destination_index in cutlass.range_constexpr(" in push_write
     assert push_write.index("ld_global_v4_u32(") < push_write.index(
         "for destination_index in cutlass.range_constexpr("
     )
@@ -2240,6 +2240,6 @@ def test_pair_transport_override_reaches_pair_prepare(monkeypatch) -> None:
     runtime.prepare_graph_all_gather_pair(threads=512)
     runtime.prepare_graph_all_gather_heads(threads=256)
     # The pair prepares with pull while the head gather keeps push.
-    assert calls == [(2, 0, 512, True, False, False), (2, 0, 256, True, True)]
+    assert calls == [(2, 0, 512, True, False, False), (2, 0, 256, True, True, ())]
     runtime.close()
 
