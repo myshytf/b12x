@@ -905,6 +905,27 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
 
 
 class _AllGatherHeadsLaunch(_DCPA2ABase):
+    def __init__(
+        self,
+        world_size,
+        rank,
+        threads,
+        device_slot_selection,
+        push=False,
+        switch_groups=(),
+    ):
+        from ._switch_gather import normalize_switch_groups
+
+        super().__init__(world_size, rank, threads, device_slot_selection, push)
+        self._switch_groups = normalize_switch_groups(switch_groups, world_size)
+        if self._switch_groups and not push:
+            raise ValueError("switch query gather requires push transport")
+        self._local_group = next((g for g in self._switch_groups if rank in g), ())
+        self._remote_group = next((g for g in self._switch_groups if rank not in g), ())
+        self._local_peers = tuple(x for x in self._local_group if x != rank)
+        self._local_position = self._local_group.index(rank) if self._local_group else 0
+        self._remote_mask = sum(1 << x for x in self._remote_group)
+
     @cute.jit
     def __call__(
         self,
@@ -1081,11 +1102,7 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
                 (signals[self._rank] + Int64(_GRAPH_EPOCH_INDEX)).toint()
             )
             slot = generation % Uint32(2)
-            slot_offset = (
-                Int64(slot)
-                * Int64(slot_delta_256b)
-                * Int64(_SLOT_ALIGNMENT)
-            )
+            slot_offset = Int64(slot) * Int64(slot_delta_256b) * Int64(_SLOT_ALIGNMENT)
             staging = (
                 staging0 + slot_offset,
                 staging1 + slot_offset,
@@ -1105,9 +1122,8 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
                 staging15 + slot_offset,
             )
         lane = Int32(tidx) % Int32(32)
-        warp_first = (
-            Int32(bidx) * Int32(self._warps_per_block)
-            + Int32(tidx) // Int32(32)
+        warp_first = Int32(bidx) * Int32(self._warps_per_block) + Int32(tidx) // Int32(
+            32
         )
         warp_stride = Int32(gdim) * Int32(self._warps_per_block)
         total_heads = local_heads * Int32(self._world_size)
@@ -1122,9 +1138,8 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
             if source_rank == Int32(self._rank):
                 local_head = global_head - source_rank * local_heads
                 base = (
-                    (Int64(batch_index) * Int64(local_heads) + Int64(local_head))
-                    * Int64(packs_per_head)
-                )
+                    Int64(batch_index) * Int64(local_heads) + Int64(local_head)
+                ) * Int64(packs_per_head)
                 if cutlass.const_expr(self._push):
                     # Push transport: the local row lands in every peer's
                     # staging at its output position; the peer's warp with
@@ -1136,23 +1151,60 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
                     while pack < packs_per_head:
                         values = ld_global_v4_u32(
                             (
-                                local_input
-                                + base * Int64(4)
-                                + Int64(pack) * Int64(4)
+                                local_input + base * Int64(4) + Int64(pack) * Int64(4)
                             ).toint()
                         )
                         pack_offset = (push_base + Int64(pack)) * Int64(16)
-                        for destination_index in cutlass.range_constexpr(
-                            1, self._world_size
-                        ):
-                            destination = (
-                                self._rank + destination_index
-                            ) % self._world_size
-                            st_global_v4_u32(
-                                Int64(staging[destination].toint())
-                                + pack_offset,
-                                *values,
+                        if cutlass.const_expr(bool(self._switch_groups)):
+                            packet_id = base + Int64(pack)
+                            bucket = packet_id % Int64(16)
+                            relay = (packet_id // Int64(16)) % Int64(
+                                len(self._remote_group)
                             )
+                            for destination in cutlass.range_constexpr(
+                                self._world_size
+                            ):
+                                if cutlass.const_expr(destination != self._rank):
+                                    if cutlass.const_expr(
+                                        destination in self._local_group
+                                    ):
+                                        if cutlass.const_expr(
+                                            len(self._local_group) == 5
+                                        ):
+                                            if bucket != Int64(
+                                                self._local_peers.index(destination)
+                                            ):
+                                                st_global_v4_u32(
+                                                    Int64(staging[destination].toint())
+                                                    + pack_offset,
+                                                    *values,
+                                                )
+                                        else:
+                                            st_global_v4_u32(
+                                                Int64(staging[destination].toint())
+                                                + pack_offset,
+                                                *values,
+                                            )
+                                    else:
+                                        if relay == Int64(
+                                            self._remote_group.index(destination)
+                                        ):
+                                            st_global_v4_u32(
+                                                Int64(staging[destination].toint())
+                                                + pack_offset,
+                                                *values,
+                                            )
+                        else:
+                            for destination_index in cutlass.range_constexpr(
+                                1, self._world_size
+                            ):
+                                destination = (
+                                    self._rank + destination_index
+                                ) % self._world_size
+                                st_global_v4_u32(
+                                    Int64(staging[destination].toint()) + pack_offset,
+                                    *values,
+                                )
                         pack += Int32(32)
                 else:
                     pack = lane
@@ -1173,6 +1225,69 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
             acquire=self._push,
         )
 
+        if cutlass.const_expr(bool(self._switch_groups)):
+            # Every row keeps the same block/warp owner on every rank. The
+            # first paired barrier publishes the relay inputs; the second
+            # publishes its copies before the original copy-out phase.
+            row = warp_first
+            while row < rows:
+                batch_index = row // total_heads
+                global_head = row - batch_index * total_heads
+                source_rank = global_head // local_heads
+                if ((Int32(1) << source_rank) & Int32(self._remote_mask)) != Int32(0):
+                    local_head = global_head - source_rank * local_heads
+                    source_base = (
+                        Int64(batch_index) * Int64(local_heads) + Int64(local_head)
+                    ) * Int64(packs_per_head)
+                    push_base = Int64(row) * Int64(packs_per_head)
+                    source_position = Int32(0)
+                    for position in cutlass.range_constexpr(len(self._remote_group)):
+                        if source_rank == Int32(self._remote_group[position]):
+                            source_position = Int32(position)
+                    pack = lane
+                    while pack < packs_per_head:
+                        packet_id = source_base + Int64(pack)
+                        relay = (packet_id // Int64(16)) % Int64(len(self._local_group))
+                        if relay == Int64(self._local_position):
+                            pack_offset = (push_base + Int64(pack)) * Int64(16)
+                            values = ld_global_v4_u32(
+                                Int64(staging[self._rank].toint()) + pack_offset
+                            )
+                            for position in cutlass.range_constexpr(
+                                len(self._local_peers)
+                            ):
+                                destination = self._local_peers[position]
+                                st_global_v4_u32(
+                                    Int64(staging[destination].toint()) + pack_offset,
+                                    *values,
+                                )
+                            if cutlass.const_expr(len(self._remote_group) == 5):
+                                bucket = Int32(packet_id % Int64(16))
+                                if bucket < Int32(4):
+                                    destination_position = bucket
+                                    if bucket >= source_position:
+                                        destination_position += Int32(1)
+                                    for position in cutlass.range_constexpr(
+                                        len(self._remote_group)
+                                    ):
+                                        if destination_position == Int32(position):
+                                            destination = self._remote_group[position]
+                                            st_global_v4_u32(
+                                                Int64(staging[destination].toint())
+                                                + pack_offset,
+                                                *values,
+                                            )
+                        pack += Int32(32)
+                row += warp_stride
+            block_pair_barrier(
+                signals,
+                self_signal=signals[self._rank],
+                rank=self._rank,
+                world_size=self._world_size,
+                max_blocks=_MAX_BLOCKS,
+                acquire=True,
+            )
+
         row = warp_first
         while row < rows:
             batch_index = row // total_heads
@@ -1180,16 +1295,13 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
             source_rank = global_head // local_heads
             local_head = global_head - source_rank * local_heads
             source_base = (
-                (Int64(batch_index) * Int64(local_heads) + Int64(local_head))
-                * Int64(packs_per_head)
-            )
+                Int64(batch_index) * Int64(local_heads) + Int64(local_head)
+            ) * Int64(packs_per_head)
             output_base = Int64(row) * Int64(packs_per_head)
             # Resolve the peer's base address first and copy once. Cloning the
             # whole pack loop into all sixteen arms of the constexpr chain
             # bloats the kernel and pays the chain on every row.
-            source_address = Int64(
-                (local_input + source_base * Int64(4)).toint()
-            )
+            source_address = Int64((local_input + source_base * Int64(4)).toint())
             if cutlass.const_expr(self._push):
                 # Every peer's row was pushed into the local staging at its
                 # output position, so one runtime test picks the address.
@@ -1207,9 +1319,7 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
                         source_address = Int64(
                             (source_words + source_base * Int64(4)).toint()
                         )
-            output_address = Int64(
-                (output + output_base * Int64(4)).toint()
-            )
+            output_address = Int64((output + output_base * Int64(4)).toint())
             pack = lane
             while pack < packs_per_head:
                 _copy_16b_addr(
@@ -2348,6 +2458,7 @@ def _gather_launcher_key(
     threads: int,
     device_slot_selection: bool,
     push: bool = False,
+    switch_groups: tuple[tuple[int, ...], ...] = (),
 ) -> tuple[object, ...]:
     return (
         int(world_size),
@@ -2355,6 +2466,7 @@ def _gather_launcher_key(
         int(threads),
         bool(device_slot_selection),
         bool(push),
+        switch_groups,
     )
 
 
@@ -2364,14 +2476,19 @@ def is_all_gather_heads_prepared(
     threads: int,
     device_slot_selection: bool,
     push: bool = False,
+    switch_groups: tuple[tuple[int, ...], ...] = (),
 ) -> bool:
-    return _gather_launcher_key(
-        world_size,
-        rank,
-        threads,
-        device_slot_selection,
-        push,
-    ) in _PREPARED_GATHER_LAUNCHERS
+    return (
+        _gather_launcher_key(
+            world_size,
+            rank,
+            threads,
+            device_slot_selection,
+            push,
+            switch_groups,
+        )
+        in _PREPARED_GATHER_LAUNCHERS
+    )
 
 
 @functools.cache
@@ -2381,6 +2498,7 @@ def _get_compiled_all_gather_heads(
     threads: int,
     device_slot_selection: bool,
     push: bool = False,
+    switch_groups: tuple[tuple[int, ...], ...] = (),
 ) -> Callable:
     launch = _AllGatherHeadsLaunch(
         world_size,
@@ -2388,6 +2506,7 @@ def _get_compiled_all_gather_heads(
         threads,
         device_slot_selection,
         push,
+        switch_groups,
     )
     key = _gather_launcher_key(
         world_size,
@@ -2395,6 +2514,7 @@ def _get_compiled_all_gather_heads(
         threads,
         device_slot_selection,
         push,
+        switch_groups,
     )
     raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=key)
     p_u32 = _u32_ptr(16, align=4)
@@ -2413,7 +2533,7 @@ def _get_compiled_all_gather_heads(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.dcp_a2a.all_gather_heads",
-            13,
+            14,
             key,
             labels=(
                 "world_size",
@@ -2421,6 +2541,7 @@ def _get_compiled_all_gather_heads(
                 "threads",
                 "device_slot_selection",
                 "push",
+                "switch_groups",
             ),
         ),
     )
@@ -2743,6 +2864,7 @@ def all_gather_heads(
     slot_delta_bytes: int,
     blocks: int,
     push: bool = False,
+    switch_groups: tuple[tuple[int, ...], ...] = (),
 ) -> None:
     slot_delta_256b = _slot_delta_256b(slot_delta_bytes)
     launcher = _get_compiled_all_gather_heads(
@@ -2751,6 +2873,7 @@ def all_gather_heads(
         threads,
         device_slot_selection,
         push,
+        switch_groups,
     )
     if not device_slot_selection:
         _get_compiled_all_gather_heads(
@@ -2759,6 +2882,7 @@ def all_gather_heads(
             threads,
             True,
             push,
+            switch_groups,
         )
     launcher(
         local_input_ptr,

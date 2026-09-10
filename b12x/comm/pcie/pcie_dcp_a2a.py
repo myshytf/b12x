@@ -111,6 +111,17 @@ def a2a_pair_transport(default: str) -> str:
     return value
 
 
+def a2a_gather_switch_groups(world_size: int):
+    from ._switch_gather import normalize_switch_groups
+
+    groups = normalize_switch_groups(
+        os.getenv("B12X_PCIE_DCP_GATHER_GROUPS", ""), world_size
+    )
+    if groups and a2a_transport() != "push":
+        raise ValueError("switch query gather requires push transport")
+    return groups
+
+
 def a2a_transport() -> str:
     """Return the staging transport selected by ``B12X_PCIE_DCP_A2A_TRANSPORT``."""
 
@@ -538,6 +549,7 @@ class PCIeDCPA2A:
                     self.output_capacity_elems,
                     self.lse_offset,
                     self.lse_capacity,
+                    self.gather_switch_groups,
                 ),
             )
 
@@ -623,6 +635,7 @@ class PCIeDCPA2A:
             "B12X_PCIE_DCP_BLOCK_LIMIT", 0
         )
         self._transport = a2a_transport()
+        self.gather_switch_groups = a2a_gather_switch_groups(self.world_size)
         self._stream_affine = bool(stream_affine)
         self._owner_stream_key: Optional[int] = None
         self._closed = False
@@ -753,6 +766,7 @@ class PCIeDCPA2A:
                 layout,
                 a2a_transport(),
                 a2a_pair_transport(a2a_transport()),
+                a2a_gather_switch_groups(world_size),
             ),
         )
         slab = PCIeOneshotAllReduce._allocate_shared_buffer(
@@ -928,6 +942,7 @@ class PCIeDCPA2A:
                 threads,
                 True,
                 self.push_transport,
+                self.gather_switch_groups,
             )
 
     def prepare_graph_all_gather_pair(self, *, threads: int = 512) -> None:
@@ -1248,6 +1263,7 @@ class PCIeDCPA2A:
                 threads,
                 True,
                 self.push_transport,
+                self.gather_switch_groups,
             ):
                 raise RuntimeError(
                     "cold PCIe DCP gather CUDA graph capture is not allowed; "
@@ -1302,6 +1318,7 @@ class PCIeDCPA2A:
                 ),
                 blocks=blocks,
                 push=self.push_transport,
+                switch_groups=self.gather_switch_groups,
             )
 
     def all_gather_pair(
