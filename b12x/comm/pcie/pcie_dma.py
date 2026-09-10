@@ -344,6 +344,9 @@ class PCIeDmaAllReduce:
         # behind it.
         self._ag_copy_stream = torch.cuda.Stream(device=self.device)
         self._ag_flag_stream = torch.cuda.Stream(device=self.device)
+        self._pipeline_all_gather = (
+            os.getenv("B12X_PCIE_DMA_PIPELINED_GATHER", "0") == "1"
+        )
         # Persistent cross-stream events: captured graphs keep references to
         # recorded events, so per-call temporaries must not be destroyed.
         self._piece_events = [torch.cuda.Event() for _ in range(MAX_PIECES)]
@@ -826,6 +829,7 @@ class PCIeDmaAllReduce:
             "mx",
             "mx_ring",
         )
+        pipeline_gather = self._pipeline_all_gather and not compressed_ag
         if wire_codec == "i8":
             quantize = kernels.dma_quant_i8
             dequantize_store = kernels.dma_dequant_store_i8
@@ -955,6 +959,8 @@ class PCIeDmaAllReduce:
                     send_src = (
                         in_piece_ptr(send_chunk, p)
                         if k == 0
+                        else scratch_piece(rank, k - 1, p)
+                        if pipeline_gather and k > world - 1
                         else piece_ptr(send_chunk, p)
                     )
                     send_bytes = piece_bytes
@@ -1024,13 +1030,25 @@ class PCIeDmaAllReduce:
                         payload + piece_elems,
                         piece_elems,
                     )
+                elif pipeline_gather:
+                    # A received all-gather payload is immutable until the
+                    # final neighbor handshake. Forward it directly while a
+                    # separate CE stream materializes the caller's output.
+                    add_done[p].record(main)
+                    with torch.cuda.stream(self._ag_copy_stream):
+                        self._ag_copy_stream.wait_event(add_done[p])
+                        kernels.dma_copy(
+                            piece_ptr(recv_chunk, p),
+                            scratch_piece(rank, k, p),
+                            piece_bytes,
+                        )
                 else:
                     kernels.dma_copy(
                         piece_ptr(recv_chunk, p),
                         scratch_piece(rank, k, p),
                         piece_bytes,
                     )
-                if reduce_phase or not compressed_step:
+                if reduce_phase or (not compressed_step and not pipeline_gather):
                     add_done[p].record(main)
 
         # Neighbor handshake so the next call (or graph replay) cannot
@@ -1038,6 +1056,8 @@ class PCIeDmaAllReduce:
         # must also drain the copy and flag streams before the op is done.
         main.wait_stream(copy_stream)
         main.wait_stream(flag_stream)
+        if pipeline_gather:
+            main.wait_stream(self._ag_copy_stream)
         done = steps * pieces
         kernels.dma_set_flag(
             self._flag_ptr(prv, done), self._counter_ptr(self._send_counters, done)
@@ -1236,9 +1256,12 @@ class PCIeDmaAllReduce:
         self._input_ready.record(main)
         copy_stream.wait_event(self._input_ready)
         flag_stream.wait_event(self._input_ready)
+        materialize_stream = self._ag_copy_stream if self._pipeline_all_gather else main
+        materialize_stream.wait_event(self._input_ready)
         # Own block: the caller's inputs become output block ``rank``.
-        kernels.dma_copy(out_block(out_first, rank), first.data_ptr(), first_bytes)
-        kernels.dma_copy(out_block(out_second, rank), second.data_ptr(), second_bytes)
+        with torch.cuda.stream(materialize_stream):
+            kernels.dma_copy(out_block(out_first, rank), first.data_ptr(), first_bytes)
+            kernels.dma_copy(out_block(out_second, rank), second.data_ptr(), second_bytes)
 
         for k in range(steps):
             # Step k forwards block (rank - k) % world: the own block at
@@ -1266,13 +1289,17 @@ class PCIeDmaAllReduce:
             )
             received[k].record(main)
             src = self._scratch_ptr(rank, k)
-            kernels.dma_copy(out_block(out_first, recv_block), src, first_bytes)
-            kernels.dma_copy(
-                out_block(out_second, recv_block), src + second_offset, second_bytes
-            )
+            with torch.cuda.stream(materialize_stream):
+                materialize_stream.wait_event(received[k])
+                kernels.dma_copy(out_block(out_first, recv_block), src, first_bytes)
+                kernels.dma_copy(
+                    out_block(out_second, recv_block), src + second_offset, second_bytes
+                )
 
         main.wait_stream(copy_stream)
         main.wait_stream(flag_stream)
+        if self._pipeline_all_gather:
+            main.wait_stream(materialize_stream)
         done = slot(steps)
         kernels.dma_set_flag(
             self._flag_ptr(prv, done), self._counter_ptr(self._send_counters, done)
