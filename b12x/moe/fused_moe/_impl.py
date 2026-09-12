@@ -1737,6 +1737,10 @@ class TPMoEFP4Binding:
     output_expert_map: torch.Tensor | None = None
     fused_launch: object | None = None
     topk_sum_launch: object | None = None
+    # W4A16 expert-range split: the first launch of a routed call zeroes the
+    # per-route FC2 buffer and skips the top-k sum, the last launch sums.
+    zero_fc2_output_override: bool | None = None
+    skip_topk_sum: bool = False
 
     def run(self) -> torch.Tensor:
         return b12x_moe_fp4(binding=self)
@@ -2983,6 +2987,8 @@ def _build_tp_moe_fp4_binding_from_views(
     output_expert_map: torch.Tensor | None = None,
     fused_launch: object | None = None,
     topk_sum_launch: object | None = None,
+    zero_fc2_output_override: bool | None = None,
+    skip_topk_sum: bool = False,
 ) -> TPMoEFP4Binding:
     if not isinstance(experts, B12XFP4ExpertWeights):
         raise TypeError("experts must come from prepare_b12x_fp4_moe_weights")
@@ -3180,6 +3186,8 @@ def _build_tp_moe_fp4_binding_from_views(
             output_expert_map=output_expert_map,
             fused_launch=fused_launch,
             topk_sum_launch=topk_sum_launch,
+            zero_fc2_output_override=zero_fc2_output_override,
+            skip_topk_sum=skip_topk_sum,
         )
 
     if plan.implementation == "micro":
@@ -11984,6 +11992,8 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             swiglu_beta=swiglu_beta,
             fused_launch=fused_launch,
             topk_sum_launch=topk_sum_launch,
+            zero_fc2_output_override=binding.zero_fc2_output_override,
+            skip_topk_sum=binding.skip_topk_sum,
             route_block_size_m=binding.route_block_size_m,
             intermediate_rotation_scales=(
                 prepared.intermediate_rotations if full_rotation else None

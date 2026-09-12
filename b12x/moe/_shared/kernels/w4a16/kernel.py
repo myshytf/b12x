@@ -1385,7 +1385,7 @@ class W4A16GemmKernel:
         self.max_m_blocks = int(max_m_blocks)
         if torch.cuda.is_available():
             props = torch.cuda.get_device_properties(torch.cuda.current_device())
-            self.sms = int(props.multi_processor_count)
+            self.sms = _fused_sm_budget(int(props.multi_processor_count))
             max_shared_mem = int(
                 getattr(props, "shared_memory_per_block_optin", _DEFAULT_MAX_SHARED_MEM)
             )
@@ -13594,7 +13594,7 @@ def _run_trellis256_dense_current_device(
         rotated_compute.copy_(rotated_f16)
 
     props = torch.cuda.get_device_properties(x.device)
-    sms = int(props.multi_processor_count)
+    sms = _fused_sm_budget(int(props.multi_processor_count))
     max_shared_mem = int(
         getattr(props, "shared_memory_per_block_optin", _DEFAULT_MAX_SHARED_MEM)
     )
@@ -13818,6 +13818,31 @@ def _w4a16_stream_is_capturing(
     return int(status) != 0
 
 
+def _fused_sm_budget(sm_count: int) -> int:
+    """SMs the persistent fused MoE grid may occupy: the device count minus
+    ``B12X_W4A16_FUSED_SM_RESERVE`` (default 0). The launch is cooperative
+    (one CTA per SM must be resident), so with no reserve it cannot start
+    while any other kernel holds an SM and, once running, no kernel that
+    cannot co-reside with a MoE CTA can start until it ends; a small reserve
+    leaves room for concurrent collective kernels."""
+    reserve = int(os.environ.get("B12X_W4A16_FUSED_SM_RESERVE", "0") or 0)
+    return max(1, int(sm_count) - max(0, reserve))
+
+
+_W4A16_ZERO_VARIANTS: dict[int, dict[bool, "W4A16FusedMoeCompileResult"]] = {}
+
+
+def _w4a16_zero_variant(base, zero: bool, compile_fn):
+    """The prewarmed fused launch recompiled with the opposite FC2 zeroing,
+    cached per launch object (launch objects live as long as their plan)."""
+    variants = _W4A16_ZERO_VARIANTS.setdefault(id(base), {})
+    fused = variants.get(zero)
+    if fused is None:
+        fused = compile_fn()
+        variants[zero] = fused
+    return fused
+
+
 def run_w4a16_moe(
     a_input: torch.Tensor,
     prepared,
@@ -13847,6 +13872,8 @@ def run_w4a16_moe(
     swiglu_beta: float | None = None,
     fused_launch: W4A16FusedMoeCompileResult | None = None,
     topk_sum_launch: W4A16TopKSumCompileResult | None = None,
+    zero_fc2_output_override: bool | None = None,
+    skip_topk_sum: bool = False,
     route_block_size_m: int | None = None,
     intermediate_rotation_scales: torch.Tensor | None = None,
     a_input_up: torch.Tensor | None = None,
@@ -14436,7 +14463,7 @@ def run_w4a16_moe(
         )
 
     props = torch.cuda.get_device_properties(a_input.device)
-    sms = int(props.multi_processor_count)
+    sms = _fused_sm_budget(int(props.multi_processor_count))
     max_shared_mem = int(
         getattr(props, "shared_memory_per_block_optin", _DEFAULT_MAX_SHARED_MEM)
     )
@@ -14484,22 +14511,28 @@ def run_w4a16_moe(
 
     if int(prepared.workspace.numel()) < sms * 4 + 2:
         raise ValueError("prepared W4A16 workspace is too small for fused FC1+FC2")
-    if fused_launch is None:
-        fused = compile_w4a16_fused_moe(
-            size_m=m,
+    # The per-route FC2 buffer is zeroed inside the fused launch when routes of
+    # another tier are dropped (their slots must read as zero in the top-k sum);
+    # a caller that issues one MoE call as several expert-range launches zeroes
+    # in the first launch only (``zero_fc2_output_override``).
+    zero_fc2 = (
+        expert_map is not None and not full_rotation and not use_direct_topk_routes
+    )
+    if zero_fc2_output_override is not None:
+        zero_fc2 = bool(zero_fc2_output_override)
+
+    def _compile_fused(size_m_: int, max_m_blocks_: int, zero_: bool):
+        return compile_w4a16_fused_moe(
+            size_m=size_m_,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             num_experts=int(prepared.num_experts),
             top_k=topk,
             activation=activation,
             apply_router_weight_on_input=bool(apply_router_weight_on_input),
-            zero_fc2_output=(
-                expert_map is not None
-                and not full_rotation
-                and not use_direct_topk_routes
-            ),
+            zero_fc2_output=zero_,
             moe_block_size=block_size_m,
-            max_m_blocks=int(required_m_blocks),
+            max_m_blocks=max_m_blocks_,
             element_dtype=element_dtype,
             fast_math=bool(fast_math),
             sms=sms,
@@ -14529,6 +14562,24 @@ def run_w4a16_moe(
                 current_stream=current_stream,
             ),
         )
+
+    if (
+        fused_launch is not None
+        and zero_fc2_output_override is not None
+        and bool(fused_launch.zero_fc2_output) != zero_fc2
+    ):
+        base_launch = fused_launch
+        fused_launch = _w4a16_zero_variant(
+            base_launch,
+            zero_fc2,
+            lambda: _compile_fused(
+                int(base_launch.size_m),
+                max(int(required_m_blocks), int(base_launch.max_m_blocks)),
+                zero_fc2,
+            ),
+        )
+    if fused_launch is None:
+        fused = _compile_fused(m, int(required_m_blocks), zero_fc2)
     else:
         if int(fused_launch.size_m) < m:
             raise RuntimeError(
@@ -14542,11 +14593,7 @@ def run_w4a16_moe(
             topk,
             activation,
             bool(apply_router_weight_on_input),
-            (
-                expert_map is not None
-                and not full_rotation
-                and not use_direct_topk_routes
-            ),
+            zero_fc2,
             element_dtype,
             bool(fast_math),
             swiglu_limit,
@@ -14922,6 +14969,13 @@ def run_w4a16_moe(
             int(stream),
         )
 
+    if skip_topk_sum:
+        if use_prefill_fused_sum or use_tc_decode:
+            raise ValueError(
+                "skip_topk_sum requires the separate top-k sum launch (no fused sum)"
+            )
+        # The per-route outputs stay in the FC2 buffer for a later launch's sum.
+        return output
     if use_prefill_fused_sum:
         assert prefill_sum_accum is not None
         output.copy_(prefill_sum_accum[: m * hidden_size].view(m, hidden_size))
