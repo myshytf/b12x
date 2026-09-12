@@ -43,8 +43,16 @@ from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
 
 
-_THREADS = 256
-_MAX_GRID = 64
+# Threads per CTA of the ring's add/copy kernels (``B12X_PCIE_DMA_THREADS``,
+# default 256). Every kernel is a grid-stride loop, so the block size only sets
+# how many CTAs share the work: 128 threads let a CTA co-reside with a
+# persistent MoE CTA that holds 232 registers x 256 threads and ~90 KB of
+# shared memory (64 K registers per SM), so ring reductions can proceed while
+# such a kernel occupies every SM. The grid cap keeps the thread total.
+_THREADS = int(__import__("os").environ.get("B12X_PCIE_DMA_THREADS", "256"))
+if _THREADS not in (64, 128, 256, 512):
+    raise ValueError("B12X_PCIE_DMA_THREADS must be 64, 128, 256 or 512")
+_MAX_GRID = 16384 // _THREADS
 _QUANT_BLOCK = 128
 _WARPS_PER_CTA = _THREADS // 32
 _MX_SCALES_PER_BLOCK = 4
