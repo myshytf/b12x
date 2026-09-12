@@ -593,6 +593,8 @@ class EmulatedRing:
             ring._flag_stream = _FakeStream(device, rank=rank, name="flag")
             ring._ag_copy_stream = _FakeStream(device, rank=rank, name="ag-copy")
             ring._ag_flag_stream = _FakeStream(device, rank=rank, name="ag-flag")
+            # served tree (2d466e3): pipelined all-gather switch, off by default
+            ring._pipeline_all_gather = False
             ring._piece_events = [_FakeEvent() for _ in range(pcie_dma.MAX_PIECES)]
             ring._copied_events = [
                 _FakeEvent() for _ in range(2 * (world - 1) * pcie_dma.MAX_PIECES)
