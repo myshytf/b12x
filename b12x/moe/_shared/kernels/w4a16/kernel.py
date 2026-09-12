@@ -7900,10 +7900,16 @@ class W4A16FusedMoeKernel:
             block=[self.cta_threads, 1, 1],
             min_blocks_per_mp=self.blocks_per_sm,
             # The fused body crosses software all-CTA barriers between FC1,
-            # activation, and FC2. Require whole-grid admission so unrelated
-            # work cannot occupy an SM while resident CTAs wait for peers that
-            # have not been scheduled yet.
-            cooperative=True,
+            # activation, and FC2. A cooperative launch requires whole-grid
+            # admission so unrelated work cannot occupy an SM while resident
+            # CTAs wait for peers that have not been scheduled yet; on the
+            # measured deployment it also makes the kernel run alone on the
+            # device (no kernel of any other stream overlaps it). A normal
+            # launch (``B12X_W4A16_FUSED_COOPERATIVE=0``) relies on the grid
+            # fitting next to whatever else is resident (an SM reserve and
+            # co-residable collective kernels) and lets collectives proceed
+            # while the MoE runs.
+            cooperative=_fused_cooperative_launch(),
             stream=stream,
         )
 
@@ -13816,6 +13822,34 @@ def _w4a16_stream_is_capturing(
             f"cuStreamIsCapturing failed for the selected W4A16 stream: {result}"
         )
     return int(status) != 0
+
+
+_FUSED_COOP_CACHE: list = [0.0, True]
+
+
+def _fused_cooperative_launch() -> bool:
+    """Whether the fused MoE grid is launched cooperatively.
+
+    ``B12X_W4A16_FUSED_COOPERATIVE`` is ``1`` (default), ``0``, or the path of
+    a file whose first character is read at most once per second, so the
+    launch mode of a running server can be switched for measurement.
+    """
+    value = os.environ.get("B12X_W4A16_FUSED_COOPERATIVE", "1")
+    if not value.startswith("/"):
+        return value != "0"
+    import time
+
+    now = time.time()
+    if now - _FUSED_COOP_CACHE[0] < 1.0:
+        return _FUSED_COOP_CACHE[1]
+    try:
+        with open(value) as fh:
+            result = fh.read(1) != "0"
+    except OSError:
+        result = True
+    _FUSED_COOP_CACHE[0] = now
+    _FUSED_COOP_CACHE[1] = result
+    return result
 
 
 def _fused_sm_budget(sm_count: int) -> int:
