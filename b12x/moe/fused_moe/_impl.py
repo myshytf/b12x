@@ -1741,6 +1741,8 @@ class TPMoEFP4Binding:
     # per-route FC2 buffer and skips the top-k sum, the last launch sums.
     zero_fc2_output_override: bool | None = None
     skip_topk_sum: bool = False
+    # Independent route output when FC2 must survive a later FC1 launch.
+    retained_fc2_output: torch.Tensor | None = None
 
     def run(self) -> torch.Tensor:
         return b12x_moe_fp4(binding=self)
@@ -11994,6 +11996,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             topk_sum_launch=topk_sum_launch,
             zero_fc2_output_override=binding.zero_fc2_output_override,
             skip_topk_sum=binding.skip_topk_sum,
+            retained_fc2_output=binding.retained_fc2_output,
             route_block_size_m=binding.route_block_size_m,
             intermediate_rotation_scales=(
                 prepared.intermediate_rotations if full_rotation else None

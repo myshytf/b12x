@@ -26,13 +26,29 @@ import b12x.moe._shared.kernels.w4a16.route_pack as route_pack_module
 from b12x.moe._shared.kernels.w4a16.host import route_pack_capacity
 from b12x.moe._shared.kernels.w4a16.route_pack import pack_topk_routes_by_expert
 
-_STABLE_MIN_ROUTES = route_pack_module._STABLE_SORT_MIN_ROUTES
+_STABLE_MIN_ROUTES = 4096  # Large-route regression corpus size.
 _SEGMENT_SORT_WIDTHS = [
     width for width, _ in route_pack_module._STABLE_SEGMENT_SORT_WIDTHS
 ]
 _SORT_SMALL = _SEGMENT_SORT_WIDTHS[0]
 _SORT_LARGE = _SEGMENT_SORT_WIDTHS[-1]
 _TOP_K = 16
+
+
+@pytest.mark.parametrize("rows", [9, 12, 16])
+def test_short_prefills_respect_stable_route_order(rows, monkeypatch):
+    device = _kernel_device()
+    monkeypatch.setenv("B12X_W4A16_STABLE_ROUTE_PACK", "1")
+    monkeypatch.setenv("B12X_W4A16_STABLE_ROUTE_PACK_SCAN", "0")
+    ids = (torch.arange(rows * _TOP_K, device=device) % 17).reshape(rows, _TOP_K)
+    ids = ids.to(torch.int32)
+    workspaces = _workspaces(ids, 8, 896)
+    for shift in range(3):
+        ids.copy_(ids.roll(shift, dims=0))
+        expected = reference_stable_route_pack(ids, 8, 896)
+        workspaces["packed_route_indices"].fill_(-7)
+        actual = pack_topk_routes_by_expert(ids, 8, 896, **workspaces)
+        assert all(torch.equal(a.cpu(), b) for a, b in zip(actual, expected, strict=True))
 
 
 def _kernel_device() -> torch.device:
@@ -277,8 +293,8 @@ def test_segment_sort_matches_reference_at_the_served_expert_count(monkeypatch) 
 
 
 def test_stable_pack_launches_one_kernel_per_segment_width(monkeypatch) -> None:
-    """Below the stable threshold no segment kernel is launched. Above it the
-    pack sequence is one sort launch per lane width plus one scan launch,
+    """The live route count excludes unreachable larger sort/scan bands.
+    A large input uses one sort launch per lane width plus one scan launch,
     each over all experts, and the launches' ``(COUNT_MIN, SORT_WIDTH]``
     bands tile every segment size from one route up: the sort bands start at
     zero and chain, and the scan takes everything above the widest sort. A
@@ -312,7 +328,10 @@ def test_stable_pack_launches_one_kernel_per_segment_width(monkeypatch) -> None:
     small = _uniform(32, 8, num_experts, 1).to(device)
     assert small.numel() < _STABLE_MIN_ROUTES
     pack_topk_routes_by_expert(small, 16, num_experts, **_workspaces(small, 16, num_experts))
-    assert sorts.calls == [] and scans.calls == []
+    assert len(sorts.calls) == 1 and scans.calls == []
+    assert sorts.calls[0][1]["COUNT_MIN"] == 0
+    assert sorts.calls[0][1]["SORT_WIDTH"] == _SEGMENT_SORT_WIDTHS[0]
+    sorts.calls.clear()
 
     large = _uniform(_STABLE_MIN_ROUTES // 8, 8, num_experts, 2).to(device)
     pack_topk_routes_by_expert(large, 16, num_experts, **_workspaces(large, 16, num_experts))
