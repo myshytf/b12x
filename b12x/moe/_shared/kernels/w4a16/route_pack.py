@@ -18,7 +18,6 @@ _SMALL_PREFIX_MAX_ROUTE_BLOCKS = 512
 
 
 _FAST_COUNT_BLOCK_T = 1024
-_STABLE_SORT_MIN_ROUTES = 4096
 _STABLE_SORT_BLOCK_T = 4096
 _STABLE_SORT_EXPERTS_PER_PROGRAM = 1
 # Stable packing sorts each expert's scattered segment in registers. A
@@ -474,8 +473,8 @@ def _launch_stable_segment_pack(
 ) -> None:
     """Order every scattered expert segment by ascending route id.
 
-    One sort launch per lane width in ``_STABLE_SEGMENT_SORT_WIDTHS`` and one
-    scan launch for the segments above the widest sort. Each launch covers
+    One sort launch per reachable lane width in ``_STABLE_SEGMENT_SORT_WIDTHS``
+    and, when needed, one scan above the widest sort. Each launch covers
     all experts; a program outside its launch's segment-size band retires
     after one load, and the bands partition ``[1, inf)``, so every non-empty
     segment is ordered exactly once. The counts live on the device, so the
@@ -495,6 +494,10 @@ def _launch_stable_segment_pack(
             num_warps=num_warps,
         )
         count_min = width
+        # No expert can own more routes than the entire live input. Avoid
+        # launching larger sorts and a scan whose bands are unreachable.
+        if live_numel <= width:
+            return
     _pack_topk_routes_segment_scan_kernel[grid](
         topk_ids,
         expert_map_tensor,
@@ -745,7 +748,9 @@ def pack_topk_routes_by_expert(
             SEARCH_STEPS=block_e.bit_length(),
             num_warps=4,
         )
-    stable = env_flag("W4A16_STABLE_ROUTE_PACK") and numel >= _STABLE_SORT_MIN_ROUTES
+    # Short prefills need the same deterministic order as large prefills.
+    # Atomic scatter can otherwise permute token rows between identical calls.
+    stable = env_flag("W4A16_STABLE_ROUTE_PACK")
     if stable and _stable_route_pack_uses_scan():
         # Reference stable layout: one program per expert scans the whole
         # route workspace and writes its routes in ascending order.

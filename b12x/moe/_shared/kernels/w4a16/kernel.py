@@ -13889,6 +13889,7 @@ def run_w4a16_moe(
     topk_sum_launch: W4A16TopKSumCompileResult | None = None,
     zero_fc2_output_override: bool | None = None,
     skip_topk_sum: bool = False,
+    retained_fc2_output: torch.Tensor | None = None,
     route_block_size_m: int | None = None,
     intermediate_rotation_scales: torch.Tensor | None = None,
     a_input_up: torch.Tensor | None = None,
@@ -14150,7 +14151,13 @@ def run_w4a16_moe(
                     f"got {tuple(table.shape)}/{table.dtype}/{table.device}/"
                     f"contiguous={table.is_contiguous()}"
                 )
-        required_a = m * topk * hidden_size
+        token_major_rotation = bool(
+            coupled_hadamard
+            and suh_gate_table.numel() == hidden_size
+            and suh_up_table.numel() == hidden_size
+            and _w4a16_token_major_rotation_enabled()
+        )
+        required_a = m * hidden_size * (1 if token_major_rotation else topk)
         for name, scratch in (
             ("rotation_a_gate", rotation_a_gate),
             ("rotation_a_up", rotation_a_up),
@@ -14712,7 +14719,35 @@ def run_w4a16_moe(
         )
     fc1_out = intermediate_cache13_flat[: capacity_routed_rows * fc1_cols]
     activated = intermediate_cache2_flat[: capacity_routed_rows * intermediate_size]
-    if use_prefill_fused_sum:
+    if retained_fc2_output is not None:
+        if use_fused_topk_sum:
+            raise ValueError("retained FC2 output requires a separate top-k sum")
+        required_fc2 = m * topk * hidden_size
+        if (
+            retained_fc2_output.dtype != cache_dtype
+            or retained_fc2_output.device != a_input.device
+            or not retained_fc2_output.is_contiguous()
+            or retained_fc2_output.numel() < required_fc2
+        ):
+            raise ValueError(
+                "retained FC2 output must be contiguous route storage in the "
+                "cache dtype on the input device, covering every live route"
+            )
+        for transient in (
+            intermediate_cache13,
+            intermediate_cache2,
+            fc1_c_tmp,
+            fc2_c_tmp,
+            rotation_a_gate,
+            rotation_a_up,
+            prepared.workspace,
+        ):
+            if transient is not None and torch._C._overlaps(
+                retained_fc2_output, transient
+            ):
+                raise ValueError("retained FC2 output must not alias transient scratch")
+        fc2_out = retained_fc2_output.view(-1)[:required_fc2]
+    elif use_prefill_fused_sum:
         assert prefill_sum_accum is not None
         fc2_out = prefill_sum_accum[: capacity_m * hidden_size]
     elif use_tc_decode:
