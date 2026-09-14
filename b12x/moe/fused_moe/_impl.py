@@ -3143,12 +3143,20 @@ def _build_tp_moe_fp4_binding_from_views(
                 "or capacity buffer on the input device"
             )
         output = output[:m]
-        # The persistent fused kernel uses this scratch for grid-barrier state.
-        # Unlike the ordinary W4A16 prepared object, this arena is caller-owned
-        # and may contain arbitrary bytes on its first bind. Record one zero-fill
-        # in the same stream as the launch; when bind occurs during CUDA graph
-        # capture the initialization is replayed with the graph as required.
-        tensors["kernel_workspace"].zero_()
+        # Caller-owned barrier state may contain arbitrary bytes on first use.
+        # Ordinary arenas initialize here; extended grouping arenas initialize
+        # at launch so the builder can absorb the fill during graph replay.
+        kernel_workspace = tensors["kernel_workspace"]
+        from b12x.moe._shared.kernels.w4a16 import reference_grouped
+        # An extended arena is initialized at launch: the grouped builder
+        # clears its barrier header, or the ordinary launch clears it for
+        # M1/M16/prefill. Binding alone does not initialize grouped metadata.
+        grouped_arena = (
+            k == 3584 and n in (256, 384)
+            and kernel_workspace.numel() == reference_grouped.workspace_layout(n).words
+        )
+        if not grouped_arena:
+            kernel_workspace.zero_()
 
     common_kwargs = dict(
         a=a,
@@ -3632,8 +3640,15 @@ def _plan_core_workspace(
                         "rotation_a_gate", (routed_capacity, int(k)), torch.float16
                     )
                 )
+            kernel_workspace_words = sms * 4 + 2
+            from b12x.moe._shared.kernels.w4a16 import reference_grouped
+            if (
+                reference_grouped.requested() and k == 3584 and n in (256, 384)
+                and trellis_bits == 2 and weight_E == 896
+            ):
+                kernel_workspace_words = reference_grouped.workspace_layout(n).words
             tensor_specs.append(
-                _TensorAllocSpec("kernel_workspace", (sms * 4 + 2,), torch.int32)
+                _TensorAllocSpec("kernel_workspace", (kernel_workspace_words,), torch.int32)
             )
             if not coupled_hadamard:
                 tensor_specs.append(
