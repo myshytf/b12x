@@ -1,6 +1,6 @@
 # Inline FC2 reference-group preparation
 
-Status: **implemented, research-only; native and model correctness qualified; mixed model performance, unselected**.
+Status: **implemented, research-only; native and model correctness qualified; selected with documented workload tradeoff**.
 
 The Kimi TP9 decode path can reuse FC2 weight tiles across routes without changing their numerical reduction contract. Routes share a tile only when their expert, output tile and complete ordered K intervals agree. Partial results retain the deployed descending-K merge order, FP16 operands/stores, FP32 accumulation and BF16 top-k output.
 
@@ -44,7 +44,7 @@ The legacy compiler-migration comparison helper rejects typed `OptLevel` option 
 
 ## Completed model comparison
 
-The unconditional candidate is unselected. Both request contracts use four unprofiled samples per arm and input length. All 32 timed requests preserve tokens and draft acceptance; all 16 logged requests preserve chosen/top-5 logprobs. Six matched-position profile requests also preserve their complete outputs.
+The user explicitly selected the implementation after reviewing the workload tradeoff. Both request contracts use four unprofiled samples per arm and input length. All 32 timed requests preserve tokens and draft acceptance; all 16 logged requests preserve chosen/top-5 logprobs. Six matched-position profile requests also preserve their complete outputs.
 
 | Request contract | Input | Reference tok/s | Inline tok/s | Change |
 |---|---:|---:|---:|---:|
@@ -57,4 +57,8 @@ The original selection captures started early and omitted requested logprobs. Ne
 
 Unprofiled delivery windows agree: initial 66-token windows improve about 0.63–0.65%, while final 254-token windows regress about 0.56–0.70%. All eight runs within each request contract have identical token chunk boundaries. Do not select a context-length heuristic from this prompt pair; collect actual grouping and cache evidence before an adaptive exact FC2 policy.
 
-The selected production package and original gateway/mode are restored and authenticated streaming generation passes. The candidate has no activation/cache/concurrency/vision qualification because it is unselected. Complete raw evidence and the decision are under the documented experiment root in `REPORT.md`, `qualification.json`, `deployment-decision.json`, `model-r1/`, `contracts-r1/` and `post-model/`.
+The selected production package and original gateway/mode are restored and authenticated streaming generation passes. Production activation passes exact startup, old-source cache restore, cache paths, four active requests and maximum-patch vision. Vision content/logprobs match the previous source; authenticated gateway streaming passes. Complete raw evidence and the decision are under the documented experiment root in `REPORT.md`, `qualification.json`, `deployment-decision.json`, `model-r1/`, `contracts-r1/` and `post-model/`.
+
+## Selected runtime
+
+Explicit user direction adopted the measured tradeoff after qualification. The selected package is `/home/g0san/kimi-k3-production/candidates/k3-inline-groups-20260915`; `activation-r1/activation.json` and `vision-source-gates.json` under the experiment root record the successful integration gates. The regular restart verifies source hashes and retains the exact-cache-compatible namespace. Future comparisons use this selected implementation as their reference. The 8K regression remains part of the specification.

@@ -1,5 +1,5 @@
 {
-  "status": "research-only; unselected after exact native and model qualification",
+  "status": "implemented; qualified; serving by explicit user selection",
   "current_revision": "8e50247e96fe5b4724f5596f7ae3d1480687ad9c",
   "metadata_fixture": {
     "status": "qualified",
@@ -100,8 +100,44 @@
     "expected_marker": true
   },
   "unperformed_checks": [
-    "No serving activation or new cache/concurrency/vision qualification for the unselected candidate.",
     "No adaptive FC2 policy, real per-layer route statistics or reset-free replay implementation."
   ],
-  "next_research": "Measure actual group/task counts and cache behavior at matched early/late positions before choosing an adaptive FC2 policy."
+  "next_research": "Measure actual group/task counts and cache behavior at matched early/late positions before choosing an adaptive FC2 policy.",
+  "activation": {
+    "status": "qualified; serving",
+    "package": "/home/g0san/kimi-k3-production/candidates/k3-inline-groups-20260915",
+    "verified_utc": "2026-09-14T18:20:06.463695+00:00",
+    "startup_exactness": [
+      {
+        "length": 8192,
+        "token_ids_equal": true,
+        "token_logprobs_equal": true,
+        "top_logprobs_equal": true,
+        "draft_steps_equal": true,
+        "accepted_draft_tokens_equal": true
+      },
+      {
+        "length": 65536,
+        "token_ids_equal": true,
+        "token_logprobs_equal": true,
+        "top_logprobs_equal": true,
+        "draft_steps_equal": true,
+        "accepted_draft_tokens_equal": true
+      }
+    ],
+    "namespace": "iso-k3-stable-routes-20260914",
+    "cross_source_cache_restore": {
+      "external_cache_hits": 13824.0,
+      "tokens_equal": true,
+      "logprobs_equal": true
+    },
+    "cache_restore": true,
+    "four_active": true,
+    "maximum_patch_vision": true,
+    "authenticated_gateway": true
+  },
+  "activation_vision_source": {
+    "content_equal": true,
+    "logprobs_equal": true
+  }
 }
