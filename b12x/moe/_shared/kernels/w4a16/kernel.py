@@ -923,6 +923,7 @@ class W4A16FusedMoeCompileResult:
     reference_grouped: bool = False
     reference_grouped_fc1: bool = False
     reference_grouped_inline: bool = False
+    reference_grouped_cursor: bool = False
 
 
 @dataclass(frozen=True)
@@ -1083,6 +1084,10 @@ class W4A16GemmKernel:
     ):
         self.reference_grouped_phase = int(reference_grouped_phase)
         self.reference_grouped_width = int(reference_grouped_width)
+        self.reference_grouped_cursor = (
+            self.reference_grouped_phase == 1
+            and os.environ.get("B12X_W4A16_GROUP_TASK_CURSOR", "0") == "1"
+        )
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
         if weight_layout not in _WEIGHT_LAYOUTS:
@@ -1630,6 +1635,7 @@ class W4A16GemmKernel:
             self.direct_topk_routes,
             self.reference_grouped_phase,
             self.reference_grouped_width,
+            self.reference_grouped_cursor,
             _reference_grouped.ABI_VERSION if self.reference_grouped_phase >= 0 else 0,
             self.dense_route_fast_path,
             self.dual_a,
@@ -2177,10 +2183,14 @@ class W4A16GemmKernel:
         for n in cutlass.range_constexpr(self.n_tiles):
             count += workspace[Int64(count_offset + n)].to(Int32)
         task = cta
+        n_tile_index = Int32(0)
+        local_task = task
+        n_count = workspace[Int64(count_offset)].to(Int32)
         while task < count:
-            n_tile_index = Int32(0)
-            local_task = task
-            n_count = workspace[Int64(count_offset)].to(Int32)
+            if cutlass.const_expr(not self.reference_grouped_cursor):
+                n_tile_index = Int32(0)
+                local_task = task
+                n_count = workspace[Int64(count_offset)].to(Int32)
             while local_task >= n_count:
                 local_task -= n_count
                 n_tile_index += Int32(1)
@@ -2206,6 +2216,11 @@ class W4A16GemmKernel:
                     partial_count, partial, lock_slot, active_size_m,
                 )
             task += grid_x
+            if cutlass.const_expr(self.reference_grouped_cursor):
+                # Preserve the exact CTA task sequence. The carried cursor
+                # satisfies task == prefix(counts, n_tile_index) + local_task;
+                # immutable column counts therefore need only a forward scan.
+                local_task += grid_x
 
     @cute.jit
     def _run_persistent_gemm_pipelined(
@@ -11693,6 +11708,7 @@ def compile_w4a16_fused_moe(
         reference_grouped=kernel.reference_grouped,
         reference_grouped_fc1=kernel.reference_grouped_fc1,
         reference_grouped_inline=kernel.reference_grouped_inline,
+        reference_grouped_cursor=kernel.fc2.reference_grouped_cursor,
     )
     _FUSED_CACHE[cache_key] = result
     return result
@@ -12649,7 +12665,8 @@ def _report_inline_group_launch(
         f"[b12x inline-group] pid={os.getpid()} device={device} inline=1 "
         f"rows={rows} width={fused.intermediate_size} grid={grid} "
         f"threads={fused.cta_threads} registers={fused.registers_per_thread} "
-        f"local_bytes={fused.local_memory_bytes} shared_bytes={fused.shared_memory_bytes}",
+        f"local_bytes={fused.local_memory_bytes} shared_bytes={fused.shared_memory_bytes} "
+        f"cursor={int(fused.reference_grouped_cursor)}",
         flush=True,
     )
 

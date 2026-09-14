@@ -31,6 +31,7 @@ def main():
     parser.add_argument("--m-values", default="1,2,4,8,16")
     parser.add_argument("--samples", type=int, default=60)
     parser.add_argument("--stages", action="store_true")
+    parser.add_argument("--all-invalid-check", action="store_true")
     parser.add_argument(
         "--external-sanitizer", action="store_true",
         help="Correctness only: leave CUPTI to Compute Sanitizer and omit timings.",
@@ -61,6 +62,10 @@ def main():
 
     def record_init(self, *positional, **keyword):
         original_init(self, *positional, **keyword)
+        assert getattr(self.fc2, "reference_grouped_cursor", False) == (
+            self.reference_grouped
+            and os.environ.get("B12X_W4A16_GROUP_TASK_CURSOR", "0") == "1"
+        )
         if args.mode == 2 and self.reference_grouped:
             assert self.reference_grouped_inline, {
                 "message": "Inline preparation was not selected",
@@ -78,6 +83,7 @@ def main():
             "inline_builder": self.reference_grouped_inline,
             "fc1_grouped": self.fc1.reference_grouped_phase >= 0,
             "fc2_grouped": self.fc2.reference_grouped_phase >= 0,
+            "fc2_grouped_cursor": getattr(self.fc2, "reference_grouped_cursor", False),
             "fc1_n": self.fc1.tile_n,
             "fc1_threads": self.fc1.cta_threads,
             "fc2_threads": self.fc2.cta_threads,
@@ -105,6 +111,7 @@ def main():
             assert compiled.reference_grouped_inline == expected
             launch_context.update(
                 inline_builder=compiled.reference_grouped_inline,
+                grouped_cursor=getattr(compiled, "reference_grouped_cursor", False),
                 kernel_symbol=compiled.kernel_symbol,
             )
         return compiled
@@ -355,6 +362,16 @@ def main():
                 input_hashes.append([digest(x), digest(ids), digest(routing)])
             for target, source in zip((x, ids, routing), timing_inputs, strict=True):
                 target.copy_(source)
+            if args.all_invalid_check:
+                ids.fill_(-1)
+                expected_empty = run().clone()
+                graph.replay()
+                torch.accelerator.synchronize()
+                assert torch.count_nonzero(expected_empty) == 0
+                torch.testing.assert_close(replay, expected_empty, rtol=0, atol=0)
+                hashes.append(digest(replay))
+                input_hashes.append([digest(x), digest(ids), digest(routing)])
+                ids.copy_(timing_inputs[1])
             graph.replay()
             torch.accelerator.synchronize()
             torch.testing.assert_close(replay, eager, rtol=0, atol=0)
@@ -379,6 +396,7 @@ def main():
                 "m": m,
                 "output_dtype": str(output.dtype),
                 "eager_graph_exact": True,
+                "all_invalid_zero_checked": args.all_invalid_check,
                 "chosen_launch": chosen,
                 "output_hashes": hashes,
                 "launch_blocks": launch_blocks,
@@ -430,6 +448,7 @@ def main():
                     "schedule_whole_tiles",
                     "reference_grouped",
                     "reference_grouped_inline",
+                    "reference_grouped_cursor",
                 )
             }
             for v in kernel_module._FUSED_CACHE.values()
