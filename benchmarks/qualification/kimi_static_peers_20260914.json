@@ -1,5 +1,5 @@
 {
-  "status": "qualified native and controlled model comparison; activation pending",
+  "status": "implemented; qualified; serving",
   "source": {
     "tree": "/home/g0san/worktrees/b12x-static-peers-20260914",
     "head": "b3758c052174fcf3cc41d34ce24020a04ec8a766",
@@ -898,10 +898,10 @@
     ]
   },
   "limitations": [
-    "Performance is qualified for the two controlled workloads on these nine GPUs, not for every prompt or batch shape.",
-    "The candidate graph has positive register deltas on some ranks, with zero stack/local memory.",
-    "Final activation, cross-source external-cache restore and gateway verification are pending.",
-    "Profiler times are diagnostic and excluded from throughput calculations."
+    "Throughput is qualified for the two controlled workloads on this TP9/DCP9 hardware; no claim is made for every prompt or concurrency level.",
+    "The configured 1048576-token maximum was retained, not rebenchmarked by this decode experiment.",
+    "Positive register deltas on some ranks are recorded; all inspected kernels have zero stack/local memory.",
+    "Profiler timings are diagnostic and excluded from throughput calculations."
   ],
   "actual_model_selection": {
     "8192": {
@@ -1177,5 +1177,41 @@
       "benchmarks/inspect_static_peer_objects.py": "a42690677ca994a0b7b047656adabdc8abf3d6f2d58a961b8fc76e6ad64fff39"
     },
     "exact_research_sources": true
-  }
+  },
+  "activation": {
+    "status": "qualified; serving",
+    "package": "/home/g0san/kimi-k3-production/candidates/k3-static-peers-20260914",
+    "verified_utc": "2026-09-14T13:58:10.183441+00:00",
+    "startup_exactness": [
+      {
+        "length": 8192,
+        "token_ids_equal": true,
+        "token_logprobs_equal": true,
+        "top_logprobs_equal": true,
+        "draft_steps_equal": true,
+        "accepted_draft_tokens_equal": true
+      },
+      {
+        "length": 65536,
+        "token_ids_equal": true,
+        "token_logprobs_equal": true,
+        "top_logprobs_equal": true,
+        "draft_steps_equal": true,
+        "accepted_draft_tokens_equal": true
+      }
+    ],
+    "namespace": "iso-k3-stable-routes-20260914",
+    "cross_source_cache_restore": {
+      "external_cache_hits": 13824.0,
+      "tokens_equal": true,
+      "logprobs_equal": true
+    },
+    "cache_restore": true,
+    "four_active": true,
+    "maximum_patch_vision": true,
+    "authenticated_gateway": true,
+    "source_hashes_match": true,
+    "known_corrected_failure": "The first gateway probe preceded listener readiness and got ConnectionRefusedError. Authenticated retry passed without another model restart; activate.py now waits for the listener."
+  },
+  "review_pr": "https://github.com/myshytf/b12x/pull/10"
 }

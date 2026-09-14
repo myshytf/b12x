@@ -1,6 +1,6 @@
 # Static peer addresses in TP9 decode all-reduce
 
-Status: **qualified native and controlled model comparison; activation pending**.
+Status: **implemented; qualified; serving**.
 
 The deployed push collective uses a rank-specific compiled object but passes its rank as a runtime scalar when selecting peer pointers. The candidate keeps that operand constant. It retains BF16 transfer bytes, the shard-owner FP32 addition order, two barriers, slot alternation, 512 threads and the reference grid. `B12X_PCIE_TP9_STATIC_PEERS=1` freezes the opt-in at runtime creation and selects this path only for TP9, eight-element wire rows and payloads through 112 KiB. Larger payloads retain ordinary push.
 
@@ -10,9 +10,9 @@ The first matrix covers 11 payload shapes on all nine physical GPUs. An independ
 
 For M4/3584, the first two unprofiled ABBA runs change 11.5735 to 11.2530 and 11.6350 to 11.2850 microseconds per collective. For M4/7168 they change 16.6930 to 16.5650 and 16.7230 to 16.6290. Latencies use each sample's slowest rank, divided by 32 calls. The runtime-policy run gives 11.5730 to 11.3150 and 16.6930 to 16.5955. These isolated measurements do not establish full-model throughput.
 
-Resource inspection binds 54 cached objects to their manifests, extracts the immutable embedded CUDA ELFs and records `cuobjdump` declarations. Stack and local memory are zero throughout. Graph register counts change from 118 to 124,107,126,110,124,106,112,126,96 for ranks 0 through 8 respectively. Positive deltas remain visible; the target trace retains one CTA of 512 threads and zero shared memory. The model comparison must determine the effect under concurrent execution.
+Resource inspection binds 54 cached objects to their manifests, extracts the immutable embedded CUDA ELFs and records `cuobjdump` declarations. Stack and local memory are zero throughout. Graph register counts change from 118 to 124,107,126,110,124,106,112,126,96 for ranks 0 through 8 respectively. Positive deltas remain visible; the target trace retains one CTA of 512 threads and zero shared memory. The controlled model comparison below measures the effect with the existing stream overlap.
 
-Raw commands, source manifests, GPU snapshots, output hashes, balanced timings and profiler traces are under `gpu-r1/`. `native-qualification.json` summarizes their scope. The native window restored cache32 and passed authenticated SSE verification (`post-native/gateway-final.json`). `model-r1/` is the subsequent isolated A/B/B/A model qualification, with four samples per arm at each of 8192 and 65536 input tokens. Tokens, chosen/top logprobs and speculative acceptance must match before a model speed claim or serving selection. Candidate package: `/home/g0san/kimi-k3-production/candidates/k3-static-peers-20260914`.
+Raw commands, source manifests, GPU snapshots, output hashes, balanced timings and profiler traces are under `gpu-r1/`. `native-qualification.json` summarizes their scope. The native window restored cache32 and passed authenticated SSE verification (`post-native/gateway-final.json`). `model-r1/` is the subsequent isolated A/B/B/A model qualification, with four samples per arm at each of 8192 and 65536 input tokens. Tokens, chosen/top logprobs and speculative acceptance match in every measured request. Candidate package: `/home/g0san/kimi-k3-production/candidates/k3-static-peers-20260914`.
 
 ## Controlled model comparison
 
@@ -20,4 +20,4 @@ A/B/B/A completed with four samples per arm at each workload. At 8192 input / 10
 
 Both candidate traces contain four complete target steps. Each step runs 278 static-peer collectives at one CTA, 512 threads, zero shared memory and 124 registers on rank 0. The reference trace has 118 registers with the same collective count and geometry. The native object census binds these resource signatures to the implementations. Trace times are excluded from the throughput comparison.
 
-The measured candidate used its dedicated isolated namespace. Activation will reuse the qualified stable-route namespace only after an old-source/new-source external-cache restoration comparison. The new fingerprint will not be added to the global production namespace registry. Reboot exactness and cache, four-active-request, maximum-patch image and gateway checks remain pending in `activation-r1/`.
+The measured candidate used its dedicated isolated namespace. Activation reuses the qualified `iso-k3-stable-routes-20260914` namespace after the old-source/new-source external-cache comparison passes. Both arms actually restore 13,824 cached tokens and return identical tokens/logprobs. The global production fingerprint registry is unchanged. Reboot 8K/64K output/logprob/acceptance, cold/continuation/external restore, four active requests, 4096x4096 image and authenticated terminal-SSE checks pass. Receipts are in `activation-r1/`. The initial gateway probe raced listener startup; a ready listener passed the retry, and the activation helper now waits for it. No additional model restart was needed for that retry.
