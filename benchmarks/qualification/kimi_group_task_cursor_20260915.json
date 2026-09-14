@@ -29,7 +29,8 @@
     "stack_frame_local_bytes": 0,
     "launch_threads": 256,
     "launch_dynamic_shared_bytes": 101376,
-    "limitation": "Legacy migration normalization rejects typed OptLevel; raw identity and launch evidence remain independently verified."
+    "limitation": "Legacy migration normalization rejects typed OptLevel; raw identity and launch evidence remain independently verified.",
+    "paired_objects_with_zero_gpr_delta": 14
   },
   "model": {
     "status": "qualified",
@@ -108,7 +109,8 @@
     "model-r1/stream-window-comparison.json": "f41cb350c6e5148ce0d35e272af8d9db8b702b8899024a13b11b52384b18fe6c",
     "gpu-r2/gpu6-comparison.json": "1ea14dc831aabfc9d0e42bc2ad1cbc6422503a0a138875efe64c5f436726e6a3",
     "gpu-r2/object-resources.json": "008209c063f7deb9aa9837c1a937292f19683099e038083b90626eadd4fce1e5",
-    "activation-r1/activation.json": "c2fe5a745cb2e0ec3fd6f79d9b9f856482e12d09f23b36fbc6cc904e994828b0"
+    "activation-r1/activation.json": "c2fe5a745cb2e0ec3fd6f79d9b9f856482e12d09f23b36fbc6cc904e994828b0",
+    "gpu-r2/resource-comparison.json": "b715dfdf2fe4207b221537b6c4132072b8008903565f6492e9cfd86471c08f02"
   },
   "limitations": [
     "The GPU 6 fully shared width-256 native fixture regresses 0.79%.",
