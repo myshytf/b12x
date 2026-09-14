@@ -939,6 +939,13 @@ class _TwoShotPushAllReduceLaunch(_TwoShotPullAllReduceLaunch):
     bit-identical between the two kernels.
     """
 
+    def __init__(self, *args, static_peers: bool = False) -> None:
+        super().__init__(*args)
+        # The launcher cache and runtime already bind a specialization to one
+        # rank. Keeping it constant lets the compiler resolve peer pointers
+        # without changing the shard owner or its ordered FP32 accumulation.
+        self._static_peers = bool(static_peers)
+
     @cute.jit
     def __call__(
         self,
@@ -1062,7 +1069,10 @@ class _TwoShotPushAllReduceLaunch(_TwoShotPullAllReduceLaunch):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         gdim, _, _ = cute.arch.grid_dim()
-        local_rank = rank
+        if cutlass.const_expr(self._static_peers):
+            local_rank = Int32(self._rank)
+        else:
+            local_rank = rank
         packs_per_row = Int32(self._row_elems // _PACK_ELEMS)
         base_packs = Int64(rows_per_rank) * Int64(packs_per_row)
         shard_base = Int64(local_rank) * base_packs + Int64(
@@ -1218,10 +1228,13 @@ def get_twoshot_bf16_allreduce_launcher(
     """Compile the single-launch bf16 all-reduce specialization.
 
     ``mode`` selects the remote-read (``"pull"``) or posted-write (``"push"``)
-    kernel; both use the same shard partition and reduction order.
+    kernel. The research-only ``"push_static"`` mode specializes the existing
+    rank operand at TP9. All retain the same shard partition and sum order.
     """
-    if mode not in ("pull", "push"):
+    if mode not in ("pull", "push", "push_static"):
         raise ValueError(f"invalid all-reduce mode {mode!r}")
+    if mode == "push_static" and world_size != 9:
+        raise ValueError("the static-peer push experiment supports TP9 only")
     operation = f"all_reduce_{mode}"
     process_key = _bf16_process_key(
         operation,
@@ -1243,9 +1256,9 @@ def get_twoshot_bf16_allreduce_launcher(
     if row_elems <= 0 or row_elems % _PACK_ELEMS != 0:
         raise ValueError("row_elems must be a positive multiple of 8")
     slot_bias = int(slot_bias) & 1
-    launch_cls = (
-        _TwoShotPushAllReduceLaunch if mode == "push" else _TwoShotPullAllReduceLaunch
-    )
+    push = mode in ("push", "push_static")
+    launch_cls = _TwoShotPushAllReduceLaunch if push else _TwoShotPullAllReduceLaunch
+    launch_kwargs = {"static_peers": mode == "push_static"} if push else {}
     launch = launch_cls(
         world_size,
         rank,
@@ -1253,6 +1266,7 @@ def get_twoshot_bf16_allreduce_launcher(
         slot_bias,
         threads,
         row_elems,
+        **launch_kwargs,
     )
     cache_key = (
         "bf16",
@@ -1269,7 +1283,7 @@ def get_twoshot_bf16_allreduce_launcher(
     )
     # The push kernel takes the per-source pack stride ahead of the reduced
     # region offset; the pull kernel does not need it.
-    scalar_samples = (0, 1, 1, 1, 1, 0, 1) if mode == "push" else (0, 1, 1, 1, 0, 1)
+    scalar_samples = (0, 1, 1, 1, 1, 0, 1) if push else (0, 1, 1, 1, 0, 1)
     raw = b12x_compile(
         launch,
         make_ptr(cutlass.Uint32, 16, cute.AddressSpace.gmem, assumed_align=16),
@@ -1301,6 +1315,8 @@ def get_twoshot_bf16_allreduce_launcher(
         ),
     )
 
+    compiled_rank = int(rank)
+
     def run(
         payload_address: int,
         staging_addresses: Sequence[int],
@@ -1318,7 +1334,9 @@ def get_twoshot_bf16_allreduce_launcher(
             raise ValueError("two-shot scalar pointer ABI requires nine peer slots")
         if not 0 <= int(remainder_packs) < world_size:
             raise ValueError("remainder_packs must be below the world size")
-        if mode == "push":
+        if mode == "push_static" and rank != compiled_rank:
+            raise ValueError("static-peer launcher rank does not match its specialization")
+        if push:
             if pack_stride <= 0:
                 raise ValueError("the push all-reduce needs a positive pack_stride")
             scalars = (rank, pack_stride, reduced_offset, slot_bytes,

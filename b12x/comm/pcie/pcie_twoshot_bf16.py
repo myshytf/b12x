@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import os
 from typing import Optional, Sequence
 
 import torch
@@ -193,6 +194,13 @@ class PCIeTwoShotBF16:
         # "pull": remote reads (the original single-launch kernel);
         # "push": posted remote writes. Same partition and reduction order.
         self.all_reduce_mode = "pull"
+        # Freeze the opt-in before graph preparation. The kernel specialization
+        # and replay path must not depend on later environment changes.
+        self._static_peers_enabled = (
+            world_size == 9
+            and row_elems == _PACK_ELEMS
+            and os.getenv("B12X_PCIE_TP9_STATIC_PEERS", "0") == "1"
+        )
         return self
 
     @classmethod
@@ -381,6 +389,15 @@ class PCIeTwoShotBF16:
 
     # ---- graph plumbing ---------------------------------------------------
 
+    def _all_reduce_kernel_mode(self, rows_per_rank: int, remainder_packs: int) -> str:
+        mode = self.all_reduce_mode
+        total_packs = rows_per_rank * self.world_size + remainder_packs
+        if self._static_peers_enabled and mode == "push" and total_packs <= 7168:
+            # Up to eight Kimi hidden rows (or sixteen latent rows). Larger
+            # messages retain the deployed path; they had no established gain.
+            return "push_static"
+        return mode
+
     def prepare_graph(
         self,
         *,
@@ -411,17 +428,21 @@ class PCIeTwoShotBF16:
                         self.row_elems,
                         device_index,
                     )
-            for slot_bias in (0, 1):
-                get_twoshot_bf16_allreduce_launcher(
-                    self.world_size,
-                    self.rank,
-                    True,
-                    slot_bias,
-                    threads,
-                    self.row_elems,
-                    device_index,
-                    self.all_reduce_mode,
-                )
+            modes = [self.all_reduce_mode]
+            if self._static_peers_enabled and self.all_reduce_mode == "push":
+                modes.append("push_static")
+            for mode in modes:
+                for slot_bias in (0, 1):
+                    get_twoshot_bf16_allreduce_launcher(
+                        self.world_size,
+                        self.rank,
+                        True,
+                        slot_bias,
+                        threads,
+                        self.row_elems,
+                        device_index,
+                        mode,
+                    )
 
     @contextmanager
     def capture(
@@ -508,7 +529,7 @@ class PCIeTwoShotBF16:
                     threads,
                     self.row_elems,
                     device_index,
-                    self.all_reduce_mode,
+                    self._all_reduce_kernel_mode(rows_per_rank, remainder_packs),
                 )
             else:
                 prepared = is_twoshot_bf16_launcher_prepared(
@@ -670,7 +691,7 @@ class PCIeTwoShotBF16:
                 threads,
                 self.row_elems,
                 device_index,
-                self.all_reduce_mode,
+                self._all_reduce_kernel_mode(rows_per_rank, remainder_packs),
             )
             launcher(
                 payload.data_ptr(),
