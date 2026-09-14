@@ -1,0 +1,151 @@
+{
+  "status": "implemented; qualified; serving",
+  "source_revision": "81c899d4a2c6e43fd520d7f01df238c676598eb8",
+  "source_files_sha256": {
+    "b12x/moe/_shared/kernels/w4a16/kernel.py": "78078a22002d029942c6a26d23662a3ace689466d7b5ce0924e2b067a0da3ebe",
+    "benchmarks/benchmark_kimi_inline_groups.py": "589bff1e449fade82b7470046f058a93a96aa1c60d223e2c541ffccf4090d371"
+  },
+  "reference_package": "/home/g0san/kimi-k3-production/candidates/k3-inline-groups-20260915",
+  "candidate_package": "/home/g0san/kimi-k3-production/candidates/k3-group-task-cursor-20260915",
+  "artifact_root": "/home/g0san/kimi-k3-production/research/decode-optimization-20260914/group-task-cursor-20260915",
+  "native": {
+    "configurations": 54,
+    "exact_snapshots": 270,
+    "all_invalid_routes": true,
+    "retained_stages_exact": true,
+    "actual_deployed_reference_kernel": true,
+    "physical_gpus": [
+      5,
+      6
+    ]
+  },
+  "resources": {
+    "objects": 28,
+    "gprs": [
+      115,
+      125
+    ],
+    "gpr_delta": 0,
+    "stack_frame_local_bytes": 0,
+    "launch_threads": 256,
+    "launch_dynamic_shared_bytes": 101376,
+    "limitation": "Legacy migration normalization rejects typed OptLevel; raw identity and launch evidence remain independently verified."
+  },
+  "model": {
+    "status": "qualified",
+    "timed_requests": 16,
+    "all_tokens_chosen_top5_logprobs_and_acceptance_exact": true,
+    "samples_per_arm_per_length": 4,
+    "order": "A-before x2, B-first x2, B-second x2, A-after x2",
+    "comparison": [
+      {
+        "length": 8192,
+        "reference_tok_s": 119.7152499331724,
+        "candidate_tok_s": 120.98208371328045,
+        "candidate_over_reference": 1.0105820585164815
+      },
+      {
+        "length": 65536,
+        "reference_tok_s": 92.30655483625848,
+        "candidate_tok_s": 93.00820955742738,
+        "candidate_over_reference": 1.0076013531478187
+      }
+    ],
+    "stream_window_comparison": [
+      {
+        "start_tokens": 1,
+        "end_tokens": 67,
+        "reference_tok_s": 118.6440959291123,
+        "cursor_tok_s": 119.75003141518233,
+        "cursor_over_reference": 1.0093214540294597
+      },
+      {
+        "start_tokens": 67,
+        "end_tokens": 131,
+        "reference_tok_s": 120.84678260385769,
+        "cursor_tok_s": 122.09825992639912,
+        "cursor_over_reference": 1.0103559010473935
+      },
+      {
+        "start_tokens": 131,
+        "end_tokens": 259,
+        "reference_tok_s": 120.56871416675767,
+        "cursor_tok_s": 121.80059956197042,
+        "cursor_over_reference": 1.010217288985175
+      },
+      {
+        "start_tokens": 259,
+        "end_tokens": 515,
+        "reference_tok_s": 120.33663233910158,
+        "cursor_tok_s": 121.64466783369232,
+        "cursor_over_reference": 1.0108698030613386
+      },
+      {
+        "start_tokens": 515,
+        "end_tokens": 770,
+        "reference_tok_s": 119.42543138614255,
+        "cursor_tok_s": 120.7085182655184,
+        "cursor_over_reference": 1.0107438329046283
+      },
+      {
+        "start_tokens": 770,
+        "end_tokens": 1024,
+        "reference_tok_s": 118.85525594332509,
+        "cursor_tok_s": 120.18820466658053,
+        "cursor_over_reference": 1.011214890857591
+      }
+    ]
+  },
+  "review": {
+    "cpu_policy_tests": 17,
+    "ruff": "passed",
+    "runtime_composition_limitation": "Four selected communication overlay files differ from or are absent in the public review base; preserve the production static-peer source manifest for reproduction."
+  },
+  "evidence_sha256": {
+    "native-gates.json": "0d706601ed6b9008ebb3f7b5f0ffa51643d7ef79866efa6c52253982f0c94d7d",
+    "model-r1/comparison.json": "1ca2ae73fd3da41fc6b6f4f39749a9ef60bd7f2efa6d46546fb26179ec793c83",
+    "model-r1/model-gates.json": "0ca7217f5ac92cc409ca812bc39e4de52b3966602039d1a973827e60cc96b256",
+    "model-r1/stream-window-comparison.json": "f41cb350c6e5148ce0d35e272af8d9db8b702b8899024a13b11b52384b18fe6c",
+    "gpu-r2/gpu6-comparison.json": "1ea14dc831aabfc9d0e42bc2ad1cbc6422503a0a138875efe64c5f436726e6a3",
+    "gpu-r2/object-resources.json": "008209c063f7deb9aa9837c1a937292f19683099e038083b90626eadd4fce1e5",
+    "activation-r1/activation.json": "c2fe5a745cb2e0ec3fd6f79d9b9f856482e12d09f23b36fbc6cc904e994828b0"
+  },
+  "limitations": [
+    "The GPU 6 fully shared width-256 native fixture regresses 0.79%.",
+    "Performance evidence uses two fixed-prompt lengths; no general prompt or maximum-context guarantee.",
+    "No new dedicated memory-sanitizer campaign was run for the integer cursor change; its base inline path has the retained targeted audit."
+  ],
+  "activation": {
+    "status": "qualified; serving",
+    "package": "/home/g0san/kimi-k3-production/candidates/k3-group-task-cursor-20260915",
+    "verified_utc": "2026-09-14T20:29:41.531903+00:00",
+    "startup_exactness": [
+      {
+        "length": 8192,
+        "token_ids_equal": true,
+        "token_logprobs_equal": true,
+        "top_logprobs_equal": true,
+        "draft_steps_equal": true,
+        "accepted_draft_tokens_equal": true
+      },
+      {
+        "length": 65536,
+        "token_ids_equal": true,
+        "token_logprobs_equal": true,
+        "top_logprobs_equal": true,
+        "draft_steps_equal": true,
+        "accepted_draft_tokens_equal": true
+      }
+    ],
+    "namespace": "iso-k3-stable-routes-20260914",
+    "cross_source_cache_restore": {
+      "external_cache_hits": 13824.0,
+      "tokens_equal": true,
+      "logprobs_equal": true
+    },
+    "cache_restore": true,
+    "four_active": true,
+    "maximum_patch_vision": true,
+    "authenticated_gateway": true
+  }
+}
