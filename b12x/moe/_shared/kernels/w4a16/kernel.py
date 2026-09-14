@@ -102,6 +102,7 @@ from b12x._lib.quant.sqg_fp16_d3l import (
     sqg_fp16_d3l_descriptors,
 )
 from b12x._lib.utils import current_cuda_stream, make_ptr
+from b12x.moe._shared.kernels.w4a16 import reference_grouped as _reference_grouped
 from b12x.moe._shared.kernels.w4a16.route_pack import (
     pack_topk_routes_by_expert as _pack_topk_routes_by_expert,
 )
@@ -919,6 +920,9 @@ class W4A16FusedMoeCompileResult:
     local_memory_bytes: int = -1
     cta_threads: int = -1
     shared_memory_bytes: int = -1
+    reference_grouped: bool = False
+    reference_grouped_fc1: bool = False
+    reference_grouped_inline: bool = False
 
 
 @dataclass(frozen=True)
@@ -1074,7 +1078,11 @@ class W4A16GemmKernel:
         schedule_route_block_factor: int = 1,
         paired_m8_routes: bool = False,
         cta_threads_multiplier: int = 1,
+        reference_grouped_phase: int = -1,
+        reference_grouped_width: int = 0,
     ):
+        self.reference_grouped_phase = int(reference_grouped_phase)
+        self.reference_grouped_width = int(reference_grouped_width)
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
         if weight_layout not in _WEIGHT_LAYOUTS:
@@ -1620,6 +1628,9 @@ class W4A16GemmKernel:
             self.source_n_rotation,
             self.single_token_route_fast_path,
             self.direct_topk_routes,
+            self.reference_grouped_phase,
+            self.reference_grouped_width,
+            _reference_grouped.ABI_VERSION if self.reference_grouped_phase >= 0 else 0,
             self.dense_route_fast_path,
             self.dual_a,
             self.route_major_a,
@@ -1902,6 +1913,13 @@ class W4A16GemmKernel:
         active_size_m: Int32,
         emit_tile: cutlass.Constexpr = None,
     ):
+        if cutlass.const_expr(self.reference_grouped_phase >= 0):
+            self._run_reference_grouped_tasks(
+                a_bf16_flat, a_alt_bf16_flat, b_i32_flat, c_bf16_flat,
+                scales_i32_flat, global_scale, topk_weights_flat, locks_i32_flat,
+                trellis_lut_addr, smem_base, tid, cta, grid_x, active_size_m,
+            )
+            return
         if cutlass.const_expr(self.cross_tile_prefetch and emit_tile is None):
             self._run_persistent_gemm_pipelined(
                 a_bf16_flat,
@@ -2125,6 +2143,69 @@ class W4A16GemmKernel:
                     if output_n_tile == n_tiles:
                         output_n_tile = Int32(0)
                         route_block_idx += Int32(1)
+
+    @cute.jit
+    def _run_reference_grouped_tasks(
+        self, a_bf16_flat: cute.Tensor, a_alt_bf16_flat: cute.Tensor,
+        b_i32_flat: cute.Tensor, c_bf16_flat: cute.Tensor,
+        scales_i32_flat: cute.Tensor, global_scale: cute.Tensor,
+        topk_weights_flat: cute.Tensor, workspace: cute.Tensor,
+        trellis_lut_addr: Int64, smem_base: Int32, tid: Int32,
+        cta: Int32, grid_x: Int32, active_size_m: Int32,
+    ):
+        layout = _reference_grouped.workspace_layout(self.reference_grouped_width)
+        route_offset = layout.fc1_routes
+        task_offset = layout.fc1_tasks
+        count_offset = layout.fc1_counts
+        if cutlass.const_expr(self.reference_grouped_phase == 1):
+            route_offset = layout.fc2_routes
+            task_offset = layout.fc2_tasks
+            count_offset = layout.fc2_counts
+        routes = cute.make_tensor(
+            workspace.iterator + Int64(route_offset),
+            cute.make_layout((_reference_grouped.MAX_ROUTES * self.n_tiles * 8,), stride=(1,)),
+        )
+        locks = cute.make_tensor(
+            workspace.iterator + Int64(layout.locks),
+            cute.make_layout((_reference_grouped.MAX_ROUTES * 28,), stride=(1,)),
+        )
+        partials = cute.make_tensor(
+            cute.recast_ptr(workspace.iterator + Int64(layout.partials), dtype=cutlass.Float32),
+            cute.make_layout((layout.words - layout.partials,), stride=(1,)),
+        )
+        count = Int32(0)
+        for n in cutlass.range_constexpr(self.n_tiles):
+            count += workspace[Int64(count_offset + n)].to(Int32)
+        task = cta
+        while task < count:
+            n_tile_index = Int32(0)
+            local_task = task
+            n_count = workspace[Int64(count_offset)].to(Int32)
+            while local_task >= n_count:
+                local_task -= n_count
+                n_tile_index += Int32(1)
+                n_count = workspace[Int64(count_offset) + Int64(n_tile_index)].to(Int32)
+            offset = Int64(task_offset) + (
+                Int64(n_tile_index) * Int64(_reference_grouped.MAX_ROUTES * _reference_grouped.MAX_PARTIALS)
+                + Int64(local_task)
+            ) * Int64(_reference_grouped.TASK_WORDS)
+            expert = workspace[offset].to(Int32)
+            if expert >= Int32(0):
+                group = workspace[offset + Int64(1)].to(Int32)
+                n_tile = workspace[offset + Int64(2)].to(Int32)
+                k_begin = workspace[offset + Int64(3)].to(Int32)
+                k_count = workspace[offset + Int64(4)].to(Int32)
+                partial = workspace[offset + Int64(5)].to(Int32)
+                partial_count = workspace[offset + Int64(6)].to(Int32)
+                lock_slot = workspace[offset + Int64(7)].to(Int32)
+                self._run_tile(
+                    a_bf16_flat, a_alt_bf16_flat, b_i32_flat, c_bf16_flat,
+                    scales_i32_flat, global_scale, routes, topk_weights_flat,
+                    partials, locks, trellis_lut_addr, smem_base, tid,
+                    group, expert, n_tile, k_begin, k_count,
+                    partial_count, partial, lock_slot, active_size_m,
+                )
+            task += grid_x
 
     @cute.jit
     def _run_persistent_gemm_pipelined(
@@ -7400,6 +7481,21 @@ class W4A16FusedMoeKernel:
             and self.broadcast_suh
             and _w4a16_token_major_rotation_enabled()
         )
+        self.reference_grouped = bool(
+            _reference_grouped.requested()
+            and self.full_rotation and self.coupled_hadamard
+            and self.direct_topk_routes and self.use_expert_map
+            and self.small_m_splitk and self.trellis_bits == 2
+            and self.trellis_codebook == "sqg_xor_cheb_t12"
+            and hidden_size == 3584 and intermediate_size in (256, 384)
+            and num_experts == 896 and top_k == 16 and 2 <= size_m <= 8
+            and moe_block_size == 8
+            and (fc1_tile_n, fc1_tile_k, fc2_tile_n, fc2_tile_k) == (128, 128, 128, 128)
+        )
+        grouped_phases = os.environ.get("B12X_W4A16_REFERENCE_GROUPED_PHASES", "both")
+        if self.reference_grouped and grouped_phases not in ("both", "fc2"):
+            raise ValueError("reference grouped phases must be 'both' or 'fc2'")
+        self.reference_grouped_fc1 = self.reference_grouped and grouped_phases == "both"
         fc1_source_n_rotation = (
             int(intermediate_size)
             if (weight_layout == "modelopt" and w13_layout == "w13" and is_gated)
@@ -7428,11 +7524,13 @@ class W4A16FusedMoeKernel:
             trellis_rate_axis=("n" if self.fc1_trellis_pair_kind is not None else None),
             source_n_rotation=fc1_source_n_rotation,
             single_token_route_fast_path=size_m == 1 and not self.direct_topk_routes,
-            direct_topk_routes=self.direct_topk_routes,
+            direct_topk_routes=self.direct_topk_routes and not self.reference_grouped_fc1,
             dual_a=self.dual_a,
             route_major_a=self.full_rotation and not self.token_major_rotation,
             schedule_whole_tiles=self.schedule_whole_tiles,
             dynamic_num_experts=self.dynamic_num_experts,
+            reference_grouped_phase=0 if self.reference_grouped_fc1 else -1,
+            reference_grouped_width=intermediate_size if self.reference_grouped_fc1 else 0,
         )
         self.fc2 = W4A16GemmKernel(
             size_m=routed_rows,
@@ -7459,7 +7557,7 @@ class W4A16FusedMoeKernel:
             trellis_pair_kind=self.fc2_trellis_pair_kind,
             trellis_rate_axis=("k" if self.fc2_trellis_pair_kind is not None else None),
             single_token_route_fast_path=size_m == 1 and not self.direct_topk_routes,
-            direct_topk_routes=self.direct_topk_routes,
+            direct_topk_routes=self.direct_topk_routes and not self.reference_grouped,
             fused_topk_sum=(
                 self.tc_decode_fused_sum or self.prefill_fused_sum_fp32
             ),
@@ -7472,6 +7570,8 @@ class W4A16FusedMoeKernel:
                 self.fc2_moe_block_size == 8
                 and self.fc2_schedule_route_block_factor == 2
             ),
+            reference_grouped_phase=1 if self.reference_grouped else -1,
+            reference_grouped_width=intermediate_size if self.reference_grouped else 0,
         )
         self.cta_threads_multiplier = int(cta_threads_multiplier)
         self.cta_threads = max(self.fc1.cta_threads, self.fc2.cta_threads)
@@ -7480,6 +7580,10 @@ class W4A16FusedMoeKernel:
                 "fused W4A16 kernel expects matching FC1/FC2 thread counts"
             )
         self.sms = self.fc1.sms
+        if self.reference_grouped and (
+            self.cta_threads != 256 or self.sms * 4 + 2 > _reference_grouped.HEADER_WORDS
+        ):
+            raise ValueError("reference grouping requires 256 threads and a supported resident grid")
         self.blocks_per_sm = min(self.fc1.blocks_per_sm, self.fc2.blocks_per_sm)
         self.shared_words = max(self.fc1.shared_words, self.fc2.shared_words)
         self.sqg_xor_cheb_t12_smem = (
@@ -7553,6 +7657,17 @@ class W4A16FusedMoeKernel:
             self.fc2.sqg_xor_cheb_t12_direct_smem = self.sqg_xor_cheb_t12_direct_smem
         self.barrier_count_off = self.sms * 4
         self.barrier_sense_off = self.sms * 4 + 1
+        self.reference_grouped_inline = bool(
+            self.reference_grouped and not self.reference_grouped_fc1
+            and self.sqg_xor_cheb_t12_direct_smem
+            and self.cta_threads == 256 and self.blocks_per_sm == 1
+            # This is the reserved execution budget, not physical SM count:
+            # production keeps two of the 188 SMs available for overlap.
+            and self.sms == 186
+            and os.getenv("B12X_W4A16_GROUP_BUILDER_INLINE", "0") == "1"
+        )
+        if self.reference_grouped_inline and self.sqg_xor_cheb_t12_smem_off < 3 * 128 * 4:
+            raise ValueError("inline grouping scratch overlaps the staged direct LUT")
 
     @property
     def __cache_key__(self) -> tuple[object, ...]:
@@ -7592,6 +7707,7 @@ class W4A16FusedMoeKernel:
             self.broadcast_suh,
             self.rotation_input_dtype,
             self.token_major_rotation,
+            self.reference_grouped_inline,
             self.sqg_xor_cheb_t12_smem,
             self.sqg_xor_cheb_t12_direct_smem,
             self.small_m_splitk,
@@ -7914,6 +8030,27 @@ class W4A16FusedMoeKernel:
             stream=stream,
         )
 
+    @cute.jit
+    def _build_inline_reference_groups(
+        self, ids: cute.Tensor, expert_map: cute.Tensor,
+        workspace: cute.Tensor, shared_words: cute.Pointer,
+        tid: Int32, cta: Int32, grid_x: Int32, active_m: Int32,
+    ):
+        # At most 7 token-major or 112 route-major CTAs rotate M<=8 inputs.
+        # Use 28 other CTAs while their disjoint direct-LUT copies are in
+        # flight. The ordinary GEMM scratch is write-first after this phase.
+        first_cta = Int32(7 if self.token_major_rotation else 112)
+        if cta >= first_cta and cta < first_cta + Int32(28):
+            scratch = cute.make_tensor(
+                cute.recast_ptr(shared_words, dtype=cutlass.Int32),
+                cute.make_layout((3 * _reference_grouped.MAX_ROUTES,), stride=(1,)),
+            )
+            logical_tile = cta - first_cta + Int32(self.intermediate_size * 2 // 128)
+            _reference_grouped.emit_reference_group_tile(
+                ids, expert_map, workspace, scratch,
+                active_m, grid_x, logical_tile, tid, self.intermediate_size,
+            )
+
     @cute.kernel
     def kernel(
         self,
@@ -7993,6 +8130,11 @@ class W4A16FusedMoeKernel:
                         fc1_trellis_lut_addr,
                         Int32(self.sqg_xor_cheb_t12_smem_region_bytes),
                         shared_ptr_to_u32(direct_copy_mbar),
+                    )
+                if cutlass.const_expr(self.reference_grouped_inline):
+                    self._build_inline_reference_groups(
+                        packed_route_indices, expert_map_flat, locks_i32_flat,
+                        storage.words.data_ptr(), tid, cta, grid_x, active_m,
                     )
                 cute.arch.mbarrier_wait(direct_copy_mbar, phase=0)
             else:
@@ -11417,7 +11559,8 @@ def compile_w4a16_fused_moe(
     )
     locks_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (4 * 256 + 2,),
+        (_reference_grouped.workspace_layout(intermediate_size).words
+         if kernel.reference_grouped else 4 * 256 + 2,),
         assumed_align=16,
     )
     rot_scales_fake = make_ptr(
@@ -11547,6 +11690,9 @@ def compile_w4a16_fused_moe(
         local_memory_bytes=local_memory_bytes,
         cta_threads=kernel.cta_threads,
         shared_memory_bytes=kernel.shared_words * 4 + 16,
+        reference_grouped=kernel.reference_grouped,
+        reference_grouped_fc1=kernel.reference_grouped_fc1,
+        reference_grouped_inline=kernel.reference_grouped_inline,
     )
     _FUSED_CACHE[cache_key] = result
     return result
@@ -12327,6 +12473,36 @@ def _w4a16_fused_moe_launch_flat(
         # Non-trellis kernels never dereference this ABI slot.
         fc1_trellis_lut_addr = w13_scale_i32.data_ptr()
         fc2_trellis_lut_addr = w13_scale_i32.data_ptr()
+    if fused.reference_grouped_inline:
+        # Only this regular kernel node initializes the resident-grid header.
+        # In-kernel metadata construction must not race the grid barrier.
+        resident_ctas = _w4a16_fused_persistent_grid_x(
+            fused=fused, m=m, topk=topk, intermediate_size=intermediate_size,
+            activation=activation, direct_topk_routes=direct_topk_routes, sms=sms,
+        )
+        if resident_ctas != 186:
+            raise ValueError("inline grouping requires the qualified 186-CTA grid")
+        _report_inline_group_launch(fused, a_input.device, m, resident_ctas)
+        workspace[:_reference_grouped.HEADER_WORDS].zero_()
+    elif fused.reference_grouped:
+        assert expert_map is not None
+        _reference_grouped.build_reference_groups(
+            packed_route_indices, expert_map, workspace, rows=m,
+            width=intermediate_size,
+            grid=_w4a16_fused_persistent_grid_x(
+                fused=fused, m=m, topk=topk, intermediate_size=intermediate_size,
+                activation=activation, direct_topk_routes=direct_topk_routes, sms=sms,
+            ),
+            stream=stream_int,
+            include_fc1=fused.reference_grouped_fc1,
+        )
+    elif (
+        full_rotation and hidden_size == 3584 and intermediate_size in (256, 384)
+        and workspace.numel() == _reference_grouped.workspace_layout(intermediate_size).words
+    ):
+        # M1, M16 and prefill retain the ordinary launch while sharing the
+        # extended arena. They have no builder, so initialize the header here.
+        workspace[:_reference_grouped.HEADER_WORDS].zero_()
     fused.compiled(
         make_ptr(
             _cutlass_element_dtype(element_dtype),
@@ -12450,6 +12626,31 @@ def _w4a16_fused_moe_launch_flat(
             sms=sms,
         ),
         cuda.CUstream(stream_int),
+    )
+
+
+_INLINE_GROUP_REPORTED: set[tuple[int | None, int, int]] = set()
+
+
+def _report_inline_group_launch(
+    fused: W4A16FusedMoeCompileResult,
+    device: torch.device,
+    rows: int,
+    grid: int,
+) -> None:
+    """Record actual host dispatch once per shape for controlled qualification."""
+    if os.environ.get("B12X_W4A16_INLINE_GROUP_DIAGNOSTICS", "0") != "1":
+        return
+    key = (device.index, rows, fused.intermediate_size)
+    if key in _INLINE_GROUP_REPORTED:
+        return
+    _INLINE_GROUP_REPORTED.add(key)
+    print(
+        f"[b12x inline-group] pid={os.getpid()} device={device} inline=1 "
+        f"rows={rows} width={fused.intermediate_size} grid={grid} "
+        f"threads={fused.cta_threads} registers={fused.registers_per_thread} "
+        f"local_bytes={fused.local_memory_bytes} shared_bytes={fused.shared_memory_bytes}",
+        flush=True,
     )
 
 
@@ -14341,6 +14542,18 @@ def run_w4a16_moe(
         (not collect_activation_amax)
         and (m <= direct_m_cap or use_tc_decode)
         and direct_layout_ok
+        # Several verification tokens often choose the same expert. The
+        # existing stable route pack can share its weight tile across those
+        # rows. With small-M split-K enabled, however, changed tile counts
+        # change K-partial boundaries: this research path is not bit-identical
+        # to direct routing and must not be selected by serving policy.
+        and not (
+            os.environ.get("B12X_W4A16_GROUPED_DECODE", "0") == "1"
+            and full_rotation
+            and coupled_hadamard
+            and trellis_bits == 2
+            and 1 < m <= 8
+        )
     )
     use_direct_topk_routes = bool(
         direct_topk_eligible
