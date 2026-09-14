@@ -15,6 +15,7 @@ import json
 from pathlib import Path
 import socket
 import statistics
+import sys
 
 import torch
 import torch.distributed as dist
@@ -77,6 +78,7 @@ def worker(rank, port, args):
         "b12x.comm.pcie._reference_twoshot_bf16_cute", args.reference_kernel
     )
     reference = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = reference
     spec.loader.exec_module(reference)
     candidate_get = runtime_module.get_twoshot_bf16_allreduce_launcher
     candidate_prepared = runtime_module.is_twoshot_bf16_allreduce_launcher_prepared
