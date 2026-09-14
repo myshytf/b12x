@@ -1,0 +1,107 @@
+{
+  "status": "research-only; unselected after exact native and model qualification",
+  "current_revision": "8e50247e96fe5b4724f5596f7ae3d1480687ad9c",
+  "metadata_fixture": {
+    "status": "qualified",
+    "path": "/home/g0san/kimi-k3-production/research/decode-optimization-20260914/inline-groups-20260915/gpu-r1/01-metadata.log",
+    "passed": 56,
+    "skipped": 28,
+    "conditions": "Rows 2..8, widths 256/384, standalone plus inline token/route builder CTA positions, independent CPU partition oracle, poison/mutated routing/map, unchanged header and exact LUT roundtrip"
+  },
+  "host_policy": {
+    "status": "qualified",
+    "passed": 14,
+    "path": "/home/g0san/kimi-k3-production/research/decode-optimization-20260914/inline-groups-20260915/host-policy.log",
+    "limitation": "CPU-only actual constructor policy; no native arithmetic claim"
+  },
+  "native_r4": {
+    "status": "qualified native exactness; full sanitizer attempt incomplete",
+    "source_manifest": "/home/g0san/kimi-k3-production/research/decode-optimization-20260914/inline-groups-20260915/gpu-r4/source.json",
+    "configurations": 54,
+    "exact_snapshots": 216,
+    "stage_comparison": "/home/g0san/kimi-k3-production/research/decode-optimization-20260914/inline-groups-20260915/gpu-r4/04-compare-stages.json",
+    "route_major_stages": "/home/g0san/kimi-k3-production/research/decode-optimization-20260914/inline-groups-20260915/gpu-r4/10-compare-route.json",
+    "gpu6_abba": "/home/g0san/kimi-k3-production/research/decode-optimization-20260914/inline-groups-20260915/gpu-r4/15-compare-gpu6.json",
+    "resources": "/home/g0san/kimi-k3-production/research/decode-optimization-20260914/inline-groups-20260915/gpu-r4/object-resources.json",
+    "resource_objects": 28,
+    "all_stack_and_local_zero": true,
+    "raw_manifest_integrity": "all verified; legacy migration normalizer rejects typed OptLevel options, retained as an explicit limitation",
+    "memcheck_attempt": {
+      "status": "incomplete; CUPTI subscriber collision at Torch profiler gate",
+      "memory_errors_reported": 0,
+      "path": "/home/g0san/kimi-k3-production/research/decode-optimization-20260914/inline-groups-20260915/gpu-r4/16-memcheck.log",
+      "targeted_retry": "model preflight with explicit sanitizer-only harness"
+    },
+    "gpu6_summary": "/home/g0san/kimi-k3-production/research/decode-optimization-20260914/inline-groups-20260915/gpu-r4/gpu6-comparison.json"
+  },
+  "targeted_memcheck": {
+    "status": "qualified targeted native memcheck",
+    "configurations": 6,
+    "exact_snapshots": 24,
+    "memory_errors": 0,
+    "kernel_filter": "kns=W4A16FusedMoeKernel",
+    "limitation": "The existing Triton planner kernels are outside this targeted memory audit. Normal native traces were qualified separately."
+  },
+  "model": {
+    "status": "qualified exactness; mixed performance; unselected",
+    "path": "/home/g0san/kimi-k3-production/research/decode-optimization-20260914/inline-groups-20260915/model-r1",
+    "requests": 16,
+    "all_exact": true,
+    "comparison": [
+      {
+        "length": 8192,
+        "reference_tok_s": 120.25673790889647,
+        "candidate_tok_s": 119.78119795667277,
+        "candidate_over_reference": 0.9960456273761229
+      },
+      {
+        "length": 65536,
+        "reference_tok_s": 91.18238119741716,
+        "candidate_tok_s": 92.26038449538731,
+        "candidate_over_reference": 1.0118224955722115
+      }
+    ],
+    "restoration": {
+      "original_mode": "overlap moesplit=1 offset=2\n",
+      "gateway_was_active": true,
+      "started_at": "2026-09-14T16:42:52.341403+00:00",
+      "restored_at": "2026-09-14T17:15:29.420840+00:00",
+      "mode_restored": true,
+      "gateway_active_after": true
+    }
+  },
+  "supplementary": {
+    "status": "qualified correctness; mixed performance; complete",
+    "path": "/home/g0san/kimi-k3-production/research/decode-optimization-20260914/inline-groups-20260915/contracts-r1",
+    "requests": 16,
+    "all_exact": true,
+    "comparison": [
+      {
+        "length": 8192,
+        "reference_tok_s": 121.017668477766,
+        "candidate_tok_s": 120.4766821061175,
+        "candidate_over_reference": 0.9955296910074921
+      },
+      {
+        "length": 65536,
+        "reference_tok_s": 91.75875336777477,
+        "candidate_tok_s": 92.82597170326963,
+        "candidate_over_reference": 1.0116306978497995
+      }
+    ],
+    "profile_quality_gates": 6,
+    "position_diagnostics": "/home/g0san/kimi-k3-production/research/decode-optimization-20260914/inline-groups-20260915/contracts-r1/position-comparison.json"
+  },
+  "gateway": {
+    "status": 200,
+    "stream_done": true,
+    "finish_reason": "stop",
+    "content": "KIMI_PRECISION_OK",
+    "expected_marker": true
+  },
+  "unperformed_checks": [
+    "No serving activation or new cache/concurrency/vision qualification for the unselected candidate.",
+    "No adaptive FC2 policy, real per-layer route statistics or reset-free replay implementation."
+  ],
+  "next_research": "Measure actual group/task counts and cache behavior at matched early/late positions before choosing an adaptive FC2 policy."
+}

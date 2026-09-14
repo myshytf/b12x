@@ -1,6 +1,6 @@
 # Inline FC2 reference-group preparation
 
-Status: **implemented, research-only; native correctness qualified, model qualification pending**.
+Status: **implemented, research-only; native and model correctness qualified; mixed model performance, unselected**.
 
 The Kimi TP9 decode path can reuse FC2 weight tiles across routes without changing their numerical reduction contract. Routes share a tile only when their expert, output tile and complete ordered K intervals agree. Partial results retain the deployed descending-K merge order, FP16 operands/stores, FP32 accumulation and BF16 top-k output.
 
@@ -41,3 +41,20 @@ The independent-route regression is material and is retained in the decision evi
 This review branch contains the exact tested MoE and compiler source, but is not a complete serving checkout. The model experiment composes the three changed MoE files over the selected production package, including its unchanged 30-file communication overlay. That overlay's source manifest is `/home/g0san/kimi-k3-production/candidates/k3-static-peers-20260914/source-manifest.json`; four communication files differ from or are absent in the review base. `review-source-comparison.json` records the distinction. Do not infer full-runtime identity from the MoE port.
 
 The legacy compiler-migration comparison helper rejects typed `OptLevel` option objects. The raw resource census retains that limitation and validates the complete raw identities and launch evidence separately; it neither rewrites cache identities nor claims compiler-migration qualification.
+
+## Completed model comparison
+
+The unconditional candidate is unselected. Both request contracts use four unprofiled samples per arm and input length. All 32 timed requests preserve tokens and draft acceptance; all 16 logged requests preserve chosen/top-5 logprobs. Six matched-position profile requests also preserve their complete outputs.
+
+| Request contract | Input | Reference tok/s | Inline tok/s | Change |
+|---|---:|---:|---:|---:|
+| Top-5 logprobs | 8192 | 120.256738 | 119.781198 | -0.3954% |
+| Top-5 logprobs | 65536 | 91.182381 | 92.260384 | +1.1822% |
+| No logprobs; token IDs | 8192 | 121.017668 | 120.476682 | -0.4470% |
+| No logprobs; token IDs | 65536 | 91.758753 | 92.825972 | +1.1631% |
+
+The original selection captures started early and omitted requested logprobs. New captures match the request contract and trigger at generated-token positions 0 and 768 (actual late trigger 770/774 in both arms). In the late four-step captures, target spans increase 252–261 µs and routed-MoE category sums increase 225–261 µs. The early capture improves. Category sums overlap and are not throughput metrics.
+
+Unprofiled delivery windows agree: initial 66-token windows improve about 0.63–0.65%, while final 254-token windows regress about 0.56–0.70%. All eight runs within each request contract have identical token chunk boundaries. Do not select a context-length heuristic from this prompt pair; collect actual grouping and cache evidence before an adaptive exact FC2 policy.
+
+The selected production package and original gateway/mode are restored and authenticated streaming generation passes. The candidate has no activation/cache/concurrency/vision qualification because it is unselected. Complete raw evidence and the decision are under the documented experiment root in `REPORT.md`, `qualification.json`, `deployment-decision.json`, `model-r1/`, `contracts-r1/` and `post-model/`.
