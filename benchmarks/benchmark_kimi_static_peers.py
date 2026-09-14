@@ -12,6 +12,7 @@ from datetime import timedelta
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import socket
 import statistics
@@ -105,12 +106,17 @@ def worker(rank, port, args):
     runtime_module.is_twoshot_bf16_allreduce_launcher_prepared = prepared
     runtimes = {}
     for mode in ("push", "push_static"):
+        os.environ["B12X_PCIE_TP9_STATIC_PEERS"] = (
+            "1" if args.runtime_policy and mode == "push_static" else "0"
+        )
         runtime = runtime_module.PCIeTwoShotBF16.from_exchange_group(
             exchange_group=dist.group.WORLD, device=device, max_rows=49149, row_elems=8
         )
-        runtime.all_reduce_mode = mode
+        runtime.all_reduce_mode = "push" if args.runtime_policy else mode
         runtime.prepare_graph(operations=())
         runtimes[mode] = runtime
+    # A later environment mutation must not change a captured runtime policy.
+    os.environ["B12X_PCIE_TP9_STATIC_PEERS"] = "0"
     records, retained = [], []
 
     def check(output, expected, context):
@@ -132,6 +138,16 @@ def worker(rank, port, args):
         inp = inputs[rank].to(device)
         input_pointer = inp.data_ptr()
         outputs = {mode: torch.empty_like(inp) for mode in runtimes}
+        packs = inp.numel() // 8
+        rows, remainder = divmod(packs, WORLD)
+        effective_modes = {
+            mode: runtime._all_reduce_kernel_mode(rows, remainder)
+            for mode, runtime in runtimes.items()
+        }
+        assert effective_modes["push"] == "push"
+        assert effective_modes["push_static"] == (
+            "push" if args.runtime_policy and packs > 7168 else "push_static"
+        )
         addresses = {mode: value.data_ptr() for mode, value in outputs.items()}
         graphs = {}
         hashes = {mode: [] for mode in runtimes}
@@ -212,6 +228,7 @@ def worker(rank, port, args):
         }
         record = {
             "shape": shape,
+            "effective_modes": effective_modes,
             "hashes": hashes,
             "exact": True,
             "batches": batches,
@@ -286,6 +303,10 @@ def worker(rank, port, args):
                     "cuda": torch.version.cuda,
                     "devices": devices,
                     "calls_per_graph": args.calls_per_graph,
+                    "runtime_policy": args.runtime_policy,
+                    "runtime_sha256": hashlib.sha256(
+                        Path(runtime_module.__file__).read_bytes()
+                    ).hexdigest(),
                     "records": records,
                     "limitation": "Synthetic communication inputs; no model throughput or quality qualification.",
                 },
@@ -302,6 +323,7 @@ def main():
     parser.add_argument("--shapes", default=SHAPES)
     parser.add_argument("--samples", type=int, default=40)
     parser.add_argument("--calls-per-graph", type=int, default=32)
+    parser.add_argument("--runtime-policy", action="store_true")
     args = parser.parse_args()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with socket.socket() as sock:
