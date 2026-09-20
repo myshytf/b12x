@@ -953,6 +953,177 @@ def _check_queued_mixed_grid_graph(
         )
 
 
+KIMI_LATENT_WIDTH = 3584
+KIMI_ROUTER_WIDTH = 896
+KIMI_PAIR_BATCHES = (1, 2, 3, 4, 5, 8)
+
+
+def _kimi_shard_width(width: int, world_size: int) -> int:
+    """This rank's share of a Kimi projection padded to whole 16-byte packs
+    (the model pads every shard to a multiple of eight elements, so nine
+    ranks hold 400 latent columns and 104 experts each)."""
+    return -(-width // world_size // 8) * 8
+
+
+def _kimi_rank_rows(
+    step: int, source_rank: int, batch: int, world_size: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Kimi decode projection shards with router logits that exercise the
+    selection's tie and non-finite handling: a few distinct values repeated
+    across experts, one row of all-equal logits, and +-inf / NaN entries."""
+    generator = torch.Generator(device="cpu").manual_seed(50000 * step + source_rank)
+    down_width = _kimi_shard_width(KIMI_LATENT_WIDTH, world_size)
+    router_width = _kimi_shard_width(KIMI_ROUTER_WIDTH, world_size)
+    down = torch.randn(batch, down_width, generator=generator, dtype=torch.float32)
+    router = torch.randn(batch, router_width, generator=generator, dtype=torch.float32)
+    # Ties: quantize half of the rows to sixteen distinct logit values.
+    quantized = (router * 2).round() / 2
+    router[: (batch + 1) // 2] = quantized[: (batch + 1) // 2]
+    if batch >= 2:
+        router[1] = 0.25  # every expert equal: ids must follow the index order
+    if batch >= 3:
+        router[2, ::7] = float("inf")
+        router[2, 3::11] = float("-inf")
+        router[2, 5::13] = float("nan")
+    # Padding columns beyond the logical width are never selected: poison them.
+    return (
+        down.to(device=device, dtype=torch.bfloat16),
+        router.to(device=device),
+    )
+
+
+def _kimi_correction_bias(world_size: int, device: torch.device) -> torch.Tensor:
+    generator = torch.Generator(device="cpu").manual_seed(777 + world_size)
+    bias = torch.randn(KIMI_ROUTER_WIDTH, generator=generator, dtype=torch.float32) * 0.1
+    bias[::5] = 0.0  # exact-zero selections must canonicalize the same way
+    return bias.to(device=device)
+
+
+def _check_pair_kimi_topk(rank: int, world_size: int, device: torch.device) -> None:
+    """The fused pair gather + expert selection equals the served two-launch
+    path (paired gather clipped to the logical widths, then the batched
+    selection kernel) bit for bit: gathered latent rows, weights and ids,
+    eagerly and under CUDA graph replay, for padded shards and batches of
+    one to eight rows."""
+    down_width = _kimi_shard_width(KIMI_LATENT_WIDTH, world_size)
+    router_width = _kimi_shard_width(KIMI_ROUTER_WIDTH, world_size)
+    combined = down_width * 2 + router_width * 4
+    pool = PCIeDCPA2APool.from_process_group(
+        process_group=dist.group.WORLD,
+        device=device,
+        max_batch_size=8,
+        total_heads=world_size,
+        head_dim=combined,
+        query_head_dim=combined,
+        max_concurrent_channels=2,
+    )
+    try:
+        pool.prepare_channels(("eager:kimi", "graph:kimi"))
+        bias = _kimi_correction_bias(world_size, device)
+        for step, batch in enumerate(KIMI_PAIR_BATCHES, start=600):
+            down, router = _kimi_rank_rows(step, rank, batch, world_size, device)
+            expected_down = torch.empty(
+                batch, KIMI_LATENT_WIDTH, dtype=torch.bfloat16, device=device
+            )
+            expected_router = torch.empty(
+                batch, KIMI_ROUTER_WIDTH, dtype=torch.float32, device=device
+            )
+            pool.all_gather_pair(
+                down, router, expected_down, expected_router, channel_id="eager:kimi"
+            )
+            expected_weights, expected_ids = pool.kimi_topk16(
+                expected_router, bias, channel_id="eager:kimi"
+            )
+            fused_down, fused_weights, fused_ids = pool.all_gather_pair_kimi_topk(
+                down, router, bias, channel_id="eager:kimi"
+            )
+            torch.cuda.synchronize(device)
+            assert torch.equal(fused_down, expected_down), f"fused latent rows batch {batch}"
+            assert torch.equal(fused_ids, expected_ids), f"fused expert ids batch {batch}"
+            assert torch.equal(
+                fused_weights.view(torch.int32), expected_weights.view(torch.int32)
+            ), f"fused expert weights batch {batch}"
+            _stage(rank, f"pair_kimi_topk_eager_batch{batch}_ok")
+
+        # Graph replay: two layers captured once, replayed with new inputs.
+        layers = 2
+        batch = 4
+        stream = torch.cuda.Stream(device=device)
+        downs = [
+            torch.empty(batch, down_width, dtype=torch.bfloat16, device=device)
+            for _ in range(layers)
+        ]
+        routers = [
+            torch.empty(batch, router_width, dtype=torch.float32, device=device)
+            for _ in range(layers)
+        ]
+        out_downs = [
+            torch.empty(batch, KIMI_LATENT_WIDTH, dtype=torch.bfloat16, device=device)
+            for _ in range(layers)
+        ]
+        out_weights = [
+            torch.empty(batch, 16, dtype=torch.float32, device=device)
+            for _ in range(layers)
+        ]
+        out_ids = [
+            torch.empty(batch, 16, dtype=torch.int32, device=device)
+            for _ in range(layers)
+        ]
+        graph = torch.cuda.CUDAGraph()
+        _stage(rank, "pair_kimi_topk_graph_capture")
+        with pool.capture(stream, channel_id="graph:kimi") as graph_channel, torch.cuda.graph(
+            graph, stream=stream
+        ):
+            for layer in range(layers):
+                graph_channel.all_gather_pair_kimi_topk(
+                    downs[layer],
+                    routers[layer],
+                    bias,
+                    out_downs[layer],
+                    out_weights[layer],
+                    out_ids[layer],
+                )
+        stream.synchronize()
+        _stage(rank, "pair_kimi_topk_graph_captured")
+        for replay in range(3):
+            for layer in range(layers):
+                step = 7000 + 10 * replay + layer
+                down, router = _kimi_rank_rows(step, rank, batch, world_size, device)
+                downs[layer].copy_(down)
+                routers[layer].copy_(router)
+            torch.cuda.synchronize(device)
+            dist.barrier()
+            with torch.cuda.stream(stream):
+                graph.replay()
+            stream.synchronize()
+            for layer in range(layers):
+                step = 7000 + 10 * replay + layer
+                down, router = _kimi_rank_rows(step, rank, batch, world_size, device)
+                expected_down = torch.empty(
+                    batch, KIMI_LATENT_WIDTH, dtype=torch.bfloat16, device=device
+                )
+                expected_router = torch.empty(
+                    batch, KIMI_ROUTER_WIDTH, dtype=torch.float32, device=device
+                )
+                pool.all_gather_pair(
+                    down, router, expected_down, expected_router, channel_id="eager:kimi"
+                )
+                expected_weights, expected_ids = pool.kimi_topk16(
+                    expected_router, bias, channel_id="eager:kimi"
+                )
+                torch.cuda.synchronize(device)
+                assert torch.equal(out_downs[layer], expected_down), f"replay {replay} layer {layer} latent"
+                assert torch.equal(out_ids[layer], expected_ids), f"replay {replay} layer {layer} ids"
+                assert torch.equal(
+                    out_weights[layer].view(torch.int32), expected_weights.view(torch.int32)
+                ), f"replay {replay} layer {layer} weights"
+            _stage(rank, f"pair_kimi_topk_graph_replay{replay}_ok")
+        torch.cuda.synchronize(device)
+        dist.barrier()
+    finally:
+        pool.close()
+
+
 def _stage(rank: int, name: str) -> None:
     """One JSON line per rank and check boundary, so a hang or a collective
     sequence mismatch can be attributed to the check a rank was in."""
@@ -1013,6 +1184,10 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         dist.barrier()
         _stage(rank, "pair_graph")
         _check_pair_graph(pool, rank, world_size, device)
+        dist.barrier()
+        # The fused Kimi router path needs its own pool (Kimi row widths).
+        _stage(rank, "pair_kimi_topk")
+        _check_pair_kimi_topk(rank, world_size, device)
         _stage(rank, "complete")
         if rank == 0:
             print("A2A GPU gate: complete", flush=True)

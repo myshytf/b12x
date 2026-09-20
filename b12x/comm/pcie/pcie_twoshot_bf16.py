@@ -201,6 +201,9 @@ class PCIeTwoShotBF16:
             and row_elems == _PACK_ELEMS
             and os.getenv("B12X_PCIE_TP9_STATIC_PEERS", "0") == "1"
         )
+        # Opt-in fused RMSNorm-shard epilogue (``all_reduce_rms_norm_shard``);
+        # set before graph preparation so the launcher is compiled for capture.
+        self.norm_shard_enabled = False
         return self
 
     @classmethod
@@ -442,6 +445,22 @@ class PCIeTwoShotBF16:
                         self.row_elems,
                         device_index,
                         mode,
+                    )
+            if self.norm_shard_enabled:
+                from ._twoshot_bf16_norm_cute import (
+                    get_twoshot_bf16_allreduce_norm_shard_launcher,
+                )
+
+                for slot_bias in (0, 1):
+                    get_twoshot_bf16_allreduce_norm_shard_launcher(
+                        self.world_size,
+                        self.rank,
+                        True,
+                        slot_bias,
+                        512,
+                        self.row_elems,
+                        device_index,
+                        self._norm_shard_mode(),
                     )
 
     @contextmanager
@@ -706,6 +725,140 @@ class PCIeTwoShotBF16:
                 blocks,
                 pack_stride=self._pack_stride,
             )
+
+    def _norm_shard_mode(self) -> str:
+        if self.all_reduce_mode != "push":
+            raise ValueError("the RMSNorm-shard all-reduce needs the push transport")
+        return "push_static_norm_shard" if self._static_peers_enabled else "push_norm_shard"
+
+    def all_reduce_rms_norm_shard(
+        self,
+        inp: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        col0: int,
+        width: int,
+        *,
+        out: Optional[torch.Tensor] = None,
+        shard_out: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Lossless bf16 all-reduce of ``inp`` (``[rows, hidden]``) plus, in the
+        same launch, the RMSNorm of every reduced row and the store of the
+        normalized column block ``[col0, col0 + width)`` as ``shard_out``
+        (``[rows, width]``, columns past ``hidden`` zero-filled).
+
+        The all-reduce output equals ``all_reduce`` bit for bit. The
+        normalization computes the variance in float64 and the scale
+        ``1 / sqrt(variance / hidden + eps)`` in float64 rounded once to fp32,
+        then ``(x * scale) * weight`` in fp32 rounded once to bf16 — the
+        served CUDA RMSNorm's operation order with a more precise scale.
+        One CTA of 512 threads serves rows of up to sixteen tokens.
+        """
+        if not self.norm_shard_enabled:
+            raise RuntimeError("all_reduce_rms_norm_shard is not enabled on this runtime")
+        if not self._balanced_partition:
+            raise ValueError("the RMSNorm-shard all-reduce needs single-pack rows")
+        if not self.accepts(inp):
+            raise ValueError("input not accepted by PCIeTwoShotBF16.all_reduce")
+        if inp.ndim != 2:
+            raise ValueError("the RMSNorm-shard all-reduce needs [rows, hidden] input")
+        rows, hidden = (int(value) for value in inp.shape)
+        if rows <= 0 or rows > 16:
+            raise ValueError("the RMSNorm-shard all-reduce serves one to sixteen rows")
+        if hidden % _PACK_ELEMS or col0 % _PACK_ELEMS or width % _PACK_ELEMS:
+            raise ValueError("hidden, col0 and width must be multiples of 8")
+        if width <= 0 or col0 < 0 or col0 >= hidden:
+            raise ValueError("the column block must start inside the row")
+        if (
+            weight.device != inp.device
+            or weight.dtype != torch.bfloat16
+            or weight.shape != (hidden,)
+            or not weight.is_contiguous()
+            or weight.data_ptr() % 16
+        ):
+            raise ValueError("weight must be a contiguous bf16 [hidden] tensor on the runtime device")
+        if eps < 0:
+            raise ValueError("eps must be non-negative")
+        with _device_guard(self.device):
+            if out is None:
+                out = torch.empty_like(inp)
+            self._check_tensor(out, shape=tuple(inp.shape), name="output")
+            _require_disjoint(out, inp, source_name="input")
+            if shard_out is None:
+                shard_out = torch.empty((rows, width), dtype=inp.dtype, device=inp.device)
+            self._check_tensor(shard_out, shape=(rows, width), name="shard output")
+            _require_disjoint(shard_out, inp, source_name="input")
+            _require_disjoint(shard_out, out, source_name="output")
+            packs = inp.numel() // _PACK_ELEMS
+            rows_per_rank = packs // self.world_size
+            remainder_packs = packs % self.world_size
+            mode = self._norm_shard_mode()
+            device_index = self._device_index()
+            capturing = _is_current_stream_capturing(self.device)
+            if capturing:
+                from ._twoshot_bf16_norm_cute import (
+                    is_twoshot_bf16_allreduce_norm_shard_launcher_prepared,
+                )
+
+                if self._capture_context_depth <= 0 or not self._device_slot_selection:
+                    raise RuntimeError(
+                        "cold PCIe twoshot-bf16 CUDA graph capture is not allowed; "
+                        "enter runtime.capture() before torch.cuda.graph()"
+                    )
+                if not is_twoshot_bf16_allreduce_norm_shard_launcher_prepared(
+                    self.world_size,
+                    self.rank,
+                    True,
+                    self._device_slot_bias,
+                    512,
+                    self.row_elems,
+                    device_index,
+                    mode,
+                ):
+                    raise RuntimeError(
+                        "cold PCIe twoshot-bf16 CUDA graph capture is not allowed; "
+                        "enable norm_shard before prepare_graph()"
+                    )
+            if self._device_slot_selection:
+                slot = 0
+            else:
+                slot = self._slot % 2
+                self._slot += 1
+            from ._twoshot_bf16_norm_cute import (
+                get_twoshot_bf16_allreduce_norm_shard_launcher,
+            )
+
+            with torch.cuda.device(self.device):
+                launcher = get_twoshot_bf16_allreduce_norm_shard_launcher(
+                    self.world_size,
+                    self.rank,
+                    self._device_slot_selection,
+                    self._device_slot_bias,
+                    512,
+                    self.row_elems,
+                    device_index,
+                    mode,
+                )
+                launcher(
+                    inp.data_ptr(),
+                    self._staging_ptrs[slot],
+                    self._signal_ptrs,
+                    out.data_ptr(),
+                    weight.data_ptr(),
+                    shard_out.data_ptr(),
+                    self.rank,
+                    self._reduced_offset,
+                    self._slot_bytes,
+                    rows_per_rank,
+                    remainder_packs,
+                    self._pack_stride,
+                    rows,
+                    hidden // _PACK_ELEMS,
+                    col0 // _PACK_ELEMS,
+                    width // _PACK_ELEMS,
+                    float(eps),
+                )
+        return out, shard_out
 
     def all_reduce(
         self,

@@ -121,6 +121,8 @@ class _FakeRuntime(PCIeDCPA2A):
 
 
 class _FakeKimiRuntime(PCIeDCPA2A):
+    kimi_calls: list = []
+
     def _launch_all_gather_pair_kimi_topk(
         self,
         local_down,
@@ -133,10 +135,18 @@ class _FakeKimiRuntime(PCIeDCPA2A):
         slot,
         device_slot_selection,
     ):
-        del local_router, correction_bias, slot, device_slot_selection
-        out_down.copy_(torch.cat((local_down,) * self.world_size, dim=1))
+        del correction_bias, slot, device_slot_selection
+        self.kimi_calls.append(
+            (tuple(local_down.shape), tuple(local_router.shape), tuple(out_down.shape))
+        )
+        gathered = torch.cat((local_down,) * self.world_size, dim=1)
+        out_down.copy_(gathered[:, : out_down.shape[1]])
         topk_weights.fill_(1.0 / 16.0)
-        topk_ids.copy_(torch.arange(16, dtype=torch.int32).view(1, 16))
+        topk_ids.copy_(
+            torch.arange(16, dtype=torch.int32)
+            .view(1, 16)
+            .expand(topk_ids.shape[0], -1)
+        )
 
     def _launch_kimi_topk16(
         self,
@@ -160,13 +170,26 @@ def _make_runtime() -> PCIeDCPA2A:
     return _FakeRuntime()
 
 
+def _kimi_shard_width(width: int, world_size: int) -> int:
+    """A rank's share of a Kimi projection padded to eight elements, the
+    model's shard alignment (nine ranks: 400 latent columns, 104 experts)."""
+    return -(-width // world_size // 8) * 8
+
+
 def _make_kimi_runtime(
     world_size: int,
     ext: _FakeExt | None = None,
     *,
     max_batch_size: int = 8,
+    padded: bool = False,
 ) -> PCIeDCPA2A:
-    query_head_dim = 7168 // world_size + 3584 // world_size
+    if padded:
+        query_head_dim = (
+            _kimi_shard_width(3584, world_size) * 2
+            + _kimi_shard_width(896, world_size) * 4
+        )
+    else:
+        query_head_dim = 7168 // world_size + 3584 // world_size
     return _FakeKimiRuntime(
         rank=0,
         world_size=world_size,
@@ -699,6 +722,125 @@ def test_kimi_pair_topk_dispatches_compact_outputs(world_size: int) -> None:
     torch.testing.assert_close(weights, torch.full_like(weights, 1.0 / 16.0))
     assert torch.equal(ids, torch.arange(16, dtype=torch.int32).view(1, 16))
     runtime.close()
+
+
+@pytest.mark.parametrize("world_size", (9, 8))
+@pytest.mark.parametrize("batch", (1, 3, 8))
+def test_kimi_pair_topk_accepts_padded_shards_and_batches(
+    world_size: int, batch: int
+) -> None:
+    """Padded shards (nine ranks: 400 latent columns and 104 experts per
+    rank) and one to eight rows dispatch to the fused launch with the
+    logical 3,584-column latent output and [batch, 16] selections."""
+    runtime = _make_kimi_runtime(world_size, padded=True)
+    down_width = _kimi_shard_width(3584, world_size)
+    router_width = _kimi_shard_width(896, world_size)
+    local_down = torch.arange(
+        batch * down_width, dtype=torch.float32
+    ).to(torch.bfloat16).view(batch, down_width)
+    local_router = torch.arange(
+        batch * router_width, dtype=torch.float32
+    ).view(batch, router_width)
+    correction_bias = torch.zeros(896, dtype=torch.float32)
+    _FakeKimiRuntime.kimi_calls.clear()
+
+    down, weights, ids = runtime.all_gather_pair_kimi_topk(
+        local_down, local_router, correction_bias
+    )
+
+    assert down.shape == (batch, 3584)
+    assert weights.shape == (batch, 16)
+    assert ids.shape == (batch, 16)
+    assert _FakeKimiRuntime.kimi_calls == [
+        ((batch, down_width), (batch, router_width), (batch, 3584))
+    ]
+    torch.testing.assert_close(weights, torch.full_like(weights, 1.0 / 16.0))
+    assert torch.equal(
+        ids, torch.arange(16, dtype=torch.int32).view(1, 16).expand(batch, -1)
+    )
+    runtime.close()
+
+
+def test_kimi_pair_topk_rejects_shapes_the_fused_selection_cannot_serve() -> None:
+    runtime = _make_kimi_runtime(9, padded=True)
+    correction_bias = torch.zeros(896, dtype=torch.float32)
+    good_down = torch.zeros((1, 400), dtype=torch.bfloat16)
+    good_router = torch.zeros((1, 104), dtype=torch.float32)
+    with pytest.raises(ValueError, match="batch"):
+        runtime.all_gather_pair_kimi_topk(
+            torch.zeros((9, 400), dtype=torch.bfloat16),
+            torch.zeros((9, 104), dtype=torch.float32),
+            correction_bias,
+        )
+    with pytest.raises(ValueError, match="multiples of 16 bytes"):
+        runtime.all_gather_pair_kimi_topk(
+            torch.zeros((1, 396), dtype=torch.bfloat16),
+            torch.zeros((1, 106), dtype=torch.float32),
+            correction_bias,
+        )
+    with pytest.raises(ValueError, match="query dimension"):
+        runtime.all_gather_pair_kimi_topk(
+            torch.zeros((1, 408), dtype=torch.bfloat16),
+            good_router,
+            correction_bias,
+        )
+    with pytest.raises(ValueError, match="must cover"):
+        runtime.all_gather_pair_kimi_topk(
+            torch.zeros((1, 416), dtype=torch.bfloat16),
+            torch.zeros((1, 96), dtype=torch.float32),
+            correction_bias,
+        )
+    with pytest.raises(ValueError, match="out_down"):
+        runtime.all_gather_pair_kimi_topk(
+            good_down,
+            good_router,
+            correction_bias,
+            torch.zeros((1, 3576), dtype=torch.bfloat16),
+        )
+    runtime.close()
+
+
+def test_kimi_pair_topk_kernel_wrapper_requires_an_896_wide_router_row() -> None:
+    from b12x.comm.pcie import _dcp_a2a_cute as cute_module
+
+    kwargs = dict(
+        world_size=9,
+        rank=0,
+        local_down_ptr=16,
+        local_router_ptr=32,
+        correction_bias_ptr=48,
+        output_down_ptr=64,
+        topk_weights_ptr=80,
+        topk_ids_ptr=96,
+        staging_ptrs=tuple(range(200, 209)),
+        signal_ptrs=tuple(range(300, 309)),
+        device_slot_selection=True,
+        slot_delta_bytes=0,
+        push=True,
+    )
+    with pytest.raises(ValueError, match="896-wide"):
+        cute_module.all_gather_pair_kimi_topk(
+            **kwargs, batch=1, down_row_bytes=800, router_row_bytes=416
+        )
+    with pytest.raises(ValueError, match="one to eight rows"):
+        cute_module.all_gather_pair_kimi_topk(
+            **kwargs,
+            batch=9,
+            down_row_bytes=800,
+            router_row_bytes=416,
+            output_down_row_bytes=7168,
+            output_router_row_bytes=3584,
+        )
+    with pytest.raises(ValueError, match="sixteen warps"):
+        cute_module.all_gather_pair_kimi_topk(
+            **kwargs,
+            batch=1,
+            down_row_bytes=800,
+            router_row_bytes=416,
+            output_down_row_bytes=7168,
+            output_router_row_bytes=3584,
+            threads=256,
+        )
 
 
 @pytest.mark.parametrize("world_size", (2, 4, 8, 16))
@@ -1914,9 +2056,11 @@ def test_pair_launcher_key_and_compile_spec_carry_the_transport() -> None:
     source = inspect.getsource(kernels._get_compiled_all_gather_pair)
     labels = source.split("labels=(", maxsplit=1)[1]
     assert '"push",' in labels.split(")", maxsplit=1)[0]
-    # The spec version moved past the transport-less, unclipped layouts.
+    # The spec version moved past the transport-less, unclipped layouts; the
+    # fused Kimi selection variant moved again when it took padded shards,
+    # batches and the batched kernel's arithmetic.
     spec = source.split("compile_spec=KernelCompileSpec.from_key(", 1)[1]
-    assert "            3,\n            key," in spec
+    assert "            4 if kimi_topk else 3,\n            key," in spec
 
 
 def test_push_pair_kernel_writes_rows_to_peers_and_copies_out_locally() -> None:

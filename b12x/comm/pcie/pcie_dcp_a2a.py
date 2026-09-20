@@ -1529,7 +1529,17 @@ class PCIeDCPA2A:
         topk_weights: Optional[torch.Tensor] = None,
         topk_ids: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Gather Kimi-K3's sharded latent row and select its 16 experts."""
+        """Gather Kimi-K3's sharded latent rows and select their 16 experts.
+
+        ``local_down`` (``[batch, W_d]`` bf16) and ``local_router``
+        (``[batch, W_r]`` fp32) are this rank's shards; a rank may pad its
+        share to whole 16-byte packs (the last rank of nine ranks holds 384
+        latent columns and 64 experts in 400- and 104-wide rows), in which
+        case the gathered rows are clipped to the logical 3,584 columns and
+        896 experts. ``out_down`` holds the logical (default) or the full
+        gathered latent row; ``topk_weights`` / ``topk_ids`` are
+        ``[batch, 16]`` fp32 / int32.
+        """
         self._check_stream()
         if self._closed:
             raise RuntimeError("PCIeDCPA2A is closed")
@@ -1538,21 +1548,22 @@ class PCIeDCPA2A:
                 "Kimi paired gather+top-k requires a supported PCIe DCP "
                 f"world size, got TP{self.world_size}"
             )
-        local_down_width = 3584 // self.world_size
-        local_router_width = 896 // self.world_size
+        if local_down.ndim != 2 or local_router.ndim != 2:
+            raise ValueError("paired inputs must have shape [batch, width]")
+        batch = int(local_down.shape[0])
+        capacity = min(self.max_batch_size, 8)
+        if batch <= 0 or batch > capacity:
+            raise ValueError(
+                f"Kimi paired gather+top-k batch {batch} must be between 1 "
+                f"and the supported capacity {capacity}"
+            )
+        if int(local_router.shape[0]) != batch:
+            raise ValueError("paired inputs must have the same batch size")
+        down_width = int(local_down.shape[1])
+        router_width = int(local_router.shape[1])
         expected = (
-            (
-                local_down,
-                (1, local_down_width),
-                torch.bfloat16,
-                "local_down",
-            ),
-            (
-                local_router,
-                (1, local_router_width),
-                torch.float32,
-                "local_router",
-            ),
+            (local_down, (batch, down_width), torch.bfloat16, "local_down"),
+            (local_router, (batch, router_width), torch.float32, "local_router"),
             (correction_bias, (896,), torch.float32, "correction_bias"),
         )
         for value, shape, dtype, name in expected:
@@ -1565,16 +1576,51 @@ class PCIeDCPA2A:
                 raise ValueError(
                     f"{name} must be contiguous {shape} {dtype} on {self.device}"
                 )
+        down_row_bytes = down_width * 2
+        router_row_bytes = router_width * 4
+        if down_row_bytes % 16 or router_row_bytes % 16:
+            raise ValueError("paired row widths must be multiples of 16 bytes")
+        if down_row_bytes + router_row_bytes != self.query_head_dim:
+            raise ValueError(
+                "paired row bytes must match the runtime query dimension: "
+                f"got {down_row_bytes + router_row_bytes}, "
+                f"expected {self.query_head_dim}"
+            )
+        full_down = down_width * self.world_size
+        full_router = router_width * self.world_size
+        if full_down < 3584 or full_router < 896:
+            raise ValueError(
+                "the gathered rows must cover Kimi-K3's 3,584 latent columns "
+                f"and 896 experts, got {full_down} and {full_router}"
+            )
         if out_down is None:
-            out_down = torch.empty((1, 3584), device=self.device, dtype=torch.bfloat16)
+            out_down = torch.empty(
+                (batch, 3584), device=self.device, dtype=torch.bfloat16
+            )
         if topk_weights is None:
-            topk_weights = torch.empty((1, 16), device=self.device, dtype=torch.float32)
+            topk_weights = torch.empty(
+                (batch, 16), device=self.device, dtype=torch.float32
+            )
         if topk_ids is None:
-            topk_ids = torch.empty((1, 16), device=self.device, dtype=torch.int32)
+            topk_ids = torch.empty(
+                (batch, 16), device=self.device, dtype=torch.int32
+            )
+        if (
+            out_down.device != self.device
+            or out_down.dtype != torch.bfloat16
+            or out_down.ndim != 2
+            or int(out_down.shape[0]) != batch
+            or not 3584 <= int(out_down.shape[1]) <= full_down
+            or (int(out_down.shape[1]) * 2) % 16
+            or not out_down.is_contiguous()
+        ):
+            raise ValueError(
+                f"out_down must be a contiguous [{batch}, 3584..{full_down}] "
+                f"bfloat16 row-major tensor on {self.device}"
+            )
         outputs = (
-            (out_down, (1, 3584), torch.bfloat16, "out_down"),
-            (topk_weights, (1, 16), torch.float32, "topk_weights"),
-            (topk_ids, (1, 16), torch.int32, "topk_ids"),
+            (topk_weights, (batch, 16), torch.float32, "topk_weights"),
+            (topk_ids, (batch, 16), torch.int32, "topk_ids"),
         )
         for value, shape, dtype, name in outputs:
             if (
@@ -1636,6 +1682,7 @@ class PCIeDCPA2A:
     ) -> None:
         from ._dcp_a2a_cute import all_gather_pair_kimi_topk
 
+        full_router_bytes = int(local_router.shape[1]) * 4 * self.world_size
         with torch.cuda.device(self.device):
             all_gather_pair_kimi_topk(
                 world_size=self.world_size,
@@ -1653,6 +1700,15 @@ class PCIeDCPA2A:
                     self._slot_bytes if slot == 0 else -self._slot_bytes
                 ),
                 push=self.pair_push_transport,
+                batch=int(local_down.shape[0]),
+                down_row_bytes=int(local_down.shape[1]) * 2,
+                router_row_bytes=int(local_router.shape[1]) * 4,
+                output_down_row_bytes=_clipped_row_bytes(
+                    out_down, int(local_down.shape[1]) * self.world_size
+                ),
+                output_router_row_bytes=(
+                    0 if full_router_bytes == 896 * 4 else 896 * 4
+                ),
             )
 
     def kimi_topk16(
