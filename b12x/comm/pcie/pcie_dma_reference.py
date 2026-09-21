@@ -378,6 +378,26 @@ class RingOp(NamedTuple):
     main_local: RingAccess | None
 
 
+def reduce_scatter_op_count(world: int, pieces: int) -> int:
+    """Number of leading plan ops that form the reduce-scatter phase: the
+    ``world - 1`` reduce-scatter steps of ``ring_schedule`` times the pieces
+    per step. The all-gather ops follow (same count), then the handshake."""
+    return (world - 1) * pieces
+
+
+def owned_chunk(rank: int, world: int) -> int:
+    """Chunk a rank holds fully reduced in ``out`` after the reduce-scatter
+    steps: the last reduce-scatter step ``k = world - 2`` receives chunk
+    ``(rank + recv_offset) mod world`` with ``recv_offset = -(k + 1)``, i.e.
+    ``(rank + 1) mod world``, and its add stores into ``out``
+    (``_sum_location``). Under the granule mapping this is every granule
+    ``b`` with ``b mod world == owned_chunk(rank, world)``."""
+    schedule = ring_schedule(world)
+    last = schedule[world - 2]
+    assert last.reduce and last.step == world - 2
+    return (rank + last.recv_offset) % world
+
+
 def final_handshake_slot(world: int, pieces: int, fp32_hops: int = 0) -> int:
     """Flag slot of the neighbour handshake that closes an all-reduce."""
     return len(ring_schedule(world, fp32_hops)) * pieces

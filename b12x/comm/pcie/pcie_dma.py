@@ -18,7 +18,7 @@ from collections import OrderedDict
 from contextlib import suppress
 from functools import lru_cache
 from statistics import median
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 import torch.distributed as dist
@@ -26,6 +26,8 @@ from torch.distributed import ProcessGroup
 
 from ._cuda_ipc import CudaRTLibrary
 from .pcie_dma_reference import (
+    owned_chunk,
+    reduce_scatter_op_count,
     final_handshake_slot,
     granule_elems_for,
     lossless_access_plan,
@@ -275,6 +277,7 @@ class _ReplayEntry:
         "outputs",
         "scratch",
         "graph",
+        "graph_ag",
         "slot",
         "last_use",
     )
@@ -287,12 +290,17 @@ class _ReplayEntry:
         graph,
         slot: int,
         scratch: tuple[torch.Tensor, ...] = (),
+        graph_ag=None,
     ) -> None:
         self.key = key
         self.inputs = inputs
         self.outputs = outputs
         self.scratch = scratch
         self.graph = graph
+        # Split all-reduce entries: ``graph`` is the reduce-scatter phase and
+        # ``graph_ag`` the all-gather phase, replayed around the caller's
+        # in-place work on its owned rows of ``outputs[0]``.
+        self.graph_ag = graph_ag
         self.slot = slot
         self.last_use = 0
 
@@ -447,6 +455,9 @@ class PCIeDmaAllReduce:
         ]
         self._input_ready = torch.cuda.Event()
         self._ag_ready = torch.cuda.Event()
+        # Split all-reduce: recorded on the main stream after the caller's
+        # in-place work between the reduce-scatter and all-gather phases.
+        self._hook_done = torch.cuda.Event()
         self._a2a_qdone = [torch.cuda.Event() for _ in range(MAX_PIECES)]
         self._a2a_ownq = [torch.cuda.Event() for _ in range(MAX_PIECES)]
         # Explicit argument wins over the environment so integrations can
@@ -853,6 +864,220 @@ class PCIeDmaAllReduce:
             self._all_reduce_key(inp), (static_in,), (static_out,), graph, slot
         )
 
+    # ------------------------------------------------------------------
+    # Split all-reduce: reduce-scatter, caller's in-place work, all-gather
+    def split_owned_rows(self, inp: torch.Tensor) -> list[tuple[int, int]] | None:
+        """Row blocks ``(row0, rows)`` of a 2-D ``inp`` this rank holds fully
+        reduced between the phases of ``all_reduce_in_place_split``: under
+        the row-granule mapping (``B12X_PCIE_RING_GRANULE_ROWS``) granule
+        ``b`` belongs to chunk ``b mod world`` and the rank owns chunk
+        ``owned_chunk(rank, world)``. ``None`` when ``inp`` reduces with the
+        served contiguous mapping, whose chunks cut rows."""
+        if inp.ndim != 2:
+            return None
+        granule_elems = self._granule_elems(inp)
+        if not granule_elems or granule_elems % int(inp.shape[1]):
+            return None
+        granule_rows = granule_elems // int(inp.shape[1])
+        rows = int(inp.shape[0])
+        if rows % (self.world_size * granule_rows):
+            return None
+        chunk = owned_chunk(self.rank, self.world_size)
+        return [
+            (b * granule_rows, granule_rows)
+            for b in range(rows // granule_rows)
+            if b % self.world_size == chunk
+        ]
+
+    def can_all_reduce_split(self, inp: torch.Tensor) -> bool:
+        """Whether ``all_reduce_in_place_split`` accepts ``inp``: the lossless
+        ring (granule mapping or fp32 hops), no wire padding, and a
+        row-aligned owned chunk."""
+        if not self.should_allreduce(inp):
+            return False
+        if inp.numel() % (self.world_size * 8):
+            return False
+        if not (self._granule_elems(inp) or self._fp32_hops_for(inp)):
+            return False
+        return self.split_owned_rows(inp) is not None
+
+    def all_reduce_in_place_split(
+        self,
+        inp: torch.Tensor,
+        between: Callable[[torch.Tensor], None],
+        *,
+        borrow_output: bool = False,
+    ) -> torch.Tensor:
+        """Ring all-reduce of ``inp`` whose all-gather phase distributes what
+        ``between(out)`` wrote into this rank's owned rows (``split_owned_rows``)
+        of the reduced tensor: the reduce-scatter ops run, the side streams are
+        joined, ``between`` runs on the main stream, then the all-gather ops.
+
+        Every rank must call ``between`` on its own rows only; the values a
+        rank does not own are undefined until the op returns. Replayed
+        shapes use an entry of two graphs (reduce-scatter, all-gather) with
+        ``between`` invoked on the entry's static output between them;
+        ``borrow_output`` returns that static output (see ``all_reduce``).
+        The reduction arithmetic and order are the served lossless ring's.
+        """
+        if borrow_output and not self._graph_replay:
+            raise ValueError("borrow_output needs graph replay")
+        with torch.cuda.device(self.device):
+            if not self.can_all_reduce_split(inp):
+                raise ValueError(
+                    "input does not satisfy split ring all-reduce requirements "
+                    f"(shape={tuple(inp.shape)}, dtype={inp.dtype})"
+                )
+            if self._graph_replay and self._graph_replay_eligible(inp):
+                return self._all_reduce_replayed_split(inp, between, borrow_output)
+            self._op_seq += 1
+            out = torch.empty_like(inp)
+            return self._all_reduce_lossless(
+                inp,
+                out,
+                granule_elems=self._granule_elems(inp),
+                fp32_hops=self._fp32_hops_for(inp),
+                between=between,
+            )
+
+    def all_gather_owned_rows(
+        self, tensor: torch.Tensor, *, borrow_output: bool = False
+    ) -> torch.Tensor:
+        """Row all-gather over the split mapping: every rank's owned rows of
+        ``tensor`` (``split_owned_rows``) reach every rank; the other rows of
+        the input are ignored. This is the all-gather phase of the lossless
+        ring alone (its chunk copies read the owned chunk of the buffer), so
+        it costs about half an all-reduce and moves bytes only. Replayed
+        shapes use a one-graph entry keyed apart from the all-reduce entries.
+        """
+        if borrow_output and not self._graph_replay:
+            raise ValueError("borrow_output needs graph replay")
+        with torch.cuda.device(self.device):
+            if not self.can_all_reduce_split(tensor):
+                raise ValueError(
+                    "input does not satisfy split ring all-gather requirements "
+                    f"(shape={tuple(tensor.shape)}, dtype={tensor.dtype})"
+                )
+            granule_elems = self._granule_elems(tensor)
+            fp32_hops = self._fp32_hops_for(tensor)
+            if self._graph_replay and self._graph_replay_eligible(tensor):
+                key = ("agr", *self._replay_key(tensor))
+                entry = self._replay_entry_for(
+                    key, lambda: self._capture_gather_entry(tensor, key)
+                )
+                self._op_seq += 1
+                if entry is not None:
+                    entry.last_use = self._op_seq
+                    if not _same_storage(entry.inp, tensor):
+                        if _byte_ranges_overlap(entry.inp, tensor):
+                            raise ValueError(
+                                "row all-gather input partially overlaps the ring's "
+                                "static buffer; pass the whole borrowed tensor or a copy"
+                            )
+                        entry.inp.view(-1).copy_(tensor.view(-1))
+                    entry.graph.replay()
+                    if borrow_output:
+                        return entry.out.view(tensor.shape)
+                    out = torch.empty_like(tensor)
+                    out.view(-1).copy_(entry.out.view(-1))
+                    return out
+            else:
+                self._op_seq += 1
+            out = tensor.clone()
+            return self._all_reduce_lossless(
+                out, out, granule_elems=granule_elems, fp32_hops=fp32_hops, phase="ag"
+            )
+
+    def _capture_gather_entry(self, tensor: torch.Tensor, key: tuple) -> _ReplayEntry:
+        slot = self._replay_free_slots.pop()
+        spec = (tuple(tensor.shape), tensor.dtype)
+        (static,) = self._slot_views(slot, [spec])
+        granule_elems = self._granule_elems(tensor)
+        fp32_hops = self._fp32_hops_for(tensor)
+        graph = self._capture_graph(
+            lambda: self._all_reduce_lossless(
+                static, static, granule_elems=granule_elems, fp32_hops=fp32_hops, phase="ag"
+            )
+        )
+        return _ReplayEntry(key, (static,), (static,), graph, slot)
+
+    def _split_key(self, inp: torch.Tensor) -> tuple:
+        return ("ars", *self._replay_key(inp))
+
+    def _all_reduce_replayed_split(
+        self,
+        inp: torch.Tensor,
+        between: Callable[[torch.Tensor], None],
+        borrow_output: bool,
+    ) -> torch.Tensor:
+        key = self._split_key(inp)
+        entry = self._replay_entry_for(key, lambda: self._capture_split_entry(inp))
+        self._op_seq += 1
+        if entry is None:
+            out = torch.empty_like(inp)
+            return self._all_reduce_lossless(
+                inp,
+                out,
+                granule_elems=self._granule_elems(inp),
+                fp32_hops=self._fp32_hops_for(inp),
+                between=between,
+            )
+        entry.last_use = self._op_seq
+        if not _same_storage(entry.inp, inp):
+            if _byte_ranges_overlap(entry.inp, inp):
+                raise ValueError(
+                    "split all-reduce input partially overlaps the ring's static "
+                    "buffer; pass the whole borrowed tensor or a copy"
+                )
+            entry.inp.view(-1).copy_(inp.view(-1))
+        entry.graph.replay()
+        between(entry.out.view(inp.shape))
+        entry.graph_ag.replay()
+        if borrow_output:
+            return entry.out.view(inp.shape)
+        out = torch.empty_like(inp)
+        out.view(-1).copy_(entry.out.view(-1))
+        return out
+
+    def _capture_split_entry(self, inp: torch.Tensor) -> _ReplayEntry:
+        """Capture the reduce-scatter and all-gather phases of ``inp``'s shape
+        as two graphs over one in-place static buffer."""
+        slot = self._replay_free_slots.pop()
+        spec = (tuple(inp.shape), inp.dtype)
+        if self._replay_in_place:
+            (static_in,) = self._slot_views(slot, [spec])
+            static_out = static_in
+        else:
+            static_in, static_out = self._slot_views(slot, [spec, spec])
+        granule_elems = self._granule_elems(inp)
+        fp32_hops = self._fp32_hops_for(inp)
+        graph_rs = self._capture_graph(
+            lambda: self._all_reduce_lossless(
+                static_in,
+                static_out,
+                granule_elems=granule_elems,
+                fp32_hops=fp32_hops,
+                phase="rs",
+            )
+        )
+        graph_ag = self._capture_graph(
+            lambda: self._all_reduce_lossless(
+                static_in,
+                static_out,
+                granule_elems=granule_elems,
+                fp32_hops=fp32_hops,
+                phase="ag",
+            )
+        )
+        return _ReplayEntry(
+            self._split_key(inp),
+            (static_in,),
+            (static_out,),
+            graph_rs,
+            slot,
+            graph_ag=graph_ag,
+        )
+
     def all_reduce_input(
         self, shape: tuple[int, ...], dtype: torch.dtype
     ) -> torch.Tensor | None:
@@ -1226,6 +1451,8 @@ class PCIeDmaAllReduce:
         *,
         granule_elems: int = 0,
         fp32_hops: int = 0,
+        phase: str = "all",
+        between: Optional[Callable[[torch.Tensor], None]] = None,
     ) -> torch.Tensor:
         """Lossless ring all-reduce with a selectable chunk-to-element mapping
         and fp32 running sums on the trailing reduce-scatter hops.
@@ -1255,7 +1482,22 @@ class PCIeDmaAllReduce:
 
         Scratch, flag slots and events are the ones ``_all_reduce_aligned``
         uses; the two schedules never run concurrently on one channel.
+
+        Split issue (``all_reduce_in_place_split``): the plan's leading
+        ``reduce_scatter_op_count`` ops are the reduce-scatter phase, the rest
+        the all-gather phase. ``phase="rs"`` issues the first phase and joins
+        the side streams back into the main stream (every rank then holds
+        its fully reduced chunk ``owned_chunk`` in ``out``); ``phase="ag"``
+        records ``_hook_done`` on the main stream, forks the side streams from
+        it and issues the second phase plus the handshake, so the all-gather
+        distributes whatever the caller wrote into its owned chunk between
+        the phases; ``phase="all"`` with ``between`` runs both around
+        ``between(out)`` in one eager sequence. The kernels and their order
+        within each phase are the served ones — only the join/fork at the
+        phase boundary is added — so the reduced values are unchanged.
         """
+        if phase not in ("all", "rs", "ag"):
+            raise ValueError(f"unknown lossless ring phase {phase!r}")
         kernels = self._kernels
         world = self.world_size
         rank = self.rank
@@ -1334,11 +1576,11 @@ class PCIeDmaAllReduce:
         def address(access) -> int:
             return bases[(access.region, access.owner)] + access.offset
 
-        for op in plan:
+        def issue(op, *, after_hook: bool) -> None:
             p = op.piece
             slot = op.slot
             with torch.cuda.stream(copy_stream):
-                if op.step > 0:
+                if op.step > 0 and not after_hook:
                     copy_stream.wait_event(add_done[p])
                 kernels.dma_copy(
                     address(op.copy_dst), address(op.copy_src), op.copy_src.nbytes
@@ -1375,6 +1617,34 @@ class PCIeDmaAllReduce:
                     address(op.main_dst), address(op.main_recv), op.main_dst.nbytes
                 )
             add_done[p].record(main)
+
+        rs_ops = reduce_scatter_op_count(world, pieces)
+        split = phase != "all" or between is not None
+        if phase in ("all", "rs"):
+            self._input_ready.record(main)
+            copy_stream.wait_event(self._input_ready)
+            flag_stream.wait_event(self._input_ready)
+            for op in plan[:rs_ops]:
+                issue(op, after_hook=False)
+            if split:
+                # Every reduce-scatter add is on the main stream; joining the
+                # side streams makes the reduced chunk visible to the caller's
+                # main-stream work and closes the reduce-scatter graph.
+                main.wait_stream(copy_stream)
+                main.wait_stream(flag_stream)
+            if phase == "rs":
+                return out
+        if between is not None:
+            between(out)
+        if split:
+            self._hook_done.record(main)
+            copy_stream.wait_event(self._hook_done)
+            flag_stream.wait_event(self._hook_done)
+        for op in plan[rs_ops:]:
+            # The first all-gather step of a split follows the hook event
+            # rather than the reduce-scatter's add events (those belong to
+            # the other phase's graph); later steps chain on their own adds.
+            issue(op, after_hook=split and op.step == world - 1)
 
         main.wait_stream(copy_stream)
         main.wait_stream(flag_stream)

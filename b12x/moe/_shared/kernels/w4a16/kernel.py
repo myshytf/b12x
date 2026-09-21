@@ -12499,7 +12499,7 @@ def _w4a16_fused_moe_launch_flat(
         if resident_ctas != 186:
             raise ValueError("inline grouping requires the qualified 186-CTA grid")
         _report_inline_group_launch(fused, a_input.device, m, resident_ctas)
-        workspace[:_reference_grouped.HEADER_WORDS].zero_()
+        _clear_resident_header(workspace)
     elif fused.reference_grouped:
         assert expert_map is not None
         _reference_grouped.build_reference_groups(
@@ -12518,7 +12518,7 @@ def _w4a16_fused_moe_launch_flat(
     ):
         # M1, M16 and prefill retain the ordinary launch while sharing the
         # extended arena. They have no builder, so initialize the header here.
-        workspace[:_reference_grouped.HEADER_WORDS].zero_()
+        _clear_resident_header(workspace)
     fused.compiled(
         make_ptr(
             _cutlass_element_dtype(element_dtype),
@@ -12646,6 +12646,41 @@ def _w4a16_fused_moe_launch_flat(
 
 
 _INLINE_GROUP_REPORTED: set[tuple[int | None, int, int]] = set()
+
+
+_RESIDENT_HEADER_CLEARED: set[tuple[int, int]] = set()
+
+
+def _resident_header_host_clear_every_launch() -> bool:
+    """Whether the host zeroes the resident-grid header before every launch.
+
+    The header holds the split-K reduction locks (each reset by its last
+    contributor), the grid barrier's arrival count (reset by the last
+    arriver) and its sense (monotonic, read before every arrival), so a
+    completed launch leaves it ready for the next one. ``0`` keeps the
+    historical clear only for the first launch on a workspace; the default
+    retains the clear before every launch while the self-cleaning path is
+    qualified end to end.
+    """
+    return os.environ.get("B12X_W4A16_HEADER_HOST_CLEAR", "1") != "0"
+
+
+def _clear_resident_header(workspace: torch.Tensor) -> None:
+    """Zero the resident-grid header (locks, barrier count and sense).
+
+    With ``B12X_W4A16_HEADER_HOST_CLEAR=0`` the zero runs once per workspace
+    storage (its first launch in this process); later launches, including
+    those captured into CUDA graphs, rely on the kernel's own resets. A
+    captured graph therefore carries no fill node before the MoE kernel.
+    """
+    if _resident_header_host_clear_every_launch():
+        workspace[:_reference_grouped.HEADER_WORDS].zero_()
+        return
+    key = (int(workspace.data_ptr()), int(workspace.device.index or 0))
+    if key in _RESIDENT_HEADER_CLEARED:
+        return
+    workspace[:_reference_grouped.HEADER_WORDS].zero_()
+    _RESIDENT_HEADER_CLEARED.add(key)
 
 
 def _report_inline_group_launch(
