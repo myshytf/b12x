@@ -193,3 +193,29 @@ def test_split_rejects_unsupported_inputs() -> None:
     assert not granule.rings[0].can_all_reduce_split(y)
     # 1-D inputs have no rows to own.
     assert granule.rings[0].split_owned_rows(x.reshape(-1)) is None
+
+
+def test_row_all_gather_distributes_every_rank_owned_rows() -> None:
+    emu = EmulatedRing(WORLD, MAX_BYTES, granule_rows=GRANULE_ROWS, fp32_hops=1, model=True)
+    gen = torch.Generator().manual_seed(21)
+    full = torch.randn(ROWS, WIDTH, generator=gen).to(torch.bfloat16)
+
+    def call(ring, rank):
+        # Each rank knows only its owned rows; the rest is garbage.
+        mine = torch.full((ROWS, WIDTH), float("nan"), dtype=torch.bfloat16)
+        for row0, rows in ring.split_owned_rows(full):
+            mine[row0 : row0 + rows] = full[row0 : row0 + rows]
+        eager = ring.all_gather_owned_rows(mine)
+        replayed = ring.all_gather_owned_rows(mine)
+        borrowed = ring.all_gather_owned_rows(mine, borrow_output=True)
+        return eager, replayed, borrowed
+
+    results = emu.run(call)
+    assert emu.conflicts == [], emu.conflicts
+    for rank, (eager, replayed, borrowed) in enumerate(results):
+        assert torch.equal(eager, full), f"rank {rank} eager"
+        assert torch.equal(replayed, full), f"rank {rank} replay"
+        assert torch.equal(borrowed, full), f"rank {rank} borrowed"
+        ring = emu.rings[rank]
+        assert ring.is_ring_storage(borrowed) and not ring.is_ring_storage(replayed)
+        assert list(ring._replay_entries) == [("agr", full.numel(), torch.bfloat16, GRANULE_ROWS * WIDTH)]

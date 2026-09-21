@@ -940,6 +940,67 @@ class PCIeDmaAllReduce:
                 between=between,
             )
 
+    def all_gather_owned_rows(
+        self, tensor: torch.Tensor, *, borrow_output: bool = False
+    ) -> torch.Tensor:
+        """Row all-gather over the split mapping: every rank's owned rows of
+        ``tensor`` (``split_owned_rows``) reach every rank; the other rows of
+        the input are ignored. This is the all-gather phase of the lossless
+        ring alone (its chunk copies read the owned chunk of the buffer), so
+        it costs about half an all-reduce and moves bytes only. Replayed
+        shapes use a one-graph entry keyed apart from the all-reduce entries.
+        """
+        if borrow_output and not self._graph_replay:
+            raise ValueError("borrow_output needs graph replay")
+        with torch.cuda.device(self.device):
+            if not self.can_all_reduce_split(tensor):
+                raise ValueError(
+                    "input does not satisfy split ring all-gather requirements "
+                    f"(shape={tuple(tensor.shape)}, dtype={tensor.dtype})"
+                )
+            granule_elems = self._granule_elems(tensor)
+            fp32_hops = self._fp32_hops_for(tensor)
+            if self._graph_replay and self._graph_replay_eligible(tensor):
+                key = ("agr", *self._replay_key(tensor))
+                entry = self._replay_entry_for(
+                    key, lambda: self._capture_gather_entry(tensor, key)
+                )
+                self._op_seq += 1
+                if entry is not None:
+                    entry.last_use = self._op_seq
+                    if not _same_storage(entry.inp, tensor):
+                        if _byte_ranges_overlap(entry.inp, tensor):
+                            raise ValueError(
+                                "row all-gather input partially overlaps the ring's "
+                                "static buffer; pass the whole borrowed tensor or a copy"
+                            )
+                        entry.inp.view(-1).copy_(tensor.view(-1))
+                    entry.graph.replay()
+                    if borrow_output:
+                        return entry.out.view(tensor.shape)
+                    out = torch.empty_like(tensor)
+                    out.view(-1).copy_(entry.out.view(-1))
+                    return out
+            else:
+                self._op_seq += 1
+            out = tensor.clone()
+            return self._all_reduce_lossless(
+                out, out, granule_elems=granule_elems, fp32_hops=fp32_hops, phase="ag"
+            )
+
+    def _capture_gather_entry(self, tensor: torch.Tensor, key: tuple) -> _ReplayEntry:
+        slot = self._replay_free_slots.pop()
+        spec = (tuple(tensor.shape), tensor.dtype)
+        (static,) = self._slot_views(slot, [spec])
+        granule_elems = self._granule_elems(tensor)
+        fp32_hops = self._fp32_hops_for(tensor)
+        graph = self._capture_graph(
+            lambda: self._all_reduce_lossless(
+                static, static, granule_elems=granule_elems, fp32_hops=fp32_hops, phase="ag"
+            )
+        )
+        return _ReplayEntry(key, (static,), (static,), graph, slot)
+
     def _split_key(self, inp: torch.Tensor) -> tuple:
         return ("ars", *self._replay_key(inp))
 
