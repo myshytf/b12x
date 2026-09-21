@@ -1124,6 +1124,84 @@ def _check_pair_kimi_topk(rank: int, world_size: int, device: torch.device) -> N
         pool.close()
 
 
+
+def _time_pair_kimi_topk(rank: int, world_size: int, device: torch.device) -> None:
+    """Replay timing of the served two-launch selection (paired gather, then
+    the batched top-16 kernel) against the fused launch, for batches of one to
+    eight rows, ``B12X_PCIE_DCP_A2A_TIME_LAYERS`` layers per graph (default 30)
+    and ``B12X_PCIE_DCP_A2A_TIME_REPLAYS`` replays (default 20). Every rank
+    prints the median per-layer time; the collective's time is the slowest
+    rank's. Enabled by ``B12X_PCIE_DCP_A2A_TIME=1``."""
+    import json
+    import statistics
+
+    layers = int(os.getenv("B12X_PCIE_DCP_A2A_TIME_LAYERS", "30"))
+    replays = int(os.getenv("B12X_PCIE_DCP_A2A_TIME_REPLAYS", "20"))
+    down_width = _kimi_shard_width(KIMI_LATENT_WIDTH, world_size)
+    router_width = _kimi_shard_width(KIMI_ROUTER_WIDTH, world_size)
+    combined = down_width * 2 + router_width * 4
+    pool = PCIeDCPA2APool.from_process_group(
+        process_group=dist.group.WORLD,
+        device=device,
+        max_batch_size=8,
+        total_heads=world_size,
+        head_dim=combined,
+        query_head_dim=combined,
+        max_concurrent_channels=3,
+    )
+    try:
+        pool.prepare_channels(("eager:time", "graph:time-legacy", "graph:time-fused"))
+        bias = _kimi_correction_bias(world_size, device)
+        stream = torch.cuda.Stream(device=device)
+        results = []
+        for batch in (1, 2, 4, 8):
+            down, router = _kimi_rank_rows(9000 + batch, rank, batch, world_size, device)
+            # Eager launches prepare both launcher variants on this stream.
+            with torch.cuda.stream(stream):
+                out_down = torch.empty(batch, KIMI_LATENT_WIDTH, dtype=torch.bfloat16, device=device)
+                out_router = torch.empty(batch, KIMI_ROUTER_WIDTH, dtype=torch.float32, device=device)
+                pool.all_gather_pair(down, router, out_down, out_router, channel_id="eager:time")
+                pool.kimi_topk16(out_router, bias, channel_id="eager:time")
+                pool.all_gather_pair_kimi_topk(down, router, bias, channel_id="eager:time")
+            stream.synchronize()
+            dist.barrier()
+            timings = {}
+            for variant in ("legacy", "fused"):
+                out_downs = [torch.empty(batch, KIMI_LATENT_WIDTH, dtype=torch.bfloat16, device=device) for _ in range(layers)]
+                out_routers = [torch.empty(batch, KIMI_ROUTER_WIDTH, dtype=torch.float32, device=device) for _ in range(layers)]
+                out_weights = [torch.empty(batch, 16, dtype=torch.float32, device=device) for _ in range(layers)]
+                out_ids = [torch.empty(batch, 16, dtype=torch.int32, device=device) for _ in range(layers)]
+                graph = torch.cuda.CUDAGraph()
+                with pool.capture(stream, channel_id=f"graph:time-{variant}") as channel, torch.cuda.graph(graph, stream=stream):
+                    for layer in range(layers):
+                        if variant == "legacy":
+                            channel.all_gather_pair(down, router, out_downs[layer], out_routers[layer])
+                            channel.kimi_topk16(out_routers[layer], bias, out_weights[layer], out_ids[layer])
+                        else:
+                            channel.all_gather_pair_kimi_topk(down, router, bias, out_downs[layer], out_weights[layer], out_ids[layer])
+                stream.synchronize()
+                samples = []
+                for _ in range(replays):
+                    dist.barrier()
+                    start = torch.cuda.Event(enable_timing=True)
+                    end = torch.cuda.Event(enable_timing=True)
+                    with torch.cuda.stream(stream):
+                        start.record(stream)
+                        graph.replay()
+                        end.record(stream)
+                    stream.synchronize()
+                    samples.append(start.elapsed_time(end) * 1000.0 / layers)
+                timings[variant] = statistics.median(samples)
+                del graph
+                torch.cuda.synchronize(device)
+                dist.barrier()
+            results.append({"rank": rank, "batch": batch, "legacy_us": timings["legacy"], "fused_us": timings["fused"]})
+            print(json.dumps({"stage": "pair_kimi_topk_timing", **results[-1]}), flush=True)
+        torch.cuda.synchronize(device)
+        dist.barrier()
+    finally:
+        pool.close()
+
 def _stage(rank: int, name: str) -> None:
     """One JSON line per rank and check boundary, so a hang or a collective
     sequence mismatch can be attributed to the check a rank was in."""
@@ -1188,6 +1266,9 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         # The fused Kimi router path needs its own pool (Kimi row widths).
         _stage(rank, "pair_kimi_topk")
         _check_pair_kimi_topk(rank, world_size, device)
+        if os.getenv("B12X_PCIE_DCP_A2A_TIME", "0") == "1":
+            _stage(rank, "pair_kimi_topk_timing")
+            _time_pair_kimi_topk(rank, world_size, device)
         _stage(rank, "complete")
         if rank == 0:
             print("A2A GPU gate: complete", flush=True)
