@@ -601,6 +601,7 @@ class EmulatedRing:
             ]
             ring._input_ready = _FakeEvent()
             ring._ag_ready = _FakeEvent()
+            ring._hook_done = _FakeEvent()
             ring._a2a_qdone = [_FakeEvent() for _ in range(pcie_dma.MAX_PIECES)]
             ring._a2a_ownq = [_FakeEvent() for _ in range(pcie_dma.MAX_PIECES)]
             ring._fp8 = ""
