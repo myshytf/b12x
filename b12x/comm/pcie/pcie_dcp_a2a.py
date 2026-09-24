@@ -634,6 +634,17 @@ class PCIeDCPA2A:
         self._block_limit_override = _env_int(
             "B12X_PCIE_DCP_BLOCK_LIMIT", 0
         )
+        # Per-operation geometry (``lse``: LSE reduce-scatter, ``heads``:
+        # query head gather) takes precedence over the two settings above, so
+        # one collective can be retuned without moving the others. A warp
+        # owns a whole row in both kernels, so geometry never changes results.
+        self._op_launch_overrides = {
+            op: (
+                _env_int(f"B12X_PCIE_DCP_{op.upper()}_THREADS", 0),
+                _env_int(f"B12X_PCIE_DCP_{op.upper()}_BLOCK_LIMIT", 0),
+            )
+            for op in ("lse", "heads")
+        }
         self._transport = a2a_transport()
         self.gather_switch_groups = a2a_gather_switch_groups(self.world_size)
         self._stream_affine = bool(stream_affine)
@@ -880,13 +891,22 @@ class PCIeDCPA2A:
         *,
         threads: int,
         block_limit: int,
+        op: Optional[str] = None,
     ) -> tuple[int, int]:
         threads = int(threads)
         block_limit = int(block_limit)
-        if self._threads_override > 0:
-            threads = min(512, max(64, (self._threads_override // 32) * 32))
-        if self._block_limit_override > 0:
-            block_limit = min(self._block_limit_override, _MAX_BLOCKS)
+        threads_override = self._threads_override
+        block_limit_override = self._block_limit_override
+        if op is not None:
+            op_threads, op_block_limit = self._op_launch_overrides[op]
+            if op_threads > 0:
+                threads_override = op_threads
+            if op_block_limit > 0:
+                block_limit_override = op_block_limit
+        if threads_override > 0:
+            threads = min(512, max(64, (threads_override // 32) * 32))
+        if block_limit_override > 0:
+            block_limit = min(block_limit_override, _MAX_BLOCKS)
         if (
             threads < self.world_size
             or threads > 512
@@ -911,7 +931,9 @@ class PCIeDCPA2A:
             )
         if dtype not in SUPPORTED_DTYPES:
             raise ValueError(f"unsupported output dtype {dtype}")
-        threads, _ = self._resolve_launch_config(threads=threads, block_limit=1)
+        threads, _ = self._resolve_launch_config(
+            threads=threads, block_limit=1, op="lse"
+        )
         dtype_name = "fp16" if dtype == torch.float16 else "bf16"
         from ._dcp_a2a_cute import _get_compiled_lse_reduce_scatter
 
@@ -932,7 +954,9 @@ class PCIeDCPA2A:
             raise RuntimeError(
                 "prepare_graph_all_gather_heads() must run before capture"
             )
-        threads, _ = self._resolve_launch_config(threads=threads, block_limit=1)
+        threads, _ = self._resolve_launch_config(
+            threads=threads, block_limit=1, op="heads"
+        )
         from ._dcp_a2a_cute import _get_compiled_all_gather_heads
 
         with torch.cuda.device(self.device):
@@ -1093,6 +1117,7 @@ class PCIeDCPA2A:
         threads, block_limit = self._resolve_launch_config(
             threads=threads,
             block_limit=block_limit,
+            op="lse",
         )
         rows = int(partial_output.shape[0]) * self.heads_per_rank
         warps_per_block = threads // 32
@@ -1246,6 +1271,7 @@ class PCIeDCPA2A:
         threads, block_limit = self._resolve_launch_config(
             threads=threads,
             block_limit=block_limit,
+            op="heads",
         )
         rows = int(batch) * self.total_heads
         warps_per_block = threads // 32
