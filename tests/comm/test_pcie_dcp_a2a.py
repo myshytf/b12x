@@ -2387,3 +2387,31 @@ def test_pair_transport_override_reaches_pair_prepare(monkeypatch) -> None:
     assert calls == [(2, 0, 512, True, False, False), (2, 0, 256, True, True)]
     runtime.close()
 
+
+
+def test_per_operation_launch_overrides_take_precedence(monkeypatch):
+    """``B12X_PCIE_DCP_{LSE,HEADS}_{THREADS,BLOCK_LIMIT}`` retune one
+    collective over the global ``B12X_PCIE_DCP_*`` geometry; the paired
+    gather keeps the global setting."""
+    monkeypatch.setenv("B12X_PCIE_DCP_THREADS", "512")
+    monkeypatch.setenv("B12X_PCIE_DCP_BLOCK_LIMIT", "8")
+    monkeypatch.setenv("B12X_PCIE_DCP_LSE_THREADS", "64")
+    monkeypatch.setenv("B12X_PCIE_DCP_LSE_BLOCK_LIMIT", "32")
+    monkeypatch.setenv("B12X_PCIE_DCP_HEADS_THREADS", "128")
+    runtime = _make_runtime()
+    partial_output = torch.zeros(2, 32, 64, dtype=torch.bfloat16)
+    partial_lse = torch.zeros(2, 32, dtype=torch.float32)
+
+    runtime.lse_reduce_scatter(partial_output, partial_lse, threads=256, block_limit=16)
+    # 2 rows x 16 heads per rank over 2 warps per block -> 16 blocks (limit 32).
+    assert runtime.run_calls[-1][2:4] == (64, 16)
+    runtime.all_gather_heads(partial_output[:, :16].contiguous(), threads=256)
+    # 2 x 32 gathered rows over 4 warps per block, global block limit 8.
+    assert runtime.run_calls[-1][2:4] == (128, 8)
+    runtime.all_gather_pair(
+        torch.zeros(2, 16, dtype=torch.bfloat16),
+        torch.zeros(2, 8, dtype=torch.float32),
+        threads=256,
+    )
+    assert runtime.run_calls[-1][2] == 512
+    runtime.close()

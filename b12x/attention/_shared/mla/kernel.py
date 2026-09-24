@@ -313,6 +313,43 @@ def _env_glm_fastpath_enabled() -> bool:
     return raw is not None and raw.strip().lower() in {"1", "true", "on", "yes"}
 
 
+_MLA_SM120_HEAD_MULTICAST_ENV = "B12X_MLA_SM120_HEAD_MULTICAST"
+
+
+def _head_multicast_for(
+    grid_h_blocks: int,
+    *,
+    per_token_len: bool,
+    has_extra: bool,
+    glm_fastpath: bool,
+    scale_format: int,
+    heads: int,
+    valid_hpb: int,
+    model_type: int,
+) -> int:
+    """Head blocks per thread-block cluster sharing one KV gather.
+
+    ``B12X_MLA_SM120_HEAD_MULTICAST`` = 1/true/on/yes enables it for launches
+    of the packed GLM per-token single-cache path (the generic HPB=16 fast
+    path) whose full-block grid has 2-8 head blocks: all of them form one
+    cluster. Unset/0, and every other launch, keeps one CTA per gather.
+    """
+    value = os.environ.get(_MLA_SM120_HEAD_MULTICAST_ENV, "").strip().lower()
+    if value not in ("1", "true", "on", "yes"):
+        return 1
+    if not (
+        per_token_len
+        and not has_extra
+        and glm_fastpath
+        and int(model_type) == int(ModelType.GLM_NSA)
+        and int(scale_format) == int(ScaleFormat.ARBITRARY_FP32)
+        and int(valid_hpb) == 16
+        and heads != 8
+    ):
+        return 1
+    return grid_h_blocks if 2 <= grid_h_blocks <= 8 else 1
+
+
 def _env_balanced_waves() -> float:
     """CTA waves the balanced split policy fills (default 1.0)."""
     raw = os.environ.get(_MLA_SM120_BALANCED_WAVES_ENV)
@@ -465,6 +502,7 @@ class UnifiedDecodeKernel:
         glm_fastpath=False,
         glm_w_hw_dequant=False,
         q_packed=False,
+        head_multicast=1,
     ):
         self.traits = traits
         self.layout = layout
@@ -569,6 +607,25 @@ class UnifiedDecodeKernel:
         self.math_threads = int(traits.math_threads)
         self.block_threads = 320 if self.native_dsv4_h16 else int(traits.block_threads)
         self.io_threads = self.block_threads - self.math_threads
+        # Head multicast (packed GLM per-token single-cache path only): a
+        # thread-block cluster of ``head_mc`` consecutive head blocks of one
+        # (token, split) shares each gathered KV chunk. Every CTA issues the
+        # bulk copies of 1/head_mc of the chunk's records and multicasts them
+        # to all CTAs of the cluster, so each record is read from L2 once per
+        # cluster instead of once per head block. Staged bytes, math and
+        # partials are unchanged (bit-identical); 1 keeps the per-CTA gather.
+        self.head_mc = int(head_multicast)
+        if self.head_mc > 1:
+            if not (self.glm_fastpath and per_token_len and not has_extra):
+                raise ValueError(
+                    "SM120 sparse MLA decode head multicast requires the packed GLM "
+                    "per-token single-cache path"
+                )
+            if self.head_mc > 8 or self.h_blocks % self.head_mc:
+                raise ValueError(
+                    f"SM120 sparse MLA decode head multicast {self.head_mc} must "
+                    f"divide h_blocks {self.h_blocks} and be at most 8"
+                )
 
     @cute.jit
     def __call__(
@@ -693,6 +750,8 @@ class UnifiedDecodeKernel:
             block=[self.block_threads, 1, 1],
             min_blocks_per_mp=1,
             stream=stream,
+            # Head multicast only; other launches keep their exact attributes.
+            **({"cluster": [1, self.head_mc, 1]} if self.head_mc > 1 else {}),
         )
 
     @cute.jit
@@ -731,6 +790,8 @@ class UnifiedDecodeKernel:
             block=[self.block_threads, 1, 1],
             min_blocks_per_mp=1,
             stream=stream,
+            # Head multicast only; other launches keep their exact attributes.
+            **({"cluster": [1, self.head_mc, 1]} if self.head_mc > 1 else {}),
         )
 
     @cute.jit
@@ -1766,11 +1827,26 @@ class UnifiedDecodeKernel:
         n_buf = int(L.kv_bufs)
 
         full_arrivals = 2 if self.native_dsv4_h16 else 1
+        # Head multicast: every CTA of the cluster writes each stage, so a
+        # stage is empty only once the consumers of all head_mc CTAs released it.
         if tid == Int32(0):
             for s in cutlass.range_constexpr(n_buf):
                 cute.arch.mbarrier_init(mbar_base + s, Int32(full_arrivals))
-                cute.arch.mbarrier_init(mbar_base + n_buf + s, Int32(1))  # empty[s]
-        cute.arch.barrier()  # Full-CTA structural fence.
+                cute.arch.mbarrier_init(
+                    mbar_base + n_buf + s, Int32(self.head_mc)
+                )  # empty[s]
+        if cutlass.const_expr(self.head_mc > 1):
+            # No CTA may multicast into, or arrive on, a peer's barriers before
+            # the peer initialized them.
+            if tid == Int32(0):
+                cute.arch.mbarrier_init_fence()
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
+        else:
+            cute.arch.barrier()  # Full-CTA structural fence.
+        cta_rank = Int32(0)
+        if cutlass.const_expr(self.head_mc > 1):
+            cta_rank = Int32(cute.arch.block_idx_in_cluster())
 
         # swa_indices for THIS token row: a 1-D (topk,) slice.
         # ZERO-WIDTH MAIN (DSV4 dual-cache, all KV in the EXTRA cache):
@@ -1866,6 +1942,8 @@ class UnifiedDecodeKernel:
                     packed_dsv4=self.native_dsv4_h8 or self.native_dsv4_h16,
                     overlap_footer_gather=self.native_dsv4_h16,
                     per_token_latent_scale=t.latent_scale_per_token,
+                    head_multicast=self.head_mc,
+                    cta_rank=cta_rank,
                 )
                 # Per-chunk section dispatch (DSV4 dual-cache; FlashInfer
                 # decode_dsv4 :243-322). chunks [0, num_main_chunks) gather from the
@@ -2434,8 +2512,16 @@ class UnifiedDecodeKernel:
                 gsum_frag[1] = global_sum[1]
 
                 cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
-                if tid == Int32(0):
-                    cute.arch.mbarrier_arrive(mbar_base + n_buf + cons_idx)
+                if cutlass.const_expr(self.head_mc > 1):
+                    # Release this stage to the producer of every CTA of the
+                    # cluster (each multicasts into this CTA's stage).
+                    if tid < Int32(self.head_mc):
+                        cute.arch.mbarrier_arrive(
+                            mbar_base + n_buf + cons_idx, peer_cta_rank_in_cluster=tid
+                        )
+                else:
+                    if tid == Int32(0):
+                        cute.arch.mbarrier_arrive(mbar_base + n_buf + cons_idx)
                 cons_idx += Int32(1)
                 if cons_idx == Int32(n_buf):
                     cons_idx = Int32(0)
@@ -2510,6 +2596,12 @@ class UnifiedDecodeKernel:
                 ),
                 warp_contiguous_dims=self.glm_fastpath,
             )
+
+        if cutlass.const_expr(self.head_mc > 1):
+            # Peers arrive on this CTA's empty barriers until their last
+            # stage; keep every CTA's shared memory alive until then.
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
 
 
 def _to_cute(x, dtype, align=16, dynamic_layout=False):
@@ -2628,6 +2720,16 @@ def _sparse_mla_decode_grid_flat_launch(
     glm_fastpath = _env_glm_fastpath_enabled()
     glm_w_hw_dequant = _env_glm_w_hw_dequant_enabled()
     heads = int(q_all.shape[1])
+    head_multicast = _head_multicast_for(
+        int(grid_h_blocks),
+        per_token_len=bool(per_token_len),
+        has_extra=bool(has_extra),
+        glm_fastpath=glm_fastpath,
+        scale_format=int(scale_format),
+        heads=heads,
+        valid_hpb=int(valid_hpb),
+        model_type=int(model_type),
+    )
     native_glm_h8 = bool(
         int(model_type) == int(ModelType.GLM_NSA)
         and heads == 8
@@ -2771,6 +2873,7 @@ def _sparse_mla_decode_grid_flat_launch(
         glm_fastpath=glm_fastpath,
         glm_w_hw_dequant=glm_w_hw_dequant,
         q_packed=q_packed,
+        head_multicast=head_multicast,
     )
     if q_packed and not kernel.q_packed:
         raise ValueError(
@@ -2783,6 +2886,7 @@ def _sparse_mla_decode_grid_flat_launch(
         key_field("glm_fastpath", int(kernel.glm_fastpath)),
         key_field("glm_w_hw_dequant", int(kernel.glm_w_hw_dequant)),
         key_field("q_packed", int(kernel.q_packed)),
+        key_field("head_multicast", int(kernel.head_mc)),
         key_field("compute_mode", traits.compute_mode),
         key_field("scale_format", traits.scale_format),
         key_field("fp8_rope", int(traits.fp8_rope)),
@@ -3399,6 +3503,16 @@ def run_unified_decode(
         per_token_len=bool(per_token_len),
         split_policy=str(split_policy),
         balanced_split_target=int(balanced_split_target),
+        head_multicast=_head_multicast_for(
+            int(h_blocks_full),
+            per_token_len=bool(per_token_len),
+            has_extra=bool(has_extra),
+            glm_fastpath=_env_glm_fastpath_enabled(),
+            scale_format=int(traits.scale_format),
+            heads=int(heads),
+            valid_hpb=16,
+            model_type=int(model_type),
+        ),
         glm_fastpath=bool(
             _env_glm_fastpath_enabled()
             and per_token_len

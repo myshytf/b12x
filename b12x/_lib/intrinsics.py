@@ -1254,6 +1254,46 @@ def cp_async_bulk_g2s_mbar(
 
 
 @dsl_user_op
+def cp_async_bulk_g2s_mbar_multicast(
+    smem_dst_u32: Int32,
+    gmem_src_i64: Int64,
+    nbytes: Int32,
+    mbar_u32: Int32,
+    cta_mask: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Emit cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes
+    .multicast::cluster.
+
+    Like :func:`cp_async_bulk_g2s_mbar`, but the bytes land at the same
+    CTA-relative shared-memory offset in every CTA of the cluster selected by
+    the low 16 bits of ``cta_mask``, and each destination CTA's mbarrier at
+    ``mbar_u32``'s offset receives the completed transaction bytes.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            Int32(smem_dst_u32).ir_value(loc=loc, ip=ip),
+            Int64(gmem_src_i64).ir_value(loc=loc, ip=ip),
+            Int32(nbytes).ir_value(loc=loc, ip=ip),
+            Int32(mbar_u32).ir_value(loc=loc, ip=ip),
+            Int32(cta_mask).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t.reg .b16 mask;\n\tcvt.u16.u32 mask, $4;\n\t"
+        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes"
+        ".multicast::cluster [$0], [$1], $2, [$3], mask;\n\t}",
+        "r,l,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def create_l2_evict_first_policy(*, loc=None, ip=None) -> Uint64:
     """Create an L2 evict-first policy for one-pass streaming cache rows."""
     return Uint64(
