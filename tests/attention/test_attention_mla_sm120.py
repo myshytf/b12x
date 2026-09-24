@@ -2515,3 +2515,71 @@ def test_unified_decode_glm_packed_query_bit_identical(monkeypatch, num_tokens, 
     monkeypatch.setenv("B12X_MLA_SM120_GLM_FASTPATH", "0")
     with pytest.raises(ValueError, match="packed query"):
         run(packed)
+
+
+
+# ── Head multicast (Kimi-K3 packed dense decode, B12X_MLA_SM120_HEAD_MULTICAST) ──
+
+
+@pytest.mark.parametrize(
+    "change,expected",
+    [
+        (None, 7),
+        ("env_off", 1),
+        ("has_extra", 1),
+        ("no_fastpath", 1),
+        ("static_len", 1),
+        ("h8", 1),
+        ("nine_blocks", 1),
+        ("remainder", 1),
+    ],
+)
+def test_head_multicast_gate(monkeypatch, change, expected) -> None:
+    """Only full-block launches of the packed GLM per-token single-cache path
+    with 2-8 head blocks form head clusters, and only when enabled."""
+    from b12x.attention._shared.mla.kernel import _head_multicast_for
+    from b12x.attention._shared.mla.traits import ModelType, ScaleFormat
+
+    if change != "env_off":
+        monkeypatch.setenv("B12X_MLA_SM120_HEAD_MULTICAST", "1")
+    kwargs = dict(
+        per_token_len=change != "static_len",
+        has_extra=change == "has_extra",
+        glm_fastpath=change != "no_fastpath",
+        scale_format=int(ScaleFormat.ARBITRARY_FP32),
+        heads=8 if change == "h8" else 112,
+        valid_hpb=3 if change == "remainder" else 16,
+        model_type=int(ModelType.GLM_NSA),
+    )
+    blocks = 9 if change == "nine_blocks" else 7
+
+    assert _head_multicast_for(blocks, **kwargs) == expected
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("num_heads", [112, 128])
+@pytest.mark.parametrize("split_policy", ["static", "balanced"])
+def test_unified_decode_glm_head_multicast_is_bitwise(
+    monkeypatch, num_heads, split_policy
+) -> None:
+    """Sharing each gathered KV chunk across the head-block cluster (TMA
+    multicast) stages the same bytes, so outputs are bitwise equal to the
+    per-CTA gather, including rows of different lengths."""
+    device = require_b12x_sparse_mla()
+    import b12x.attention._shared.mla.kernel as launch
+
+    monkeypatch.setenv("B12X_MLA_SM120_GLM_FASTPATH", "1")
+    topk, num_tokens = 2048, 4
+    kwargs = dict(
+        topk=topk, num_tokens=num_tokens, forced_num_splits=16, seed=7400,
+        split_policy=split_policy, num_heads=num_heads,
+    )
+    monkeypatch.delenv("B12X_MLA_SM120_HEAD_MULTICAST", raising=False)
+    base, exp, lengths = _run_glm_multitoken(device, **kwargs)
+    assert launch.LAST_DECODE_PLAN.get("head_multicast") == 1
+    monkeypatch.setenv("B12X_MLA_SM120_HEAD_MULTICAST", "1")
+    shared, _, _ = _run_glm_multitoken(device, **kwargs)
+    assert launch.LAST_DECODE_PLAN.get("head_multicast") == num_heads // 16
+
+    assert torch.equal(shared, base)
+    _assert_glm_rows_match_reference(shared, exp, lengths, label="multicast")

@@ -48,6 +48,7 @@ from cutlass import Int32, Int64, Uint32
 
 from b12x._lib.intrinsics import (
     cp_async_bulk_g2s_mbar,
+    cp_async_bulk_g2s_mbar_multicast,
     get_ptr_as_int64,
     ld_global_nc_v2_u32,
     shared_ptr_to_u32,
@@ -115,6 +116,8 @@ def io_issue_gather(
     split_mbar_arrival: cutlass.Constexpr = False,
     overlap_footer_gather: cutlass.Constexpr = False,
     per_token_latent_scale: cutlass.Constexpr = False,
+    head_multicast: cutlass.Constexpr = 1,
+    cta_rank=None,
 ):
     """Producer body for ONE chunk into buffer ``buf`` (caller selects the dst
     addrs + full_mbar_ptr for ``buf``). Mirrors FlashInfer ``issue_gather``:
@@ -146,6 +149,15 @@ def io_issue_gather(
     stride_extra_kv_block. The smem dst layout + per-entry byte geometry are
     IDENTICAL across sections, so this body is section-agnostic and the no-extra
     DSV4 / GLM PTX is unchanged (the caller never emits the extra branch).
+
+    HEAD MULTICAST (``head_multicast`` = C > 1, packed GLM records only): the C
+    CTAs of a thread-block cluster serve C head blocks of the same token and
+    split, so they gather identical records. The CTA of cluster rank
+    ``cta_rank`` copies only the entries ``e`` with ``e % C == cta_rank`` and
+    multicasts each record to the same shared-memory offset of all C CTAs;
+    every CTA still stages all validity indices itself and its leader still
+    expects the whole chunk's transaction bytes on its own ``full`` barrier.
+    The staged bytes are identical to the single-CTA gather.
     """
     # Section-agnostic gather: ``kv_cache_u8`` / ``topk_indices`` /
     # ``page_block_size`` / ``stride_kv_block`` are THIS section's pool (the caller
@@ -222,6 +234,9 @@ def io_issue_gather(
             )
 
     def _issue_payload():
+        if cutlass.const_expr(head_multicast > 1):
+            _issue_payload_multicast()
+            return
         eo = Int32(0)
         for _ in cutlass.range_constexpr((bi + io_threads - 1) // io_threads):
             entry = eo + io_lane
@@ -268,6 +283,36 @@ def io_issue_gather(
                         _ROPE,
                         full_mbar_u32,
                     )
+            eo += Int32(io_threads)
+
+    def _issue_payload_multicast():
+        # Entries e with e % C == cta_rank, walked by the IO lanes; one packed
+        # 656-byte record per entry, multicast to every CTA of the cluster.
+        cta_mask = Int32((1 << head_multicast) - 1)
+        per_cta = (bi + head_multicast - 1) // head_multicast
+        eo = Int32(0)
+        for _ in cutlass.range_constexpr((per_cta + io_threads - 1) // io_threads):
+            entry = (eo + io_lane) * Int32(head_multicast) + cta_rank
+            if entry < Int32(bi):
+                cand_pos = g_start + entry
+                idx_raw = Int32(-1)
+                if cand_pos < g_end:
+                    idx_raw = Int32(_section_idx[cand_pos])
+                idx = idx_raw
+                if idx < Int32(0):
+                    idx = Int32(0)
+                block_idx = idx // _section_pbs
+                local_idx = idx - block_idx * _section_pbs
+                data_base_off = (
+                    Int64(block_idx) * _section_stride + Int64(local_idx) * _IOS
+                )
+                cp_async_bulk_g2s_mbar_multicast(
+                    kv_fp8_dst_addr + entry * Int32(kv_smem_stride),
+                    get_ptr_as_int64(_section_kv, data_base_off),
+                    Int32(_GLM_GMEM_STRIDE),
+                    shared_ptr_to_u32(full_mbar_ptr),
+                    cta_mask,
+                )
             eo += Int32(io_threads)
 
     # Native H16 can overlap the random scalar footer load with the much larger
