@@ -26,9 +26,21 @@ CUDA-graph path treats the GEMV (compile-cache lookup + CUTE launch) as a
 single opaque node. The fallback for shapes the kernel does not cover
 (prefill m > SMALL_M_MAX, odd K, misalignment) lives INSIDE the op, so the
 calling graph never branches on data-dependent shapes.
+
+Tensor-core variant (opt-in, ``B12X_BF16_GEMV_TC=1``): for K a multiple of
+512 the op routes to ``_tensor_core.TensorCoreGemvKernel``, which streams the
+weight once as m16n8k16 MMA operands so one weight fragment serves every
+live row, accumulates FP32 and reduces across warps in a fixed order with a
+single BF16 rounding. One compile per ``(n, k)`` covers every live row count
+1..8 (rows are a runtime argument; rows past the live count are never
+written), which keeps CUDA-graph capture at m=8 replay-safe. Deterministic
+and in the same precision class as the SIMT kernel, but a different
+reduction order — a qualification-track backend, off by default.
 """
 from __future__ import annotations
 
+import functools
+import os
 from typing import Dict, Tuple
 
 import cutlass
@@ -48,7 +60,7 @@ from b12x._lib.intrinsics import (
     warp_reduce,
 )
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
-from b12x._lib.utils import current_cuda_stream
+from b12x._lib.utils import current_cuda_stream, make_ptr
 
 _THREADS = 128
 
@@ -145,6 +157,109 @@ class SmallNGemvKernel:
             cute.arch.barrier()
 
 
+@functools.lru_cache(maxsize=1)
+def _tc_gemv_enabled() -> bool:
+    """Opt-in tensor-core GEMV selection (``B12X_BF16_GEMV_TC=1``).
+
+    Default off: the SIMT small-N path stays the serving behaviour until the
+    tc backend passes its own qualification window.
+    """
+    return os.environ.get("B12X_BF16_GEMV_TC", "0") == "1"
+
+
+def _use_tc_kernel(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    """Eligibility for the tensor-core GEMV: decode rows, wide K, aligned.
+
+    The kernel's contract (see ``_tensor_core.py``) is m<=8, K a multiple of
+    512, unit column strides and 16-byte-aligned rows; biased calls and odd
+    shapes stay with the SIMT kernel or cuBLAS.
+    """
+    m, k = x.shape
+    return (
+        _tc_gemv_enabled()
+        and 1 <= m <= 8
+        and k % 512 == 0
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and weight.is_contiguous()
+        and x.is_contiguous()
+        and weight.data_ptr() % 16 == 0
+        and x.data_ptr() % 16 == 0
+    )
+
+
+def compile_bf16_gemv_tc(n: int, k: int):
+    """Compile the tensor-core GEMV once per ``(n, k)``; row count is dynamic.
+
+    Returns ``launch(x, w, y)`` where ``x`` is ``(m, k)`` bf16 with any live
+    ``1 <= m <= 8`` (taken from the tensor at call time), ``w`` is ``(n, k)``
+    row-major bf16, and ``y`` is a preallocated ``(m, n)`` bf16 output. Rows
+    past the live count are never written, so a graph captured at m=8 replays
+    correctly with fewer live rows.
+    """
+    assert k % 512 == 0, f"tensor-core GEMV requires K multiple of 512, got {k}"
+    assert n >= 1
+    from ._tensor_core import TensorCoreGemvKernel
+
+    cache_key = ("tc", n, k)
+    cached = _KERNEL_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    kernel = TensorCoreGemvKernel(n, k)
+    raise_if_kernel_resolution_frozen(
+        "cute.compile", target=kernel, cache_key=cache_key
+    )
+    fake = tuple(
+        make_ptr(cutlass.BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16)
+        for _ in range(4)
+    )
+    raw = b12x_compile(
+        kernel,
+        *fake,
+        Int32(1),
+        Int64(k),
+        Int64(k),
+        Int64(n),
+        Int64(1),
+        Int64(1),
+        Int32(0),
+        current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_key(
+            "gemm.bf16_gemv_tc",
+            1,
+            cache_key,
+        ),
+    )
+
+    def launch(x: torch.Tensor, w: torch.Tensor, y: torch.Tensor):
+        m = x.shape[0]
+        ptrs = tuple(
+            make_ptr(cutlass.BFloat16, t.data_ptr(), cute.AddressSpace.gmem,
+                     assumed_align=16)
+            for t in (x, w, x, y)  # bias slot unused by the kernel contract
+        )
+        raw(
+            *ptrs,
+            Int32(m),
+            Int64(k),
+            Int64(k),
+            Int64(n),
+            Int64(1),
+            Int64(1),
+            Int32(0),
+            current_cuda_stream(),
+        )
+
+    _KERNEL_CACHE[cache_key] = launch
+    return launch
+
+
+def get_cached_bf16_gemv_tc(n: int, k: int):
+    """Cache-only lookup (no JIT). Returns the launch fn or ``None``."""
+    return _KERNEL_CACHE.get(("tc", n, k))
+
+
 def compile_bf16_gemv_small_n(m: int, n: int, k: int):
     """Compile the small-N bf16 GEMV for ``(m, n, k)``.
 
@@ -231,6 +346,22 @@ def precompile_bf16_gemv_small_n(weight: torch.Tensor, log=None) -> None:
     log.info(
         "bf16 GEMV precompile: n=%d k=%d, m=1..%d", n, k, SMALL_M_MAX
     )
+    if _tc_gemv_enabled() and k % 512 == 0:
+        # Compile the tc variant once (rows are dynamic) and warm both ends of
+        # its live-row range so first-launch module loading never happens under
+        # graph capture. Same dummy-then-real weight order as the SIMT path.
+        log.info("bf16 GEMV precompile: tc variant, rows 1..8 dynamic")
+        tc_launch = compile_bf16_gemv_tc(n, k)
+        x8 = torch.zeros(8, k, dtype=torch.bfloat16, device=weight.device)
+        y8 = torch.empty(8, n, dtype=torch.bfloat16, device=weight.device)
+        w_dummy = torch.zeros_like(weight)
+        tc_launch(x8[:1], w_dummy, y8[:1])
+        tc_launch(x8, w_dummy, y8)
+        torch.cuda.synchronize()
+        del w_dummy
+        tc_launch(x8[:1], weight, y8[:1])
+        tc_launch(x8, weight, y8)
+        torch.cuda.synchronize()
     for m in range(1, SMALL_M_MAX + 1):
         log.debug("bf16 GEMV precompile m=%d n=%d k=%d: compiling", m, n, k)
         launch = compile_bf16_gemv_small_n(m, n, k)
@@ -273,6 +404,18 @@ def bf16_gemv_small_n(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     Routes small decode shapes (``m <= SMALL_M_MAX``) through the CUTE GEMV;
     anything else falls back to ``F.linear`` (cuBLAS) inside the op.
     """
+    if _use_tc_kernel(x, weight):
+        n = weight.shape[0]
+        tc_launch = get_cached_bf16_gemv_tc(n, x.shape[1])
+        if tc_launch is None:
+            # Never JIT while a stream is capturing (see below); outside
+            # capture, compile once per (n, k) — rows stay dynamic.
+            if torch.cuda.is_current_stream_capturing():
+                return torch.nn.functional.linear(x, weight)
+            tc_launch = compile_bf16_gemv_tc(n, x.shape[1])
+        y = torch.empty((x.shape[0], n), dtype=torch.bfloat16, device=x.device)
+        tc_launch(x, weight, y)
+        return y
     if not _use_kernel(x, weight):
         return torch.nn.functional.linear(x, weight)
     if not x.is_contiguous() or x.data_ptr() % 16 != 0:
