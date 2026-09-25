@@ -7462,6 +7462,11 @@ def packed_decode_trellis_sqg_direct_lut_smem_to_e4m3x8(
     decode) at a 32-bit shared byte offset. Per weight: one ``bfe``, one
     ``add``, one ``ld.shared.u8`` and the pack, versus the twelve-instruction
     bijection the T12 path evaluates before its lookup.
+
+    The pack is a two-level PRMT tree (six permutes, dependency depth two):
+    each lookup byte sits in bits [7:0] of its register, so pairs merge with
+    selector 0x0040 and quads with 0x5410 — bit-identical to the former
+    shift/or chain, which serialized eight dependent ``or`` ops per output.
     """
     bits = int(bits)
     if bits not in (2, 3, 4):
@@ -7470,12 +7475,9 @@ def packed_decode_trellis_sqg_direct_lut_smem_to_e4m3x8(
         )
     extract_lines: list[str] = []
     load_lines: list[str] = []
-    pack_lines: list[str] = []
     for index in range(8):
         source = "$3" if index < 4 else "$2"
         shift = (3 - (index & 3)) * bits
-        target = "out0" if index < 4 else "out1"
-        byte_shift = 8 * (index & 3)
         if shift:
             extract_lines.append(f"bfe.u32 w{index}, {source}, {shift}, 16;")
         else:
@@ -7486,21 +7488,25 @@ def packed_decode_trellis_sqg_direct_lut_smem_to_e4m3x8(
                 ld.shared.u8 w{index}, [addr{index}];
             """
         )
-        if byte_shift:
-            pack_lines.append(f"shl.b32 w{index}, w{index}, {byte_shift};")
-        pack_lines.append(f"or.b32 {target}, {target}, w{index};")
+    pack_asm = """
+        prmt.b32 r01, w0, w1, 0x0040;
+        prmt.b32 r23, w2, w3, 0x0040;
+        prmt.b32 r45, w4, w5, 0x0040;
+        prmt.b32 r67, w6, w7, 0x0040;
+        prmt.b32 out0, r01, r23, 0x5410;
+        prmt.b32 out1, r45, r67, 0x5410;
+    """
     asm = (
         """
         {
             .reg .b32 out0,out1;
             .reg .b32 w0,w1,w2,w3,w4,w5,w6,w7;
+            .reg .b32 r01,r23,r45,r67;
             .reg .b32 addr0,addr1,addr2,addr3,addr4,addr5,addr6,addr7;
-            mov.b32 out0, 0;
-            mov.b32 out1, 0;
     """
         + "\n".join(extract_lines)
         + "\n".join(load_lines)
-        + "\n".join(pack_lines)
+        + pack_asm
         + """
             mov.b32 $0, out0;
             mov.b32 $1, out1;
@@ -7543,6 +7549,10 @@ def packed_decode_trellis_sqg_direct_lut_to_e4m3x8(
     weight. Every slot owns its own address/code registers so all eight
     global gathers are in flight together; a shared scratch pair would chain
     them behind full global-memory latency each.
+
+    The pack is the same two-level PRMT tree as the shared-memory form (six
+    permutes, dependency depth two), bit-identical to the former shift/or
+    chain.
     """
 
     bits = int(bits)
@@ -7553,15 +7563,9 @@ def packed_decode_trellis_sqg_direct_lut_to_e4m3x8(
     table_offset = ((bits - 2) << 16) if rate_indexed else 0
     extract_lines: list[str] = []
     load_lines: list[str] = []
-    pack_lines: list[str] = []
     for index in range(8):
         source = "$3" if index < 4 else "$2"
         shift = (3 - (index & 3)) * bits
-        # Accumulate into declared scratch registers, never directly into
-        # the "=r" outputs: without early-clobber the outputs may alias the
-        # window inputs that later iterations still read.
-        target = "out0" if index < 4 else "out1"
-        byte_shift = 8 * (index & 3)
         if shift:
             extract_lines.append(
                 f"bfe.u32 w{index}, {source}, {shift}, 16;"
@@ -7575,23 +7579,25 @@ def packed_decode_trellis_sqg_direct_lut_to_e4m3x8(
                 ld.global.u8 w{index}, [addr{index}];
             """
         )
-        if byte_shift:
-            pack_lines.append(
-                f"shl.b32 w{index}, w{index}, {byte_shift};"
-            )
-        pack_lines.append(f"or.b32 {target}, {target}, w{index};")
+    pack_asm = """
+        prmt.b32 r01, w0, w1, 0x0040;
+        prmt.b32 r23, w2, w3, 0x0040;
+        prmt.b32 r45, w4, w5, 0x0040;
+        prmt.b32 r67, w6, w7, 0x0040;
+        prmt.b32 out0, r01, r23, 0x5410;
+        prmt.b32 out1, r45, r67, 0x5410;
+    """
     asm = (
         """
         {
             .reg .b32 out0,out1;
             .reg .b32 w0,w1,w2,w3,w4,w5,w6,w7;
+            .reg .b32 r01,r23,r45,r67;
             .reg .b64 addr0,addr1,addr2,addr3,addr4,addr5,addr6,addr7;
-            mov.b32 out0, 0;
-            mov.b32 out1, 0;
     """
         + "\n".join(extract_lines)
         + "\n".join(load_lines)
-        + "\n".join(pack_lines)
+        + pack_asm
         + """
             mov.b32 $0, out0;
             mov.b32 $1, out1;
