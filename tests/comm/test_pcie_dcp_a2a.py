@@ -31,7 +31,9 @@ class _FakeExt:
 
 
 class _FakeRuntime(PCIeDCPA2A):
-    def __init__(self) -> None:
+    pair_blocks: list = []
+
+    def __init__(self, max_batch_size: int = 4) -> None:
         self.run_calls = []
         super().__init__(
             rank=0,
@@ -40,12 +42,12 @@ class _FakeRuntime(PCIeDCPA2A):
             signal_ptrs=(100, 200),
             staging0_ptrs=(300, 400),
             staging1_ptrs=(500, 600),
-            max_batch_size=4,
+            max_batch_size=max_batch_size,
             total_heads=32,
             head_dim=64,
-            output_capacity_elems=4 * 32 * 64,
-            lse_offset=4 * 32 * 64 * 2,
-            lse_capacity=4 * 32,
+            output_capacity_elems=max_batch_size * 32 * 64,
+            lse_offset=max_batch_size * 32 * 64 * 2,
+            lse_capacity=max_batch_size * 32,
             ext_module=_FakeExt(),
         )
 
@@ -106,6 +108,7 @@ class _FakeRuntime(PCIeDCPA2A):
         slot,
         threads,
         device_slot_selection,
+        blocks=1,
     ):
         self.run_calls.append(
             (
@@ -117,6 +120,7 @@ class _FakeRuntime(PCIeDCPA2A):
                 tuple(local_second.shape),
             )
         )
+        self.pair_blocks.append(blocks)
         out_first.copy_(torch.cat((local_first, local_first), dim=1))
         out_second.copy_(torch.cat((local_second, local_second), dim=1))
 
@@ -167,8 +171,8 @@ class _FakeKimiRuntime(PCIeDCPA2A):
         )
 
 
-def _make_runtime() -> PCIeDCPA2A:
-    return _FakeRuntime()
+def _make_runtime(max_batch_size: int = 4) -> PCIeDCPA2A:
+    return _FakeRuntime(max_batch_size)
 
 
 def _kimi_shard_width(width: int, world_size: int) -> int:
@@ -639,6 +643,43 @@ def test_runtime_validates_and_dispatches_to_cute_plan():
     )
     runtime.close()
     assert runtime._closed
+
+
+@pytest.mark.parametrize(
+    ("batch", "limit_env", "pair_env", "expected_blocks"),
+    (
+        (1, None, None, 1),
+        (4, None, None, 4),
+        (16, None, None, 16),
+        (24, None, None, 16),
+        (24, "8", None, 8),
+        (24, "1", None, 1),
+        (24, None, "1", 1),
+        (24, None, "32", 24),
+        (24, "8", "32", 8),
+    ),
+)
+def test_all_gather_pair_splits_batch_rows_across_blocks(
+    monkeypatch: pytest.MonkeyPatch, batch: int, limit_env, pair_env, expected_blocks: int
+) -> None:
+    """The paired gather launches min(batch, pair block limit) blocks: one
+    row per block up to _PAIR_GATHER_BLOCK_LIMIT (B12X_PCIE_DCP_PAIR_BLOCKS
+    overrides; 1 = the served single block), capped by
+    B12X_PCIE_DCP_BLOCK_LIMIT when set."""
+    for name, value in (("B12X_PCIE_DCP_BLOCK_LIMIT", limit_env), ("B12X_PCIE_DCP_PAIR_BLOCKS", pair_env)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    runtime = _make_runtime(max_batch_size=32)
+    runtime.pair_blocks = []
+    local_first = torch.arange(batch * 16, dtype=torch.bfloat16).reshape(batch, 16)
+    local_second = torch.arange(batch * 8, dtype=torch.float32).reshape(batch, 8)
+    try:
+        runtime.all_gather_pair(local_first, local_second, threads=256)
+    finally:
+        runtime.close()
+    assert runtime.pair_blocks == [expected_blocks]
 
 
 def test_first_capture_freezes_the_next_eager_slot_as_graph_base(monkeypatch) -> None:
@@ -2307,9 +2348,11 @@ def test_pair_wrapper_forwards_clipped_output_rows(monkeypatch) -> None:
     # Kimi-K3 TP9 decode: 400 bf16 latent columns and 104 fp32 router columns
     # per rank, clipped to the logical 3584 (7168 B) and 896 (3584 B).
     kernels.all_gather_pair(**common, output_first_row_bytes=7168, output_second_row_bytes=3584)
-    assert launched[-1][-6:] == (4, 50, 26, 1, 448, 224)
+    assert launched[-1][-7:] == (4, 50, 26, 1, 448, 224, 1)
     kernels.all_gather_pair(**common)
-    assert launched[-1][-6:] == (4, 50, 26, 1, 0, 0)
+    assert launched[-1][-7:] == (4, 50, 26, 1, 0, 0, 1)
+    kernels.all_gather_pair(**common, blocks=4)
+    assert launched[-1][-7:] == (4, 50, 26, 1, 0, 0, 4)
     with pytest.raises(ValueError, match="multiples of 16 bytes"):
         kernels.all_gather_pair(**common, output_first_row_bytes=7160)
     with pytest.raises(ValueError, match="exceeds the gathered width"):
@@ -2325,9 +2368,13 @@ def test_pair_kernel_clips_output_rows_to_the_logical_width() -> None:
         assert f"{prefix}_row_packs = Int32(self._world_size) * {prefix}_packs" in read_phase
         assert f"if output_{prefix}_packs > Int32(0):" in read_phase
         assert f"{prefix}_row_packs = output_{prefix}_packs" in read_phase
-        assert f"{prefix}_output_packs = batch * {prefix}_row_packs" in read_phase
-        assert f"batch_index = linear // {prefix}_row_packs" in read_phase
+        # Rows split across blocks; a block's threads stride over the row's
+        # clipped width and place each pack at its row-major output offset.
+        assert f"while row_pack < {prefix}_row_packs:" in read_phase
+        assert f"linear = batch_index * {prefix}_row_packs + row_pack" in read_phase
         assert f"source_rank = row_pack // {prefix}_packs" in read_phase
+    assert read_phase.count("batch_index = Int32(bidx)") == 2
+    assert read_phase.count("batch_index += Int32(gdim)") == 2
 
 
 def test_runtime_accepts_logical_width_pair_outputs() -> None:

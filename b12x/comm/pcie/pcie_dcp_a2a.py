@@ -64,6 +64,11 @@ from .pcie_oneshot import (
 )
 
 
+# Paired projection gather: default blocks per launch (B12X_PCIE_DCP_PAIR_BLOCKS
+# overrides, B12X_PCIE_DCP_BLOCK_LIMIT caps); the kernel assigns batch rows to
+# blocks, so the batch bounds it too.
+_PAIR_GATHER_BLOCK_LIMIT = 16
+
 SUPPORTED_WORLD_SIZES = (2, 4, 8, 9, 16)
 SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 SUPPORTED_GATHER_DTYPES = (*SUPPORTED_DTYPES, torch.float8_e4m3fn)
@@ -641,6 +646,12 @@ class PCIeDCPA2A:
         self._device_slot_selection = False
         self._graph_base_slot = 0
         self._threads_override = _env_int("B12X_PCIE_DCP_THREADS", 0)
+        # Paired projection gather: blocks per launch (batch rows split across
+        # blocks). 1 reproduces the single-block launch served before
+        # 2026-09-26; B12X_PCIE_DCP_BLOCK_LIMIT still caps it.
+        self._pair_block_limit = (
+            _env_int("B12X_PCIE_DCP_PAIR_BLOCKS", 0) or _PAIR_GATHER_BLOCK_LIMIT
+        )
         self._block_limit_override = _env_int(
             "B12X_PCIE_DCP_BLOCK_LIMIT", 0
         )
@@ -1433,7 +1444,12 @@ class PCIeDCPA2A:
                 )
             if not output.is_contiguous():
                 raise ValueError(f"{name} output must be contiguous")
-        threads, _ = self._resolve_launch_config(threads=threads, block_limit=1)
+        threads, block_limit = self._resolve_launch_config(
+            threads=threads, block_limit=self._pair_block_limit
+        )
+        # One block per batch row up to the limit: the kernel splits rows
+        # across blocks in every phase (see _AllGatherPairLaunch).
+        blocks = max(1, min(block_limit, batch))
         capturing = _is_current_stream_capturing(self.device)
         if capturing:
             from ._dcp_a2a_cute import is_all_gather_pair_prepared
@@ -1466,6 +1482,7 @@ class PCIeDCPA2A:
             slot=slot,
             threads=threads,
             device_slot_selection=self._device_slot_selection,
+            blocks=blocks,
         )
         return out_first, out_second
 
@@ -1479,6 +1496,7 @@ class PCIeDCPA2A:
         slot: int,
         threads: int,
         device_slot_selection: bool,
+        blocks: int = 1,
     ) -> None:
         from ._dcp_a2a_cute import all_gather_pair
 
@@ -1509,6 +1527,7 @@ class PCIeDCPA2A:
                 output_second_row_bytes=_clipped_row_bytes(
                     out_second, int(local_second.shape[1]) * self.world_size
                 ),
+                blocks=blocks,
             )
 
     def all_gather_pair_kimi_topk(
