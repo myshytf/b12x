@@ -153,6 +153,13 @@ def _is_supported_bhd_layout(tensor: torch.Tensor) -> bool:
     return packed_token_major or capacity_strided_head_major
 
 
+# Upper bound on the router rows one ``kimi_topk16`` launch selects. The
+# batched selection runs one CTA per row (``grid=(rows, 1, 1)``) with no
+# per-row shared state, so the bound only rejects shapes no decode step
+# produces; the served decode envelope stays a caller-side setting.
+KIMI_TOPK16_MAX_ROWS = 1024
+
+
 def prepare_kimi_topk16(
     *,
     device: torch.device | int | str,
@@ -181,16 +188,19 @@ def kimi_topk16(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Select Kimi-K3's 16 routed experts without communication state.
 
-    The operation accepts one to eight assembled FP32 router rows. It launches
-    on the current CUDA stream and is CUDA-graph safe after an eager launch or
-    :func:`prepare_kimi_topk16`. Graph capture requires caller-owned outputs.
+    The operation accepts between one and ``KIMI_TOPK16_MAX_ROWS`` assembled
+    FP32 router rows (one CTA per row). It launches on the current CUDA stream
+    and is CUDA-graph safe after an eager launch or :func:`prepare_kimi_topk16`.
+    Graph capture requires caller-owned outputs.
     """
 
     if router_logits.ndim != 2:
         raise ValueError("router_logits must be a contiguous rank-2 tensor")
     rows = int(router_logits.shape[0])
-    if rows < 1 or rows > 8:
-        raise ValueError(f"Kimi top-16 rows {rows} must be between 1 and 8")
+    if rows < 1 or rows > KIMI_TOPK16_MAX_ROWS:
+        raise ValueError(
+            f"Kimi top-16 rows {rows} must be between 1 and {KIMI_TOPK16_MAX_ROWS}"
+        )
     device = router_logits.device
     if device.type != "cuda":
         raise ValueError("Kimi top-16 requires CUDA tensors")
@@ -1720,7 +1730,8 @@ class PCIeDCPA2A:
         *,
         threads: int = 256,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Select Kimi-K3's 16 routed experts for one to eight tokens."""
+        """Select Kimi-K3's 16 routed experts for up to ``max_batch_size``
+        tokens (the runtime's configured decode batch)."""
 
         with _device_guard(self.device):
             self._check_stream()
@@ -1731,7 +1742,7 @@ class PCIeDCPA2A:
                     "router_logits must be a contiguous rank-2 tensor"
                 )
             rows = int(router_logits.shape[0])
-            capacity = min(self.max_batch_size, 8)
+            capacity = min(self.max_batch_size, KIMI_TOPK16_MAX_ROWS)
             if rows <= 0 or rows > capacity:
                 raise ValueError(
                     f"Kimi top-16 rows {rows} must be between 1 and the "

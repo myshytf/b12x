@@ -10,6 +10,7 @@ import torch
 
 from b12x.comm.pcie import kimi_topk16
 from b12x.comm.pcie.pcie_dcp_a2a import (
+    KIMI_TOPK16_MAX_ROWS,
     PCIeDCPA2A,
     PCIeDCPA2APool,
     _SINGLE_CHANNEL_ID,
@@ -867,16 +868,40 @@ def test_kimi_topk16_dispatches_compact_outputs(
 
 
 @pytest.mark.parametrize("rows", (0, 9))
-def test_kimi_topk16_rejects_out_of_range_rows(rows: int) -> None:
+def test_kimi_topk16_rejects_rows_past_the_runtime_batch(rows: int) -> None:
     runtime = _make_kimi_runtime(2)
     router_logits = torch.zeros((rows, 896), dtype=torch.float32)
     correction_bias = torch.zeros(896, dtype=torch.float32)
 
     try:
-        with pytest.raises(ValueError, match="must be between 1"):
+        with pytest.raises(ValueError, match="must be between 1 and the supported capacity 8"):
             runtime.kimi_topk16(router_logits, correction_bias)
     finally:
         runtime.close()
+
+
+@pytest.mark.parametrize("rows", (9, 16, 32))
+def test_kimi_topk16_serves_the_configured_batch_past_eight_rows(rows: int) -> None:
+    runtime = _make_kimi_runtime(2, max_batch_size=32)
+    router_logits = torch.zeros((rows, 896), dtype=torch.float32)
+    correction_bias = torch.zeros(896, dtype=torch.float32)
+
+    try:
+        weights, ids = runtime.kimi_topk16(router_logits, correction_bias)
+    finally:
+        runtime.close()
+
+    assert weights.shape == (rows, 16)
+    assert ids.shape == (rows, 16)
+
+
+def test_stateless_kimi_topk16_bounds_rows_before_the_device_check() -> None:
+    too_many = KIMI_TOPK16_MAX_ROWS + 1
+    with pytest.raises(ValueError, match=f"must be between 1 and {KIMI_TOPK16_MAX_ROWS}"):
+        kimi_topk16(
+            torch.zeros((too_many, 896), dtype=torch.float32),
+            torch.zeros(896, dtype=torch.float32),
+        )
 
 
 def test_kimi_topk16_capture_requires_caller_owned_outputs(
