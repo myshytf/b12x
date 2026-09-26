@@ -16,6 +16,7 @@ from cutlass._mlir.dialects import llvm
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x._lib.intrinsics import (
     fmax_f32,
+    ld_global_nc_v4_u32,
     ld_global_v4_u32,
     st_global_f32,
     st_global_v4_u32,
@@ -1580,58 +1581,55 @@ class _AllGatherPairLaunch(_DCPA2ABase):
             # second packs) lands in every peer's staging at the row slot of
             # this rank -- rows are ordered by batch index, then source rank
             # -- through posted PCIe stores issued before the barrier, and the
-            # copy-out phase reads local memory only.  One local 16-byte load
-            # feeds the stores to all peers, so a thread keeps world_size - 1
-            # posted writes in flight per pack.
+            # copy-out phase reads local memory only.  Destination-major like
+            # the two-shot push all-reduce: a block streams all of its rows'
+            # packs to one peer before the next, so consecutive posted writes
+            # of a warp target one link at consecutive addresses; the local
+            # 16-byte reloads per peer hit L2.
             block_rows = (batch - Int32(bidx) + Int32(gdim) - Int32(1)) // Int32(gdim)
-            flat = Int32(tidx)
-            while flat < block_rows * combined_packs:
-                local_row = flat // combined_packs
-                pack = flat - local_row * combined_packs
-                batch_index = Int32(bidx) + local_row * Int32(gdim)
-                source_address = Int64(
-                    (
-                        local_first
-                        + (
-                            Int64(batch_index) * Int64(first_packs)
-                            + Int64(pack)
-                        )
-                        * Int64(4)
-                    ).toint()
-                )
-                if pack >= first_packs:
+            for destination_index in cutlass.range_constexpr(1, self._world_size):
+                destination = (self._rank + destination_index) % self._world_size
+                destination_base = Int64(staging[destination].toint()) + slot_offset
+                flat = Int32(tidx)
+                while flat < block_rows * combined_packs:
+                    local_row = flat // combined_packs
+                    pack = flat - local_row * combined_packs
+                    batch_index = Int32(bidx) + local_row * Int32(gdim)
                     source_address = Int64(
                         (
-                            local_second
+                            local_first
                             + (
-                                Int64(batch_index) * Int64(second_packs)
-                                + Int64(pack - first_packs)
+                                Int64(batch_index) * Int64(first_packs)
+                                + Int64(pack)
                             )
                             * Int64(4)
                         ).toint()
                     )
-                values = ld_global_v4_u32(source_address)
-                pack_offset = (
-                    (
-                        Int64(batch_index) * Int64(self._world_size)
-                        + Int64(self._rank)
-                    )
-                    * Int64(combined_packs)
-                    + Int64(pack)
-                ) * Int64(16)
-                for destination_index in cutlass.range_constexpr(
-                    1, self._world_size
-                ):
-                    destination = (
-                        self._rank + destination_index
-                    ) % self._world_size
+                    if pack >= first_packs:
+                        source_address = Int64(
+                            (
+                                local_second
+                                + (
+                                    Int64(batch_index) * Int64(second_packs)
+                                    + Int64(pack - first_packs)
+                                )
+                                * Int64(4)
+                            ).toint()
+                        )
+                    values = ld_global_nc_v4_u32(source_address)
+                    pack_offset = (
+                        (
+                            Int64(batch_index) * Int64(self._world_size)
+                            + Int64(self._rank)
+                        )
+                        * Int64(combined_packs)
+                        + Int64(pack)
+                    ) * Int64(16)
                     st_global_v4_u32(
-                        Int64(staging[destination].toint())
-                        + slot_offset
-                        + pack_offset,
+                        destination_base + pack_offset,
                         *values,
                     )
-                flat += Int32(self._threads)
+                    flat += Int32(self._threads)
         else:
             block_rows = (batch - Int32(bidx) + Int32(gdim) - Int32(1)) // Int32(gdim)
             flat = Int32(tidx)
