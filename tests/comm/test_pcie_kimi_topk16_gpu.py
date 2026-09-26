@@ -59,9 +59,15 @@ def _cases(device: torch.device):
     for rows in (1, 2, 3, 4, 5, 8):
         for _ in range(12):
             yield f"normal rows={rows}", randn(rows), bias
+    # Decode batches past eight rows (four requests at up to seven
+    # speculative tokens): one CTA per row, so wider grids must select
+    # exactly like the narrow ones.
+    for rows in (9, 12, 16, 24, 32):
+        for _ in range(3):
+            yield f"normal rows={rows}", randn(rows), bias
     # Heavy ties: three distinct logit levels, so most of the sixteen picks
     # resolve on the expert id.
-    for rows in (1, 4, 8):
+    for rows in (1, 4, 8, 32):
         levels = torch.tensor([-2.0, 0.5, 3.0])
         ties = levels[torch.randint(0, 3, (rows, ROUTER_WIDTH), generator=generator)]
         yield f"ties rows={rows}", ties.to(device), bias
