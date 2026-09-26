@@ -2072,12 +2072,14 @@ class _AllGatherPairLaunch(_DCPA2ABase):
                 row0 += Int32(4)
 
         if cutlass.const_expr(self._device_slot_selection):
+            # Every block arrives once; the last of the gridDim.x arrivals
+            # advances the epoch (one block per launch before 2026-09-26).
             if Int32(tidx) == Int32(0):
                 self_signal = signals[self._rank]
                 _a2a_graph_epoch_arrive(
                     (self_signal + Int64(_GRAPH_EPOCH_INDEX)).toint(),
                     (self_signal + Int64(_GRAPH_ARRIVED_INDEX)).toint(),
-                    Uint32(1),
+                    Uint32(gdim),
                 )
 
 

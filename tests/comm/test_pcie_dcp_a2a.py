@@ -2377,6 +2377,20 @@ def test_pair_kernel_clips_output_rows_to_the_logical_width() -> None:
     assert read_phase.count("batch_index += Int32(gdim)") == 2
 
 
+def test_pair_kernel_graph_epoch_counts_every_block() -> None:
+    """Under device slot selection each block arrives on the graph epoch and
+    the last of gridDim.x arrivals advances it; a per-launch count of one
+    (the single-block kernel) would advance the epoch once per block and
+    desynchronize the slot of the next replayed launch (caught by the
+    nine-GPU graph test on 2026-09-26)."""
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    source = inspect.getsource(kernels._AllGatherPairLaunch.kernel)
+    epilogue = source.rsplit("_a2a_graph_epoch_arrive(", maxsplit=1)[1]
+    assert "Uint32(gdim)," in epilogue.split(")", maxsplit=1)[0]
+    assert "Uint32(1)," not in epilogue.split(")", maxsplit=1)[0]
+
+
 def test_runtime_accepts_logical_width_pair_outputs() -> None:
     from b12x.comm.pcie.pcie_dcp_a2a import _clipped_row_bytes
 
