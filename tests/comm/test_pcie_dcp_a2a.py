@@ -2386,9 +2386,11 @@ def test_pair_kernel_graph_epoch_counts_every_block() -> None:
     from b12x.comm.pcie import _dcp_a2a_cute as kernels
 
     source = inspect.getsource(kernels._AllGatherPairLaunch.kernel)
-    epilogue = source.rsplit("_a2a_graph_epoch_arrive(", maxsplit=1)[1]
-    assert "Uint32(gdim)," in epilogue.split(")", maxsplit=1)[0]
-    assert "Uint32(1)," not in epilogue.split(")", maxsplit=1)[0]
+    assert source.count("_a2a_graph_epoch_arrive(") == 1
+    call = source.rsplit("_a2a_graph_epoch_arrive(", maxsplit=1)[1]
+    call = call[: call.index("\n                )")]
+    assert "Uint32(gdim)," in call, call
+    assert "Uint32(1)" not in call, call
 
 
 def test_runtime_accepts_logical_width_pair_outputs() -> None:
