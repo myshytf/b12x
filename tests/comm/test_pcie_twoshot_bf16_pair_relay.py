@@ -117,6 +117,8 @@ def _runtime(*, mode: str, static: bool, relay: bool, min_packs: int):
     runtime._static_peers_enabled = static
     runtime._pair_relay_enabled = relay
     runtime._pair_relay_min_packs = min_packs
+    runtime._group_reduce_enabled = False
+    runtime._group_reduce_min_packs = 7168
     return runtime
 
 

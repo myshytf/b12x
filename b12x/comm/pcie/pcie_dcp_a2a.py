@@ -39,6 +39,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 from ._cuda_ipc import CudaRTLibrary
+from ._twoshot_bf16_cute import GROUP_REDUCE_MAX_SLOTS, GROUP_REDUCE_WORLD_SIZE
 from .pcie_oneshot import (
     _ABANDONED_PCIE_RUNTIME_QUARANTINE,
     _SINGLE_CHANNEL_ID,
@@ -279,6 +280,14 @@ class _StagingLayout:
     lse_capacity: int
     slot_bytes: int
     slab_bytes: int
+    # Group-reduce LSE reduce-scatter (TP9, B12X_PCIE_DCP_LSE_GROUP_REDUCE=1):
+    # inbox of the other group's rows this rank pre-reduces (two shard slots x
+    # world x rows x head_dim bf16, plus their LSEs) and the fp32 partial of
+    # this rank's own rows (rows x head_dim fp32 plus (m_g, lse_g) per row).
+    inbox_offset: int = 0
+    inbox_lse_offset: int = 0
+    partial_offset: int = 0
+    partial_lse_offset: int = 0
 
 
 def _clipped_row_bytes(output: torch.Tensor, full_columns: int) -> int:
@@ -298,6 +307,7 @@ def _staging_layout(
     total_heads: int,
     head_dim: int,
     query_head_dim: Optional[int] = None,
+    lse_group_reduce: bool = False,
 ) -> _StagingLayout:
     if signal_bytes <= 0:
         raise ValueError("signal_bytes must be positive")
@@ -324,6 +334,15 @@ def _staging_layout(
         lse_offset + lse_capacity * 4,
         IPC_SLAB_ALIGNMENT,
     )
+    inbox_offset = inbox_lse_offset = partial_offset = partial_lse_offset = 0
+    if lse_group_reduce:
+        rows = max_batch_size * (total_heads // world_size)
+        inbox_rows = GROUP_REDUCE_MAX_SLOTS * world_size * rows
+        inbox_offset = slot_bytes
+        inbox_lse_offset = _align_up(inbox_offset + inbox_rows * head_dim * 2, IPC_SLAB_ALIGNMENT)
+        partial_offset = _align_up(inbox_lse_offset + inbox_rows * 4, IPC_SLAB_ALIGNMENT)
+        partial_lse_offset = _align_up(partial_offset + rows * head_dim * 4, IPC_SLAB_ALIGNMENT)
+        slot_bytes = _align_up(partial_lse_offset + rows * 8, IPC_SLAB_ALIGNMENT)
     staging0_offset = _align_up(signal_bytes, IPC_SLAB_ALIGNMENT)
     staging1_offset = staging0_offset + slot_bytes
     return _StagingLayout(
@@ -335,6 +354,25 @@ def _staging_layout(
         lse_capacity=lse_capacity,
         slot_bytes=slot_bytes,
         slab_bytes=staging1_offset + slot_bytes,
+        inbox_offset=inbox_offset,
+        inbox_lse_offset=inbox_lse_offset,
+        partial_offset=partial_offset,
+        partial_lse_offset=partial_lse_offset,
+    )
+
+
+def lse_group_reduce_requested(world_size: int) -> bool:
+    """``B12X_PCIE_DCP_LSE_GROUP_REDUCE=1`` on TP9 with the push transport.
+
+    The LSE reduce-scatter then pre-reduces the other switch group's partial
+    rows inside that group (fp32) and crosses the switch link once per row;
+    same inputs and fp32 arithmetic in a different association order
+    (precision-equal, not bit-identical).
+    """
+    return (
+        int(world_size) == GROUP_REDUCE_WORLD_SIZE
+        and os.getenv("B12X_PCIE_DCP_LSE_GROUP_REDUCE", "0") == "1"
+        and a2a_transport() == "push"
     )
 
 
@@ -607,6 +645,7 @@ class PCIeDCPA2A:
         owned_buffers: Optional[Sequence[_OwnedSharedBuffer]],
         ext_module,
         stream_affine: bool,
+        group_reduce_offsets: tuple[int, int, int, int] = (0, 0, 0, 0),
     ) -> None:
         self.rank = int(rank)
         self.world_size = int(world_size)
@@ -642,6 +681,11 @@ class PCIeDCPA2A:
         self._output_capacity_elems = int(output_capacity_elems)
         self._lse_offset = int(lse_offset)
         self._lse_capacity = int(lse_capacity)
+        self._group_reduce_offsets = tuple(int(v) for v in group_reduce_offsets)
+        # Regions are only laid out when the env opt-in was set at construction.
+        self.lse_group_reduce = (
+            lse_group_reduce_requested(self.world_size) and all(v > 0 for v in self._group_reduce_offsets)
+        )
         self._next_slot = 0
         self._device_slot_selection = False
         self._graph_base_slot = 0
@@ -768,6 +812,7 @@ class PCIeDCPA2A:
                 total_heads=total_heads,
                 head_dim=head_dim,
                 query_head_dim=query_head_dim,
+                lse_group_reduce=lse_group_reduce_requested(world_size),
             )
             return prepared_ipc, layout
 
@@ -788,6 +833,7 @@ class PCIeDCPA2A:
                 a2a_transport(),
                 a2a_pair_transport(a2a_transport()),
                 a2a_gather_switch_groups(world_size),
+                lse_group_reduce_requested(world_size),
             ),
         )
         slab = PCIeOneshotAllReduce._allocate_shared_buffer(
@@ -815,6 +861,12 @@ class PCIeDCPA2A:
             owned_buffers=[slab],
             ext_module=ext_module,
             stream_affine=stream_affine,
+            group_reduce_offsets=(
+                layout.inbox_offset,
+                layout.inbox_lse_offset,
+                layout.partial_offset,
+                layout.partial_lse_offset,
+            ),
         )
 
         def abort_native_runtime() -> None:
@@ -934,17 +986,25 @@ class PCIeDCPA2A:
             raise ValueError(f"unsupported output dtype {dtype}")
         threads, _ = self._resolve_launch_config(threads=threads, block_limit=1)
         dtype_name = "fp16" if dtype == torch.float16 else "bf16"
-        from ._dcp_a2a_cute import _get_compiled_lse_reduce_scatter
+        from ._dcp_a2a_cute import (
+            _get_compiled_lse_group_reduce,
+            _get_compiled_lse_reduce_scatter,
+        )
 
         with torch.cuda.device(self.device):
-            _get_compiled_lse_reduce_scatter(
-                self.world_size,
-                self.rank,
-                dtype_name,
-                threads,
-                True,
-                self.push_transport,
-            )
+            if self.lse_group_reduce:
+                _get_compiled_lse_group_reduce(
+                    self.world_size, self.rank, dtype_name, threads, True
+                )
+            else:
+                _get_compiled_lse_reduce_scatter(
+                    self.world_size,
+                    self.rank,
+                    dtype_name,
+                    threads,
+                    True,
+                    self.push_transport,
+                )
 
     def prepare_graph_all_gather_heads(self, *, threads: int = 256) -> None:
         """Compile/load the gather graph launcher before CUDA graph capture."""
@@ -1124,16 +1184,24 @@ class PCIeDCPA2A:
         capturing = _is_current_stream_capturing(self.device)
         dtype_name = "fp16" if partial_output.dtype == torch.float16 else "bf16"
         if capturing:
-            from ._dcp_a2a_cute import is_lse_reduce_scatter_prepared
+            from ._dcp_a2a_cute import (
+                is_lse_group_reduce_prepared,
+                is_lse_reduce_scatter_prepared,
+            )
 
-            if not is_lse_reduce_scatter_prepared(
-                self.world_size,
-                self.rank,
-                dtype_name,
-                threads,
-                True,
-                self.push_transport,
-            ):
+            prepared = (
+                is_lse_group_reduce_prepared(self.world_size, self.rank, dtype_name, threads, True)
+                if self.lse_group_reduce
+                else is_lse_reduce_scatter_prepared(
+                    self.world_size,
+                    self.rank,
+                    dtype_name,
+                    threads,
+                    True,
+                    self.push_transport,
+                )
+            )
+            if not prepared:
                 raise RuntimeError(
                     "cold PCIe DCP LSE CUDA graph capture is not allowed; "
                     "call prepare_graph_lse_reduce_scatter() before capture"
@@ -1170,9 +1238,42 @@ class PCIeDCPA2A:
         blocks: int,
         device_slot_selection: bool,
     ) -> None:
-        from ._dcp_a2a_cute import lse_reduce_scatter
+        from ._dcp_a2a_cute import lse_group_reduce, lse_reduce_scatter
 
         dtype_name = "fp16" if partial_output.dtype == torch.float16 else "bf16"
+        if self.lse_group_reduce:
+            inbox_offset, inbox_lse_offset, partial_offset, partial_lse_offset = self._group_reduce_offsets
+            with torch.cuda.device(self.device):
+                lse_group_reduce(
+                    world_size=self.world_size,
+                    rank=self.rank,
+                    dtype_name=dtype_name,
+                    threads=threads,
+                    local_output_ptr=partial_output.data_ptr(),
+                    local_lse_ptr=partial_lse.data_ptr(),
+                    output_ptr=out.data_ptr(),
+                    staging_ptrs=self._staging_ptrs[slot],
+                    signal_ptrs=self._signal_ptrs,
+                    lse_offset=self._lse_offset,
+                    inbox_offset=inbox_offset,
+                    inbox_lse_offset=inbox_lse_offset,
+                    partial_offset=partial_offset,
+                    partial_lse_offset=partial_lse_offset,
+                    batch=int(partial_output.shape[0]),
+                    total_heads=self.total_heads,
+                    head_dim=self.head_dim,
+                    input_stride_batch=int(partial_output.stride(0)) // 8,
+                    input_stride_head=int(partial_output.stride(1)) // 8,
+                    output_stride_batch=int(out.stride(0)) // 8,
+                    output_stride_head=int(out.stride(1)) // 8,
+                    natural_log=natural_log,
+                    device_slot_selection=device_slot_selection,
+                    slot_delta_bytes=(
+                        self._slot_bytes if slot == 0 else -self._slot_bytes
+                    ),
+                    blocks=blocks,
+                )
+            return
         with torch.cuda.device(self.device):
             lse_reduce_scatter(
                 world_size=self.world_size,
