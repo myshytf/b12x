@@ -22,11 +22,17 @@ from cutlass import Float32, Int32, Int64, Uint32
 
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
-from b12x._lib.intrinsics import ld_global_nc_v4_u32, ld_global_v4_u32, st_global_v4_u32
+from b12x._lib.intrinsics import (
+    ld_global_nc_v4_u32,
+    ld_global_v4_u32,
+    st_global_v4_u32,
+    u32_as_f32,
+)
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
 
 from ._cute_intrinsics import (
+    f32_as_u32,
     graph_epoch_arrive_serialized,
     ld_relaxed_gpu_u32,
     pack_f32x2_to_bf16x2,
@@ -83,6 +89,62 @@ def pair_relay_direct(owner: int, receiver: int) -> bool:
     if owner == partner:
         return True
     return pair_base + (owner + pair_index) % 2 == receiver
+
+
+# Group reduce (TP9 only): the reduce-scatter phase pre-reduces the other
+# switch group's contributions inside that group. A = ranks {0,1,2,3,8} behind
+# switch #2, B = {4,5,6,7} behind switch #1 (README of the k=5 campaign). For a
+# shard owned in A the B-reducer 4 + (shard mod 4) sums B's four bf16
+# contributions in fp32 and sends one fp32 partial across the switch link; for a
+# shard owned in B the A-reducer shard - 4 does the same for A's five (rank 8,
+# on its own uplink, reduces nothing). The owner adds its own group's bf16
+# contributions and the partial in fp32 and rounds once. Link bytes of the phase:
+# 2.22 -> 1.11 / 0.89 x payload per direction; every input bit is kept, the
+# association order changes (precision-equal, not bit-identical).
+GROUP_REDUCE_WORLD_SIZE = 9
+GROUP_REDUCE_MAX_SLOTS = 2
+_GROUP_REDUCE_GROUP_A = (0, 1, 2, 3, 8)
+_GROUP_REDUCE_GROUP_B = (4, 5, 6, 7)
+
+
+def group_reduce_group(rank: int) -> int:
+    """0 for the switch #2 group {0,1,2,3,8}, 1 for the switch #1 group {4,5,6,7}."""
+    if rank in _GROUP_REDUCE_GROUP_A:
+        return 0
+    if rank in _GROUP_REDUCE_GROUP_B:
+        return 1
+    raise ValueError(f"rank {rank} is outside the TP9 group tables")
+
+
+def group_reduce_reducer(shard: int) -> int:
+    """The rank of the OTHER group that pre-reduces that group's contributions to ``shard``."""
+    if group_reduce_group(shard) == 0:
+        return 4 + shard % 4
+    return shard - 4
+
+
+def group_reduce_shards(rank: int) -> tuple[int, ...]:
+    """Shards (owned in the other group) that ``rank`` pre-reduces, in shard order."""
+    return tuple(
+        shard
+        for shard in range(GROUP_REDUCE_WORLD_SIZE)
+        if group_reduce_group(shard) != group_reduce_group(rank)
+        and group_reduce_reducer(shard) == rank
+    )
+
+
+def group_reduce_slot(rank: int, shard: int) -> int:
+    """Inbox slot (0 or 1) that ``rank`` uses for the contributions to ``shard``."""
+    return group_reduce_shards(rank).index(shard)
+
+
+def group_reduce_peers(rank: int) -> tuple[int, ...]:
+    """Same-group ranks other than ``rank`` in the served ring order (rank + i)."""
+    return tuple(
+        (rank + step) % GROUP_REDUCE_WORLD_SIZE
+        for step in range(1, GROUP_REDUCE_WORLD_SIZE)
+        if group_reduce_group((rank + step) % GROUP_REDUCE_WORLD_SIZE) == group_reduce_group(rank)
+    )
 
 
 @cute.jit
@@ -1383,7 +1445,435 @@ class _TwoShotPushAllReduceLaunch(_TwoShotPullAllReduceLaunch):
                 index += grid_threads
 
 
-_ALL_REDUCE_MODES = ("pull", "push", "push_static", "push_relay", "push_static_relay")
+
+class _TwoShotGroupReduceLaunch(_TwoShotPushAllReduceLaunch):
+    """Push all-reduce whose reduce-scatter pre-reduces the other switch group.
+
+    Static-peer specialization (the role tables are compile-time constants of
+    the rank). Phase one pushes each contribution either to the shard's owner
+    (same group) or to the group reducer of that shard (other group), into the
+    reducer's inbox region; after the first barrier a reducer sums its own and
+    its group peers' contributions in fp32 (own first, then ring order) and
+    pushes the fp32 partial into the owner's partial region across the switch
+    link; after the second barrier the owner sums its own contribution, its
+    group peers' bf16 contributions (ring order) and the fp32 partial, rounds
+    once to bf16 and publishes as the push kernel does (pair relay optional);
+    the third barrier and the copy-out phase are the push kernel's.
+    """
+
+    def __init__(self, *args, pair_relay: bool = False) -> None:
+        super().__init__(*args, static_peers=True, pair_relay=pair_relay)
+        if self._world_size != GROUP_REDUCE_WORLD_SIZE:
+            raise ValueError("the group-reduce push all-reduce supports TP9 only")
+        self._group = group_reduce_group(self._rank)
+        self._reduced_shards = group_reduce_shards(self._rank)
+        self._group_peers = group_reduce_peers(self._rank)
+
+    @cute.jit
+    def _accumulate_f32_half(
+        self,
+        accumulator: cute.Tensor,
+        words,
+        first_element: int,
+    ) -> None:
+        for word_index in cutlass.range_constexpr(4):
+            element = first_element + word_index
+            accumulator[element] = accumulator[element] + u32_as_f32(words[word_index])
+
+    @cute.jit
+    def __call__(
+        self,
+        payload: cute.Pointer,
+        staging0: cute.Pointer,
+        staging1: cute.Pointer,
+        staging2: cute.Pointer,
+        staging3: cute.Pointer,
+        staging4: cute.Pointer,
+        staging5: cute.Pointer,
+        staging6: cute.Pointer,
+        staging7: cute.Pointer,
+        staging8: cute.Pointer,
+        signal0: cute.Pointer,
+        signal1: cute.Pointer,
+        signal2: cute.Pointer,
+        signal3: cute.Pointer,
+        signal4: cute.Pointer,
+        signal5: cute.Pointer,
+        signal6: cute.Pointer,
+        signal7: cute.Pointer,
+        signal8: cute.Pointer,
+        output: cute.Pointer,
+        rank: Int32,
+        pack_stride: Int64,
+        reduced_offset: Int64,
+        inbox_offset: Int64,
+        partial_offset: Int64,
+        slot_bytes: Int64,
+        rows_per_rank: Int32,
+        remainder_packs: Int32,
+        grid_x: Int32,
+        stream: cuda.CUstream,
+    ) -> None:
+        self.kernel(
+            payload,
+            staging0,
+            staging1,
+            staging2,
+            staging3,
+            staging4,
+            staging5,
+            staging6,
+            staging7,
+            staging8,
+            signal0,
+            signal1,
+            signal2,
+            signal3,
+            signal4,
+            signal5,
+            signal6,
+            signal7,
+            signal8,
+            output,
+            rank,
+            pack_stride,
+            reduced_offset,
+            inbox_offset,
+            partial_offset,
+            slot_bytes,
+            rows_per_rank,
+            remainder_packs,
+        ).launch(
+            grid=(grid_x, 1, 1),
+            block=[self._threads, 1, 1],
+            max_number_threads=(512, 1, 1),
+            min_blocks_per_mp=1,
+            cluster=(1, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        payload: cute.Pointer,
+        staging0: cute.Pointer,
+        staging1: cute.Pointer,
+        staging2: cute.Pointer,
+        staging3: cute.Pointer,
+        staging4: cute.Pointer,
+        staging5: cute.Pointer,
+        staging6: cute.Pointer,
+        staging7: cute.Pointer,
+        staging8: cute.Pointer,
+        signal0: cute.Pointer,
+        signal1: cute.Pointer,
+        signal2: cute.Pointer,
+        signal3: cute.Pointer,
+        signal4: cute.Pointer,
+        signal5: cute.Pointer,
+        signal6: cute.Pointer,
+        signal7: cute.Pointer,
+        signal8: cute.Pointer,
+        output: cute.Pointer,
+        rank: Int32,
+        pack_stride: Int64,
+        reduced_offset: Int64,
+        inbox_offset: Int64,
+        partial_offset: Int64,
+        slot_bytes: Int64,
+        rows_per_rank: Int32,
+        remainder_packs: Int32,
+    ) -> None:
+        staging = (
+            staging0,
+            staging1,
+            staging2,
+            staging3,
+            staging4,
+            staging5,
+            staging6,
+            staging7,
+            staging8,
+        )
+        signals = (
+            signal0,
+            signal1,
+            signal2,
+            signal3,
+            signal4,
+            signal5,
+            signal6,
+            signal7,
+            signal8,
+        )
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        gdim, _, _ = cute.arch.grid_dim()
+        local_rank = Int32(self._rank)
+        packs_per_row = Int32(self._row_elems // _PACK_ELEMS)
+        base_packs = Int64(rows_per_rank) * Int64(packs_per_row)
+        shard_base = Int64(local_rank) * base_packs + Int64(
+            cutlass.min(local_rank, remainder_packs)
+        )
+        shard_packs = base_packs
+        if local_rank < remainder_packs:
+            shard_packs = base_packs + Int64(1)
+        threads = Int64(self._threads)
+        grid_threads = Int64(gdim) * threads
+        flat = Int64(bidx) * threads + Int64(tidx)
+
+        payload_address = Int64(payload.toint())
+        output_address = Int64(output.toint())
+        staging_slot_offset = Int64(0)
+        self_signal = self._select_address(signals, local_rank)
+        if cutlass.const_expr(self._device_slot_selection):
+            generation = ld_relaxed_gpu_u32(self_signal + Int64(_GRAPH_EPOCH_OFFSET))
+            staging_slot_offset = (
+                Int64((generation + Uint32(self._slot_bias)) % Uint32(2)) * slot_bytes
+            )
+            cute.arch.barrier()
+            if Int32(tidx) == Int32(self._threads - 1):
+                graph_epoch_arrive_serialized(
+                    self_signal + Int64(_GRAPH_EPOCH_OFFSET),
+                    self_signal + Int64(_GRAPH_BLOCKS_ARRIVED_OFFSET),
+                    Uint32(gdim),
+                )
+        self_base = self._select_address(staging, local_rank) + staging_slot_offset
+
+        # Phase one: push this rank's contribution to each shard either to
+        # the owner's payload region (same group, at this rank's source slot)
+        # or to the shard's group reducer's inbox (other group); the
+        # contribution to a shard this rank reduces itself stays local.
+        for destination_index in cutlass.range_constexpr(1, self._world_size):
+            destination = (self._rank + destination_index) % self._world_size
+            destination_shard_base = Int64(destination) * base_packs + Int64(
+                cutlass.min(Int32(destination), remainder_packs)
+            )
+            destination_shard_packs = base_packs
+            if Int32(destination) < remainder_packs:
+                destination_shard_packs = base_packs + Int64(1)
+            if cutlass.const_expr(group_reduce_group(destination) == self._group):
+                target_base = (
+                    self._select_address(staging, Int32(destination))
+                    + staging_slot_offset
+                    + Int64(self._rank) * pack_stride * Int64(16)
+                )
+                index = flat
+                while index < destination_shard_packs:
+                    words = ld_global_nc_v4_u32(
+                        payload_address + (destination_shard_base + index) * Int64(16)
+                    )
+                    _st_generic_v4_u32(
+                        target_base + index * Int64(16),
+                        words[0],
+                        words[1],
+                        words[2],
+                        words[3],
+                    )
+                    index += grid_threads
+            else:
+                reducer = group_reduce_reducer(destination)
+                if cutlass.const_expr(reducer != self._rank):
+                    inbox_row = group_reduce_slot(reducer, destination) * self._world_size + self._rank
+                    target_base = (
+                        self._select_address(staging, Int32(reducer))
+                        + staging_slot_offset
+                        + inbox_offset
+                        + Int64(inbox_row) * pack_stride * Int64(16)
+                    )
+                    index = flat
+                    while index < destination_shard_packs:
+                        words = ld_global_nc_v4_u32(
+                            payload_address + (destination_shard_base + index) * Int64(16)
+                        )
+                        _st_generic_v4_u32(
+                            target_base + index * Int64(16),
+                            words[0],
+                            words[1],
+                            words[2],
+                            words[3],
+                        )
+                        index += grid_threads
+
+        self._barrier(signals, local_rank)
+
+        # Phase one-b: as the group reducer of the other group's shards, sum
+        # this rank's own contribution and the group peers' staged
+        # contributions in fp32 (own first, then ring order) and push the fp32
+        # partial (32 bytes per pack) into the owner's partial region.
+        for reduced_index in cutlass.range_constexpr(len(self._reduced_shards)):
+            shard = self._reduced_shards[reduced_index]
+            inbox_slot = group_reduce_slot(self._rank, shard)
+            reduced_shard_base = Int64(shard) * base_packs + Int64(
+                cutlass.min(Int32(shard), remainder_packs)
+            )
+            reduced_shard_packs = base_packs
+            if Int32(shard) < remainder_packs:
+                reduced_shard_packs = base_packs + Int64(1)
+            owner_partial = (
+                self._select_address(staging, Int32(shard))
+                + staging_slot_offset
+                + partial_offset
+            )
+            index = flat
+            while index < reduced_shard_packs:
+                accumulator = cute.make_rmem_tensor((_PACK_ELEMS,), cutlass.Float32)
+                for lane in cutlass.range_constexpr(_PACK_ELEMS):
+                    accumulator[lane] = Float32(0.0)
+                own_words = ld_global_nc_v4_u32(
+                    payload_address + (reduced_shard_base + index) * Int64(16)
+                )
+                self._accumulate_words(accumulator, own_words)
+                for peer_index in cutlass.range_constexpr(len(self._group_peers)):
+                    peer = self._group_peers[peer_index]
+                    inbox_row = inbox_slot * self._world_size + peer
+                    staged_pack = (
+                        self_base
+                        + inbox_offset
+                        + Int64(inbox_row) * pack_stride * Int64(16)
+                        + index * Int64(16)
+                    )
+                    self._accumulate_words(accumulator, _ld_generic_v4_u32(staged_pack))
+                partial_address = owner_partial + index * Int64(32)
+                _st_generic_v4_u32(
+                    partial_address,
+                    f32_as_u32(accumulator[0]),
+                    f32_as_u32(accumulator[1]),
+                    f32_as_u32(accumulator[2]),
+                    f32_as_u32(accumulator[3]),
+                )
+                _st_generic_v4_u32(
+                    partial_address + Int64(16),
+                    f32_as_u32(accumulator[4]),
+                    f32_as_u32(accumulator[5]),
+                    f32_as_u32(accumulator[6]),
+                    f32_as_u32(accumulator[7]),
+                )
+                index += grid_threads
+
+        self._barrier(signals, local_rank)
+
+        # Phase two: reduce this rank's shard (own contribution, the group
+        # peers' bf16 contributions in ring order, then the other group's fp32
+        # partial), round once, publish the result to the output and the peers.
+        index = flat
+        while index < shard_packs:
+            accumulator = cute.make_rmem_tensor((_PACK_ELEMS,), cutlass.Float32)
+            for lane in cutlass.range_constexpr(_PACK_ELEMS):
+                accumulator[lane] = Float32(0.0)
+            local_words = ld_global_nc_v4_u32(
+                payload_address + (shard_base + index) * Int64(16)
+            )
+            self._accumulate_words(accumulator, local_words)
+            for peer_index in cutlass.range_constexpr(len(self._group_peers)):
+                peer = self._group_peers[peer_index]
+                staged_pack = (
+                    self_base
+                    + Int64(peer) * pack_stride * Int64(16)
+                    + index * Int64(16)
+                )
+                self._accumulate_words(accumulator, _ld_generic_v4_u32(staged_pack))
+            partial_address = self_base + partial_offset + index * Int64(32)
+            self._accumulate_f32_half(
+                accumulator, _ld_generic_v4_u32(partial_address), 0
+            )
+            self._accumulate_f32_half(
+                accumulator, _ld_generic_v4_u32(partial_address + Int64(16)), 4
+            )
+            self._store_pack(
+                output_address + (shard_base + index) * Int64(16), accumulator
+            )
+            reduced_words = (
+                pack_f32x2_to_bf16x2(accumulator[0], accumulator[1]),
+                pack_f32x2_to_bf16x2(accumulator[2], accumulator[3]),
+                pack_f32x2_to_bf16x2(accumulator[4], accumulator[5]),
+                pack_f32x2_to_bf16x2(accumulator[6], accumulator[7]),
+            )
+            for peer_index in cutlass.range_constexpr(1, self._world_size):
+                destination = (local_rank + Int32(peer_index)) % Int32(self._world_size)
+                if cutlass.const_expr(self._pair_relay):
+                    if _pair_relay_direct(local_rank, destination) == Int32(1):
+                        self._publish_reduced_pack(
+                            staging,
+                            destination,
+                            staging_slot_offset,
+                            reduced_offset,
+                            local_rank,
+                            pack_stride,
+                            index,
+                            reduced_words[0],
+                            reduced_words[1],
+                            reduced_words[2],
+                            reduced_words[3],
+                        )
+                else:
+                    self._publish_reduced_pack(
+                        staging,
+                        destination,
+                        staging_slot_offset,
+                        reduced_offset,
+                        local_rank,
+                        pack_stride,
+                        index,
+                        reduced_words[0],
+                        reduced_words[1],
+                        reduced_words[2],
+                        reduced_words[3],
+                    )
+            index += grid_threads
+
+        self._barrier(signals, local_rank)
+
+        # Phase three: copy the peers' reduced shards (pair relay: partner
+        # staging after its flag), as the push kernel does.
+        if cutlass.const_expr(self._pair_relay):
+            self._await_partner_flags(signals, local_rank)
+        for peer_index in cutlass.range_constexpr(1, self._world_size):
+            source_rank = (local_rank + Int32(peer_index)) % Int32(self._world_size)
+            source_reduced = (
+                self_base
+                + reduced_offset
+                + Int64(source_rank) * pack_stride * Int64(16)
+            )
+            if cutlass.const_expr(self._pair_relay):
+                if _pair_relay_direct(source_rank, local_rank) == Int32(0):
+                    source_reduced = (
+                        self._select_address(
+                            staging, _pair_relay_partner(local_rank)
+                        )
+                        + staging_slot_offset
+                        + reduced_offset
+                        + Int64(source_rank) * pack_stride * Int64(16)
+                    )
+            source_shard_base = Int64(source_rank) * base_packs + Int64(
+                cutlass.min(source_rank, remainder_packs)
+            )
+            source_shard_packs = base_packs
+            if source_rank < remainder_packs:
+                source_shard_packs = base_packs + Int64(1)
+            destination = output_address + source_shard_base * Int64(16)
+            index = flat
+            while index < source_shard_packs:
+                words = _ld_generic_v4_u32(source_reduced + index * Int64(16))
+                st_global_v4_u32(
+                    destination + index * Int64(16),
+                    words[0],
+                    words[1],
+                    words[2],
+                    words[3],
+                )
+                index += grid_threads
+
+
+_ALL_REDUCE_MODES = (
+    "pull",
+    "push",
+    "push_static",
+    "push_relay",
+    "push_static_relay",
+    "push_group",
+    "push_group_relay",
+)
 
 
 @functools.cache
@@ -1410,7 +1900,7 @@ def get_twoshot_bf16_allreduce_launcher(
         raise ValueError(f"invalid all-reduce mode {mode!r}")
     if mode != "pull" and mode != "push" and world_size != PAIR_RELAY_WORLD_SIZE:
         raise ValueError(
-            "the static-peer and pair-relay push variants support TP9 only"
+            "the static-peer, pair-relay and group-reduce push variants support TP9 only"
         )
     operation = f"all_reduce_{mode}"
     process_key = _bf16_process_key(
@@ -1434,15 +1924,19 @@ def get_twoshot_bf16_allreduce_launcher(
         raise ValueError("row_elems must be a positive multiple of 8")
     slot_bias = int(slot_bias) & 1
     push = mode.startswith("push")
-    launch_cls = _TwoShotPushAllReduceLaunch if push else _TwoShotPullAllReduceLaunch
-    launch_kwargs = (
-        {
+    group = mode.startswith("push_group")
+    if group:
+        launch_cls = _TwoShotGroupReduceLaunch
+        launch_kwargs = {"pair_relay": mode.endswith("_relay")}
+    elif push:
+        launch_cls = _TwoShotPushAllReduceLaunch
+        launch_kwargs = {
             "static_peers": mode.startswith("push_static"),
             "pair_relay": mode.endswith("_relay"),
         }
-        if push
-        else {}
-    )
+    else:
+        launch_cls = _TwoShotPullAllReduceLaunch
+        launch_kwargs = {}
     launch = launch_cls(
         world_size,
         rank,
@@ -1467,7 +1961,15 @@ def get_twoshot_bf16_allreduce_launcher(
     )
     # The push kernel takes the per-source pack stride ahead of the reduced
     # region offset; the pull kernel does not need it.
-    scalar_samples = (0, 1, 1, 1, 1, 0, 1) if push else (0, 1, 1, 1, 0, 1)
+    # The push kernel takes the per-source pack stride ahead of the reduced
+    # region offset; the group-reduce kernel adds the inbox and partial
+    # region offsets after it; the pull kernel needs neither.
+    if group:
+        scalar_samples = (0, 1, 1, 1, 1, 1, 1, 0, 1)
+    elif push:
+        scalar_samples = (0, 1, 1, 1, 1, 0, 1)
+    else:
+        scalar_samples = (0, 1, 1, 1, 0, 1)
     raw = b12x_compile(
         launch,
         make_ptr(cutlass.Uint32, 16, cute.AddressSpace.gmem, assumed_align=16),
@@ -1513,14 +2015,24 @@ def get_twoshot_bf16_allreduce_launcher(
         remainder_packs: int,
         grid_x: int,
         pack_stride: int = 0,
+        inbox_offset: int = 0,
+        partial_offset: int = 0,
     ) -> None:
         if len(staging_addresses) != 9 or len(signal_addresses) != 9:
             raise ValueError("two-shot scalar pointer ABI requires nine peer slots")
         if not 0 <= int(remainder_packs) < world_size:
             raise ValueError("remainder_packs must be below the world size")
-        if mode == "push_static" and rank != compiled_rank:
+        if (mode.startswith("push_static") or group) and rank != compiled_rank:
             raise ValueError("static-peer launcher rank does not match its specialization")
-        if push:
+        if group:
+            if pack_stride <= 0 or inbox_offset <= 0 or partial_offset <= 0:
+                raise ValueError(
+                    "the group-reduce all-reduce needs positive pack_stride, "
+                    "inbox_offset and partial_offset"
+                )
+            scalars = (rank, pack_stride, reduced_offset, inbox_offset, partial_offset,
+                       slot_bytes, rows_per_rank, remainder_packs, grid_x)
+        elif push:
             if pack_stride <= 0:
                 raise ValueError("the push all-reduce needs a positive pack_stride")
             scalars = (rank, pack_stride, reduced_offset, slot_bytes,

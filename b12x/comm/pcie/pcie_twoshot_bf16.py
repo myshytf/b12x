@@ -25,8 +25,11 @@ from torch.distributed import ProcessGroup
 
 from ._cuda_ipc import CudaRTLibrary
 from ._twoshot_bf16_cute import (
+    GROUP_REDUCE_MAX_SLOTS,
+    GROUP_REDUCE_WORLD_SIZE,
     PAIR_RELAY_SINGLE_RANK,
     PAIR_RELAY_WORLD_SIZE,
+    group_reduce_group,
     pair_relay_partner,
     get_twoshot_bf16_allreduce_launcher,
     get_twoshot_bf16_launcher,
@@ -77,6 +80,11 @@ class _TwoShotBf16Layout:
     reduced_offset: int
     slot_bytes: int
     slab_bytes: int
+    # Group-reduce regions (TP9 push variant): the inbox of the shards this
+    # rank pre-reduces (GROUP_REDUCE_MAX_SLOTS x world x pack_stride packs) and
+    # the fp32 partial of this rank's own shard (pack_stride x 32 bytes).
+    inbox_offset: int = 0
+    partial_offset: int = 0
 
 
 def _make_layout(max_rows: int, row_elems: int, world_size: int) -> _TwoShotBf16Layout:
@@ -94,9 +102,14 @@ def _make_layout(max_rows: int, row_elems: int, world_size: int) -> _TwoShotBf16
     # shard per source rank: the pull all-reduce publishes its own shard in
     # the first entry, the push all-reduce receives every peer's shard.
     reduced_offset = _align_up(payload_bytes, IPC_SLAB_ALIGNMENT)
-    slot_bytes = _align_up(
+    inbox_offset = _align_up(
         reduced_offset + world_size * pack_stride * 16, IPC_SLAB_ALIGNMENT
     )
+    partial_offset = _align_up(
+        inbox_offset + GROUP_REDUCE_MAX_SLOTS * world_size * pack_stride * 16,
+        IPC_SLAB_ALIGNMENT,
+    )
+    slot_bytes = _align_up(partial_offset + pack_stride * 32, IPC_SLAB_ALIGNMENT)
     signal_bytes = _align_up(_SIGNAL_BYTES, IPC_SLAB_ALIGNMENT)
     return _TwoShotBf16Layout(
         signal_bytes=signal_bytes,
@@ -104,6 +117,8 @@ def _make_layout(max_rows: int, row_elems: int, world_size: int) -> _TwoShotBf16
         reduced_offset=reduced_offset,
         slot_bytes=slot_bytes,
         slab_bytes=signal_bytes + 2 * slot_bytes,
+        inbox_offset=inbox_offset,
+        partial_offset=partial_offset,
     )
 
 
@@ -132,6 +147,88 @@ def pair_relay_min_packs() -> int:
     if value < 0:
         raise ValueError("B12X_PCIE_TP9_PAIR_RELAY_MIN_PACKS must be non-negative")
     return value
+
+
+_GROUP_REDUCE_DEFAULT_MIN_PACKS = 7168
+
+
+def group_reduce_requested(world_size: int, row_elems: int) -> bool:
+    """``B12X_PCIE_TP9_GROUP_REDUCE=1`` on the TP9 single-pack-row runtime."""
+    return (
+        int(world_size) == GROUP_REDUCE_WORLD_SIZE
+        and int(row_elems) == _PACK_ELEMS
+        and os.getenv("B12X_PCIE_TP9_GROUP_REDUCE", "0") == "1"
+    )
+
+
+def group_reduce_min_packs() -> int:
+    """Smallest payload (16-byte packs) the group-reduce kernels apply to.
+
+    ``B12X_PCIE_TP9_GROUP_REDUCE_MIN_PACKS`` (default 7168 = eight hidden rows);
+    below it the extra barrier costs more than the link bytes it saves.
+    """
+    raw = os.getenv("B12X_PCIE_TP9_GROUP_REDUCE_MIN_PACKS", str(_GROUP_REDUCE_DEFAULT_MIN_PACKS))
+    value = int(raw)
+    if value < 0:
+        raise ValueError("B12X_PCIE_TP9_GROUP_REDUCE_MIN_PACKS must be non-negative")
+    return value
+
+
+def pair_relay_device_path(
+    identity: tuple[int, int, int], sysfs_root: str = "/sys/bus/pci/devices"
+) -> Optional[tuple[str, ...]]:
+    """The sysfs bridge chain of a GPU (``None`` when sysfs does not expose it)."""
+    domain, bus, device = identity
+    node = Path(sysfs_root) / f"{domain:04x}:{bus:02x}:{device:02x}.0"
+    if not node.exists():
+        return None
+    return Path(os.path.realpath(node)).parts
+
+
+def check_group_reduce_topology(
+    identities: Sequence[tuple[int, int, int]], sysfs_root: str = "/sys/bus/pci/devices"
+) -> bool:
+    """The group tables assume ranks {0,1,2,3,8} sit behind one cascaded switch
+    and {4,5,6,7} directly behind the host-attached one.
+
+    Verified from sysfs: the group-A devices share an ancestor bridge below the
+    common ancestor of all nine (the cascaded switch's upstream port) and no
+    group-B device lies behind that bridge. False when sysfs is unavailable;
+    ValueError when the placement contradicts the tables.
+    """
+    if len(identities) != GROUP_REDUCE_WORLD_SIZE:
+        raise ValueError(f"group reduce expects {GROUP_REDUCE_WORLD_SIZE} ranks, got {len(identities)}")
+    paths = [pair_relay_device_path(identity, sysfs_root) for identity in identities]
+    if any(path is None for path in paths):
+        _LOG.warning("group reduce: sysfs does not expose the GPUs; switch placement not verified")
+        return False
+
+    def common_prefix(chains: Sequence[tuple[str, ...]]) -> tuple[str, ...]:
+        prefix = list(chains[0])
+        for chain in chains[1:]:
+            n = 0
+            while n < len(prefix) and n < len(chain) and prefix[n] == chain[n]:
+                n += 1
+            prefix = prefix[:n]
+        return tuple(prefix)
+
+    group_a = [paths[r] for r in range(GROUP_REDUCE_WORLD_SIZE) if group_reduce_group(r) == 0]
+    group_b = [paths[r] for r in range(GROUP_REDUCE_WORLD_SIZE) if group_reduce_group(r) == 1]
+    all_prefix = common_prefix(paths)
+    a_prefix = common_prefix(group_a)
+    if len(a_prefix) <= len(all_prefix):
+        raise ValueError(
+            "group reduce: ranks 0,1,2,3,8 do not share a switch below the common root; "
+            "unset B12X_PCIE_TP9_GROUP_REDUCE or fix the device order"
+        )
+    cascade_port = a_prefix[len(all_prefix)]
+    for rank, path in enumerate(paths):
+        if group_reduce_group(rank) == 1 and cascade_port in path:
+            raise ValueError(
+                f"group reduce: rank {rank} sits behind the cascaded switch ({cascade_port}); "
+                "unset B12X_PCIE_TP9_GROUP_REDUCE or fix the device order"
+            )
+    return True
 
 
 def _pci_identity(device: torch.device) -> tuple[int, int, int]:
@@ -188,12 +285,19 @@ def check_pair_relay_topology(
     return True
 
 
-def verify_pair_relay_topology(*, exchange_group: ProcessGroup, device: torch.device) -> bool:
-    """Gather every rank's PCI identity over ``exchange_group`` and check the pairs."""
+def verify_pair_relay_topology(
+    *, exchange_group: ProcessGroup, device: torch.device, check_groups: bool = False
+) -> bool:
+    """Gather every rank's PCI identity over ``exchange_group`` and check the
+    pairs (and, for the group reduce, the switch groups)."""
     world_size = dist.get_world_size(group=exchange_group)
     identities: list[Optional[tuple[int, int, int]]] = [None] * world_size
     dist.all_gather_object(identities, _pci_identity(device), group=exchange_group)
-    return check_pair_relay_topology([identity for identity in identities if identity is not None])
+    present = [identity for identity in identities if identity is not None]
+    ok = check_pair_relay_topology(present)
+    if check_groups:
+        ok = check_group_reduce_topology(present) and ok
+    return ok
 
 
 def _contiguous_storage_interval(tensor: torch.Tensor) -> tuple[int, int]:
@@ -240,6 +344,8 @@ class PCIeTwoShotBF16:
         pack_stride: int,
         reduced_offset: int,
         slot_bytes: int,
+        inbox_offset: int = 0,
+        partial_offset: int = 0,
     ) -> "PCIeTwoShotBF16":
         self = object.__new__(cls)
         self.rank = rank
@@ -264,6 +370,8 @@ class PCIeTwoShotBF16:
         self._pack_stride = int(pack_stride)
         self._reduced_offset = int(reduced_offset)
         self._slot_bytes = int(slot_bytes)
+        self._inbox_offset = int(inbox_offset)
+        self._partial_offset = int(partial_offset)
         self._slot = 0
         self._device_slot_selection = False
         self._device_slot_bias = 0
@@ -303,6 +411,13 @@ class PCIeTwoShotBF16:
         # once here so graph preparation and replay agree.
         self._pair_relay_enabled = pair_relay_requested(world_size, row_elems)
         self._pair_relay_min_packs = pair_relay_min_packs()
+        # Opt-in group reduce of the reduce-scatter phase (TP9): the other
+        # switch group's contributions are pre-reduced in fp32 inside that
+        # group and cross the switch link once. Same inputs, fp32
+        # accumulation in a different association order: precision-equal,
+        # not bit-identical (qualified separately). Static-peer kernels.
+        self._group_reduce_enabled = group_reduce_requested(world_size, row_elems)
+        self._group_reduce_min_packs = group_reduce_min_packs()
         # Opt-in fused RMSNorm-shard epilogue (``all_reduce_rms_norm_shard``);
         # set before graph preparation so the launcher is compiled for capture.
         self.norm_shard_enabled = False
@@ -341,8 +456,12 @@ class PCIeTwoShotBF16:
             exchange_group=exchange_group,
             setup=validate_factory_arguments,
         )
-        if pair_relay_requested(world_size, row_elems):
-            verify_pair_relay_topology(exchange_group=exchange_group, device=device_obj)
+        if pair_relay_requested(world_size, row_elems) or group_reduce_requested(world_size, row_elems):
+            verify_pair_relay_topology(
+                exchange_group=exchange_group,
+                device=device_obj,
+                check_groups=group_reduce_requested(world_size, row_elems),
+            )
         _require_full_grid_residency(
             owner="PCIe twoshot-bf16",
             required_sms=TWOSHOT_REQUIRED_SMS,
@@ -402,6 +521,8 @@ class PCIeTwoShotBF16:
                 pack_stride=layout.pack_stride,
                 reduced_offset=layout.reduced_offset,
                 slot_bytes=layout.slot_bytes,
+                inbox_offset=layout.inbox_offset,
+                partial_offset=layout.partial_offset,
             )
         except Exception as exc:
             init_error = exc
@@ -507,6 +628,9 @@ class PCIeTwoShotBF16:
         # the publish phase is link-bound (default: eight hidden rows).
         static = self._static_peers_enabled and total_packs <= 7168
         relay = self._pair_relay_enabled and total_packs >= self._pair_relay_min_packs
+        group = self._group_reduce_enabled and total_packs >= self._group_reduce_min_packs
+        if group:
+            return "push_group_relay" if relay else "push_group"
         if static and relay:
             return "push_static_relay"
         if static:
@@ -525,6 +649,8 @@ class PCIeTwoShotBF16:
                 modes.append("push_relay")
                 if self._static_peers_enabled:
                     modes.append("push_static_relay")
+            if self._group_reduce_enabled:
+                modes.append("push_group_relay" if self._pair_relay_enabled else "push_group")
         return tuple(modes)
 
     def prepare_graph(
@@ -847,6 +973,8 @@ class PCIeTwoShotBF16:
                 remainder_packs,
                 blocks,
                 pack_stride=self._pack_stride,
+                inbox_offset=self._inbox_offset,
+                partial_offset=self._partial_offset,
             )
 
     def _norm_shard_mode(self) -> str:
