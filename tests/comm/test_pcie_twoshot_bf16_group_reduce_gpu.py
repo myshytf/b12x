@@ -30,7 +30,7 @@ pytestmark = pytest.mark.skipif(
     reason="set B12X_RUN_PCIE_TP9_TEST=1 with nine GPUs to run",
 )
 
-SHAPES = tuple((rows, 7168) for rows in (1, 4, 8, 12, 16, 24, 32)) + tuple(
+SHAPES = tuple((rows, 7168) for rows in (1, 3, 4, 5, 6, 8, 12, 16, 24, 32)) + tuple(
     (rows, 3584) for rows in (4, 16, 32)
 )
 GRAPH_ROWS = (8, 16, 24)

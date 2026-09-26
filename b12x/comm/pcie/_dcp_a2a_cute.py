@@ -26,7 +26,17 @@ from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
 
 from ._dcp_cute_common import block_pair_barrier
+from ._twoshot_bf16_cute import (
+    GROUP_REDUCE_MAX_SLOTS,
+    GROUP_REDUCE_WORLD_SIZE,
+    group_reduce_group,
+    group_reduce_peers,
+    group_reduce_reducer,
+    group_reduce_shards,
+    group_reduce_slot,
+)
 from ._cute_intrinsics import (
+    f32_as_u32,
     float_order_key,
     redux_max_u32,
     ld_generic_f32,
@@ -888,6 +898,522 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
                         + output_base * Int64(4)
                         + Int64(pack) * Int64(4)
                     ).toint(),
+                    result0,
+                    result1,
+                    result2,
+                    result3,
+                )
+            row += warp_stride
+
+        if cutlass.const_expr(self._device_slot_selection):
+            if Int32(tidx) == Int32(0):
+                self_signal = signals[self._rank]
+                _a2a_graph_epoch_arrive(
+                    (self_signal + Int64(_GRAPH_EPOCH_INDEX)).toint(),
+                    (self_signal + Int64(_GRAPH_ARRIVED_INDEX)).toint(),
+                    Uint32(gdim),
+                )
+
+
+class _LseGroupReduceLaunch(_LseReduceScatterLaunch):
+    """LSE reduce-scatter whose combine pre-reduces the other switch group.
+
+    Push transport, TP9, static rank tables (``group_reduce_*`` of the two-shot
+    module). Phase one pushes a row's partial output and LSE either to the
+    owner (same switch group, compact row (self, row) as the push kernel) or
+    to the owner's group reducer inside the sender's group (inbox row
+    (slot, source, row)); a row this rank reduces itself stays local. After
+    the first block-pair barrier the reducer combines its group's partials in
+    fp32 with weights exp(lse_i - m_g) (own first, then ring order), writes the
+    unnormalized fp32 sum, m_g and lse_g = m_g + log(sum_i exp(lse_i - m_g))
+    into the owner's partial region across the switch link. After the second
+    barrier the owner combines its own group's bf16 partials and the fp32
+    partial (scaled by exp(m_g - m)) with the global max m and normalizes by
+    the total weight, as the served kernel does with nine sources. Same inputs
+    and fp32 arithmetic, different association: precision-equal, not
+    bit-identical.
+    """
+
+    def __init__(
+        self,
+        world_size: int,
+        rank: int,
+        dtype_name: str,
+        threads: int,
+        device_slot_selection: bool,
+    ) -> None:
+        super().__init__(world_size, rank, dtype_name, threads, device_slot_selection, True)
+        if self._world_size != GROUP_REDUCE_WORLD_SIZE:
+            raise ValueError("the group-reduce LSE reduce-scatter supports TP9 only")
+        self._group = group_reduce_group(self._rank)
+        self._reduced_shards = group_reduce_shards(self._rank)
+        self._group_peers = group_reduce_peers(self._rank)
+
+    @cute.jit
+    def __call__(
+        self,
+        local_output: cute.Pointer,
+        local_lse: cute.Pointer,
+        output: cute.Pointer,
+        staging0: cute.Pointer,
+        staging1: cute.Pointer,
+        staging2: cute.Pointer,
+        staging3: cute.Pointer,
+        staging4: cute.Pointer,
+        staging5: cute.Pointer,
+        staging6: cute.Pointer,
+        staging7: cute.Pointer,
+        staging8: cute.Pointer,
+        staging9: cute.Pointer,
+        staging10: cute.Pointer,
+        staging11: cute.Pointer,
+        staging12: cute.Pointer,
+        staging13: cute.Pointer,
+        staging14: cute.Pointer,
+        staging15: cute.Pointer,
+        signal0: cute.Pointer,
+        signal1: cute.Pointer,
+        signal2: cute.Pointer,
+        signal3: cute.Pointer,
+        signal4: cute.Pointer,
+        signal5: cute.Pointer,
+        signal6: cute.Pointer,
+        signal7: cute.Pointer,
+        signal8: cute.Pointer,
+        signal9: cute.Pointer,
+        signal10: cute.Pointer,
+        signal11: cute.Pointer,
+        signal12: cute.Pointer,
+        signal13: cute.Pointer,
+        signal14: cute.Pointer,
+        signal15: cute.Pointer,
+        lse_offset: Int64,
+        inbox_offset: Int64,
+        inbox_lse_offset: Int64,
+        partial_offset: Int64,
+        partial_lse_offset: Int64,
+        batch: Int32,
+        total_heads: Int32,
+        head_dim: Int32,
+        input_stride_batch: Int64,
+        input_stride_head: Int64,
+        output_stride_batch: Int64,
+        output_stride_head: Int64,
+        natural_log: Int32,
+        slot_delta_256b: Int32,
+        grid_x: Int32,
+        stream: cuda.CUstream,
+    ) -> None:
+        self.kernel(
+            local_output,
+            local_lse,
+            output,
+            staging0,
+            staging1,
+            staging2,
+            staging3,
+            staging4,
+            staging5,
+            staging6,
+            staging7,
+            staging8,
+            staging9,
+            staging10,
+            staging11,
+            staging12,
+            staging13,
+            staging14,
+            staging15,
+            signal0,
+            signal1,
+            signal2,
+            signal3,
+            signal4,
+            signal5,
+            signal6,
+            signal7,
+            signal8,
+            signal9,
+            signal10,
+            signal11,
+            signal12,
+            signal13,
+            signal14,
+            signal15,
+            lse_offset,
+            inbox_offset,
+            inbox_lse_offset,
+            partial_offset,
+            partial_lse_offset,
+            batch,
+            total_heads,
+            head_dim,
+            input_stride_batch,
+            input_stride_head,
+            output_stride_batch,
+            output_stride_head,
+            natural_log,
+            slot_delta_256b,
+        ).launch(
+            grid=(grid_x, 1, 1),
+            block=[self._threads, 1, 1],
+            max_number_threads=(1024, 1, 1),
+            min_blocks_per_mp=1,
+            cluster=(1, 1, 1),
+            stream=stream,
+        )
+
+    @cute.jit
+    def _lse_weight(self, value: Float32, reference: Float32, natural_log: Int32) -> Float32:
+        weight = Float32(0.0)
+        if cute.math.isfinite(value):
+            delta = value - reference
+            if natural_log != Int32(0):
+                weight = cute.math.exp(delta, fastmath=False)
+            else:
+                weight = cute.math.exp2(delta, approx=True)
+        return weight
+
+    @cute.kernel
+    def kernel(
+        self,
+        local_output: cute.Pointer,
+        local_lse: cute.Pointer,
+        output: cute.Pointer,
+        staging0: cute.Pointer,
+        staging1: cute.Pointer,
+        staging2: cute.Pointer,
+        staging3: cute.Pointer,
+        staging4: cute.Pointer,
+        staging5: cute.Pointer,
+        staging6: cute.Pointer,
+        staging7: cute.Pointer,
+        staging8: cute.Pointer,
+        staging9: cute.Pointer,
+        staging10: cute.Pointer,
+        staging11: cute.Pointer,
+        staging12: cute.Pointer,
+        staging13: cute.Pointer,
+        staging14: cute.Pointer,
+        staging15: cute.Pointer,
+        signal0: cute.Pointer,
+        signal1: cute.Pointer,
+        signal2: cute.Pointer,
+        signal3: cute.Pointer,
+        signal4: cute.Pointer,
+        signal5: cute.Pointer,
+        signal6: cute.Pointer,
+        signal7: cute.Pointer,
+        signal8: cute.Pointer,
+        signal9: cute.Pointer,
+        signal10: cute.Pointer,
+        signal11: cute.Pointer,
+        signal12: cute.Pointer,
+        signal13: cute.Pointer,
+        signal14: cute.Pointer,
+        signal15: cute.Pointer,
+        lse_offset: Int64,
+        inbox_offset: Int64,
+        inbox_lse_offset: Int64,
+        partial_offset: Int64,
+        partial_lse_offset: Int64,
+        batch: Int32,
+        total_heads: Int32,
+        head_dim: Int32,
+        input_stride_batch: Int64,
+        input_stride_head: Int64,
+        output_stride_batch: Int64,
+        output_stride_head: Int64,
+        natural_log: Int32,
+        slot_delta_256b: Int32,
+    ) -> None:
+        staging = (
+            staging0, staging1, staging2, staging3, staging4, staging5, staging6, staging7,
+            staging8, staging9, staging10, staging11, staging12, staging13, staging14, staging15,
+        )
+        signals = (
+            signal0, signal1, signal2, signal3, signal4, signal5, signal6, signal7,
+            signal8, signal9, signal10, signal11, signal12, signal13, signal14, signal15,
+        )
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        gdim, _, _ = cute.arch.grid_dim()
+        slot_offset = Int64(0)
+        if cutlass.const_expr(self._device_slot_selection):
+            generation = ld_relaxed_gpu_u32(
+                (signals[self._rank] + Int64(_GRAPH_EPOCH_INDEX)).toint()
+            )
+            slot = generation % Uint32(2)
+            slot_offset = Int64(slot) * Int64(slot_delta_256b) * Int64(_SLOT_ALIGNMENT)
+        lane = Int32(tidx) % Int32(32)
+        warp_first = Int32(bidx) * Int32(self._warps_per_block) + Int32(tidx) // Int32(32)
+        warp_stride = Int32(gdim) * Int32(self._warps_per_block)
+        heads_per_rank = total_heads // Int32(self._world_size)
+        packs_per_head = head_dim // Int32(8)
+        rows = batch * heads_per_rank
+        local_staging_address = Int64(staging[self._rank].toint()) + slot_offset
+        local_output_address = Int64(local_output.toint())
+        local_lse_address = Int64(local_lse.toint())
+
+        # Phase one: push this rank's partial rows. Same-group owners receive
+        # them at the compact row (self, row) of their staging (as the push
+        # kernel); other-group owners' rows go to that owner's group reducer's
+        # inbox at (slot, self, row). The rows of the shards this rank reduces
+        # itself are read from local_output in phase one-b.
+        row = warp_first
+        while row < rows:
+            batch_index = row // heads_per_rank
+            local_head = row - batch_index * heads_per_rank
+            for destination_index in cutlass.range_constexpr(1, self._world_size):
+                destination = (self._rank + destination_index) % self._world_size
+                source_row = (
+                    Int64(batch_index) * Int64(total_heads)
+                    + Int64(destination) * Int64(heads_per_rank)
+                    + Int64(local_head)
+                )
+                input_base = (
+                    Int64(batch_index) * input_stride_batch
+                    + (Int64(destination) * Int64(heads_per_rank) + Int64(local_head))
+                    * input_stride_head
+                )
+                if cutlass.const_expr(group_reduce_group(destination) == self._group):
+                    target_staging = Int64(staging[destination].toint()) + slot_offset
+                    target_row = Int64(self._rank) * Int64(rows) + Int64(row)
+                    target_words = target_staging + target_row * Int64(packs_per_head) * Int64(16)
+                    target_lse = target_staging + lse_offset + target_row * Int64(4)
+                else:
+                    reducer = group_reduce_reducer(destination)
+                    if cutlass.const_expr(reducer == self._rank):
+                        target_words = Int64(0)
+                        target_lse = Int64(0)
+                    else:
+                        inbox_row = Int64(group_reduce_slot(reducer, destination) * self._world_size + self._rank) * Int64(rows) + Int64(row)
+                        target_staging = Int64(staging[reducer].toint()) + slot_offset
+                        target_words = target_staging + inbox_offset + inbox_row * Int64(packs_per_head) * Int64(16)
+                        target_lse = target_staging + inbox_lse_offset + inbox_row * Int64(4)
+                if cutlass.const_expr(
+                    group_reduce_group(destination) == self._group
+                    or group_reduce_reducer(destination) != self._rank
+                ):
+                    pack = lane
+                    while pack < packs_per_head:
+                        _copy_16b_addr(
+                            local_output_address + input_base * Int64(16) + Int64(pack) * Int64(16),
+                            target_words + Int64(pack) * Int64(16),
+                        )
+                        pack += Int32(32)
+                    if lane == Int32(0):
+                        value = ld_generic_f32(local_lse_address + source_row * Int64(4))
+                        st_global_f32(target_lse, value)
+            row += warp_stride
+
+        block_pair_barrier(
+            signals,
+            self_signal=signals[self._rank],
+            rank=self._rank,
+            world_size=self._world_size,
+            max_blocks=_MAX_BLOCKS,
+            acquire=True,
+        )
+
+        # Phase one-b: group reducer. For each other-group shard this rank
+        # reduces, combine its own partial row and the group peers' inbox rows
+        # (own first, then ring order) with weights exp(lse_i - m_g), and push
+        # the unnormalized fp32 sum with (m_g, lse_g) to the owner.
+        for reduced_index in cutlass.range_constexpr(len(self._reduced_shards)):
+            shard = self._reduced_shards[reduced_index]
+            inbox_slot = group_reduce_slot(self._rank, shard)
+            owner_staging = Int64(staging[shard].toint()) + slot_offset
+            row = warp_first
+            while row < rows:
+                batch_index = row // heads_per_rank
+                local_head = row - batch_index * heads_per_rank
+                own_source_row = (
+                    Int64(batch_index) * Int64(total_heads)
+                    + Int64(shard) * Int64(heads_per_rank)
+                    + Int64(local_head)
+                )
+                own_input_base = (
+                    Int64(batch_index) * input_stride_batch
+                    + (Int64(shard) * Int64(heads_per_rank) + Int64(local_head)) * input_stride_head
+                )
+                # Lane i holds source i's LSE: lane 0 = own, lanes 1.. = peers.
+                lane_lse = Float32(float("-inf"))
+                if lane == Int32(0):
+                    lane_lse = ld_generic_f32(local_lse_address + own_source_row * Int64(4))
+                for peer_index in cutlass.range_constexpr(len(self._group_peers)):
+                    peer = self._group_peers[peer_index]
+                    inbox_row = Int64(inbox_slot * self._world_size + peer) * Int64(rows) + Int64(row)
+                    if lane == Int32(peer_index + 1):
+                        lane_lse = ld_generic_f32(local_staging_address + inbox_lse_offset + inbox_row * Int64(4))
+                if not cute.math.isfinite(lane_lse):
+                    lane_lse = Float32(float("-inf"))
+                n_sources = 1 + len(self._group_peers)
+                weights = cute.make_rmem_tensor((n_sources,), Float32)
+                group_max = Float32(float("-inf"))
+                for source_index in cutlass.range_constexpr(n_sources):
+                    value = cute.arch.shuffle_sync(lane_lse, offset=source_index)
+                    weights[source_index] = value
+                    group_max = fmax_f32(group_max, value)
+                weight_sum = Float32(0.0)
+                if cute.math.isfinite(group_max):
+                    for source_index in cutlass.range_constexpr(n_sources):
+                        weight = self._lse_weight(weights[source_index], group_max, natural_log)
+                        weights[source_index] = weight
+                        weight_sum += weight
+                else:
+                    group_max = Float32(0.0)
+                    for source_index in cutlass.range_constexpr(n_sources):
+                        weights[source_index] = Float32(0.0)
+                # Combined LSE of the group in the caller's log base.
+                group_lse = Float32(float("-inf"))
+                if weight_sum > Float32(0.0):
+                    if natural_log != Int32(0):
+                        group_lse = group_max + cute.math.log(weight_sum, fastmath=False)
+                    else:
+                        group_lse = group_max + cute.math.log2(weight_sum, fastmath=False)
+                partial_words = owner_staging + partial_offset + Int64(row) * Int64(packs_per_head) * Int64(32)
+                pack = lane
+                while pack < packs_per_head:
+                    accum = cute.make_rmem_tensor((8,), Float32)
+                    for element in cutlass.range_constexpr(8):
+                        accum[element] = Float32(0.0)
+                    own_weight = weights[0]
+                    if own_weight != Float32(0.0):
+                        words = ld_global_nc_v4_u32(
+                            local_output_address + own_input_base * Int64(16) + Int64(pack) * Int64(16)
+                        )
+                        for pair in cutlass.range_constexpr(4):
+                            lo, hi = self._unpack_pair(words[pair])
+                            accum[pair * 2] = _fma_rn_f32(own_weight, lo, accum[pair * 2])
+                            accum[pair * 2 + 1] = _fma_rn_f32(own_weight, hi, accum[pair * 2 + 1])
+                    for peer_index in cutlass.range_constexpr(len(self._group_peers)):
+                        peer = self._group_peers[peer_index]
+                        peer_weight = weights[peer_index + 1]
+                        if peer_weight != Float32(0.0):
+                            inbox_row = Int64(inbox_slot * self._world_size + peer) * Int64(rows) + Int64(row)
+                            words = _ld_generic_v4_u32(
+                                local_staging_address
+                                + inbox_offset
+                                + inbox_row * Int64(packs_per_head) * Int64(16)
+                                + Int64(pack) * Int64(16)
+                            )
+                            for pair in cutlass.range_constexpr(4):
+                                lo, hi = self._unpack_pair(words[pair])
+                                accum[pair * 2] = _fma_rn_f32(peer_weight, lo, accum[pair * 2])
+                                accum[pair * 2 + 1] = _fma_rn_f32(peer_weight, hi, accum[pair * 2 + 1])
+                    pack_address = partial_words + Int64(pack) * Int64(32)
+                    _st_generic_v4_u32(
+                        pack_address,
+                        f32_as_u32(accum[0]), f32_as_u32(accum[1]), f32_as_u32(accum[2]), f32_as_u32(accum[3]),
+                    )
+                    _st_generic_v4_u32(
+                        pack_address + Int64(16),
+                        f32_as_u32(accum[4]), f32_as_u32(accum[5]), f32_as_u32(accum[6]), f32_as_u32(accum[7]),
+                    )
+                    pack += Int32(32)
+                if lane == Int32(0):
+                    st_global_f32(owner_staging + partial_lse_offset + Int64(row) * Int64(8), group_max)
+                    st_global_f32(owner_staging + partial_lse_offset + Int64(row) * Int64(8) + Int64(4), group_lse)
+                row += warp_stride
+
+        block_pair_barrier(
+            signals,
+            self_signal=signals[self._rank],
+            rank=self._rank,
+            world_size=self._world_size,
+            max_blocks=_MAX_BLOCKS,
+            acquire=True,
+        )
+
+        # Phase two: owner combine. Sources: own row, the group peers' rows
+        # (compact rows (source, row) of the local staging) and the other
+        # group's fp32 partial (scaled by exp(m_g - m)); normalize by the total
+        # weight including exp(lse_g - m).
+        n_own = 1 + len(self._group_peers)
+        row = warp_first
+        while row < rows:
+            batch_index = row // heads_per_rank
+            local_head = row - batch_index * heads_per_rank
+            global_head = Int32(self._rank) * heads_per_rank + local_head
+            source_row = Int64(batch_index) * Int64(total_heads) + Int64(global_head)
+            local_base = Int64(batch_index) * input_stride_batch + Int64(global_head) * input_stride_head
+            output_base = Int64(batch_index) * output_stride_batch + Int64(local_head) * output_stride_head
+            partial_lse_address = local_staging_address + partial_lse_offset + Int64(row) * Int64(8)
+
+            lane_lse = Float32(float("-inf"))
+            if lane == Int32(0):
+                lane_lse = ld_generic_f32(local_lse_address + source_row * Int64(4))
+            for peer_index in cutlass.range_constexpr(len(self._group_peers)):
+                peer = self._group_peers[peer_index]
+                if lane == Int32(peer_index + 1):
+                    lane_lse = ld_generic_f32(
+                        local_staging_address + lse_offset + (Int64(peer) * Int64(rows) + Int64(row)) * Int64(4)
+                    )
+            if lane == Int32(n_own):
+                lane_lse = ld_generic_f32(partial_lse_address + Int64(4))  # lse_g
+            if not cute.math.isfinite(lane_lse):
+                lane_lse = Float32(float("-inf"))
+            group_max_value = ld_generic_f32(partial_lse_address)  # m_g (all lanes)
+            if not cute.math.isfinite(group_max_value):
+                group_max_value = Float32(0.0)
+
+            weights = cute.make_rmem_tensor((n_own + 1,), Float32)
+            max_lse = Float32(float("-inf"))
+            for source_index in cutlass.range_constexpr(n_own + 1):
+                value = cute.arch.shuffle_sync(lane_lse, offset=source_index)
+                weights[source_index] = value
+                max_lse = fmax_f32(max_lse, value)
+            if not cute.math.isfinite(max_lse):
+                max_lse = Float32(0.0)
+            weight_sum = Float32(0.0)
+            for source_index in cutlass.range_constexpr(n_own + 1):
+                weight = self._lse_weight(weights[source_index], max_lse, natural_log)
+                weights[source_index] = weight
+                weight_sum += weight
+            inv_weight_sum = Float32(1.0) / fmax_f32(weight_sum, Float32(1.0e-10))
+            partial_scale = Float32(0.0)
+            if weights[n_own] != Float32(0.0):
+                partial_scale = self._lse_weight(group_max_value, max_lse, natural_log) * inv_weight_sum
+
+            partial_words = local_staging_address + partial_offset + Int64(row) * Int64(packs_per_head) * Int64(32)
+            for pack in cutlass.range(lane, packs_per_head, Int32(32), unroll=1):
+                accum = cute.make_rmem_tensor((8,), Float32)
+                for element in cutlass.range_constexpr(8):
+                    accum[element] = Float32(0.0)
+                own_weight = weights[0] * inv_weight_sum
+                if own_weight != Float32(0.0):
+                    words = _ld_generic_v4_u32(local_output_address + local_base * Int64(16) + Int64(pack) * Int64(16))
+                    for pair in cutlass.range_constexpr(4):
+                        lo, hi = self._unpack_pair(words[pair])
+                        accum[pair * 2] = _fma_rn_f32(own_weight, lo, accum[pair * 2])
+                        accum[pair * 2 + 1] = _fma_rn_f32(own_weight, hi, accum[pair * 2 + 1])
+                for peer_index in cutlass.range_constexpr(len(self._group_peers)):
+                    peer = self._group_peers[peer_index]
+                    peer_weight = weights[peer_index + 1] * inv_weight_sum
+                    if peer_weight != Float32(0.0):
+                        words = _ld_generic_v4_u32(
+                            local_staging_address
+                            + (Int64(peer) * Int64(rows) + Int64(row)) * Int64(packs_per_head) * Int64(16)
+                            + Int64(pack) * Int64(16)
+                        )
+                        for pair in cutlass.range_constexpr(4):
+                            lo, hi = self._unpack_pair(words[pair])
+                            accum[pair * 2] = _fma_rn_f32(peer_weight, lo, accum[pair * 2])
+                            accum[pair * 2 + 1] = _fma_rn_f32(peer_weight, hi, accum[pair * 2 + 1])
+                if partial_scale != Float32(0.0):
+                    pack_address = partial_words + Int64(pack) * Int64(32)
+                    low = _ld_generic_v4_u32(pack_address)
+                    high = _ld_generic_v4_u32(pack_address + Int64(16))
+                    for element in cutlass.range_constexpr(4):
+                        accum[element] = _fma_rn_f32(partial_scale, u32_as_f32(low[element]), accum[element])
+                        accum[4 + element] = _fma_rn_f32(partial_scale, u32_as_f32(high[element]), accum[4 + element])
+                result0 = self._pack_pair(accum[0], accum[1])
+                result1 = self._pack_pair(accum[2], accum[3])
+                result2 = self._pack_pair(accum[4], accum[5])
+                result3 = self._pack_pair(accum[6], accum[7])
+                st_global_v4_u32(
+                    (output + output_base * Int64(4) + Int64(pack) * Int64(4)).toint(),
                     result0,
                     result1,
                     result2,
@@ -2529,6 +3055,171 @@ def _get_compiled_lse_reduce_scatter(
 
     _PREPARED_LSE_LAUNCHERS.add(key)
     return run
+
+
+_PREPARED_LSE_GROUP_LAUNCHERS: set[tuple[object, ...]] = set()
+
+
+def _lse_group_launcher_key(
+    world_size: int, rank: int, dtype_name: str, threads: int, device_slot_selection: bool
+) -> tuple[object, ...]:
+    return (int(world_size), int(rank), str(dtype_name), int(threads), bool(device_slot_selection), "group")
+
+
+def is_lse_group_reduce_prepared(
+    world_size: int, rank: int, dtype_name: str, threads: int, device_slot_selection: bool
+) -> bool:
+    return _lse_group_launcher_key(world_size, rank, dtype_name, threads, device_slot_selection) in _PREPARED_LSE_GROUP_LAUNCHERS
+
+
+@functools.cache
+def _get_compiled_lse_group_reduce(
+    world_size: int, rank: int, dtype_name: str, threads: int, device_slot_selection: bool
+) -> Callable:
+    launch = _LseGroupReduceLaunch(world_size, rank, dtype_name, threads, device_slot_selection)
+    key = _lse_group_launcher_key(world_size, rank, dtype_name, threads, device_slot_selection)
+    raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=key)
+    p_u32 = _u32_ptr(16, align=4)
+    p_f32 = _f32_ptr(16)
+    p_u8 = _u8_ptr(16)
+    raw = b12x_compile(
+        launch,
+        p_u32,
+        p_f32,
+        p_u32,
+        *(p_u8 for _ in range(_MAX_RANKS)),
+        *(p_u32 for _ in range(_MAX_RANKS)),
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        8,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_key(
+            "comm.pcie.dcp_a2a.lse_group_reduce",
+            1,
+            key,
+            labels=("world_size", "rank", "dtype", "threads", "device_slot_selection", "variant"),
+        ),
+    )
+
+    def run(
+        local_output_ptr: int,
+        local_lse_ptr: int,
+        output_ptr: int,
+        staging_ptrs: Sequence[int],
+        signal_ptrs: Sequence[int],
+        lse_offset: int,
+        inbox_offset: int,
+        inbox_lse_offset: int,
+        partial_offset: int,
+        partial_lse_offset: int,
+        batch: int,
+        total_heads: int,
+        head_dim: int,
+        input_stride_batch: int,
+        input_stride_head: int,
+        output_stride_batch: int,
+        output_stride_head: int,
+        natural_log: bool,
+        slot_delta_256b: int,
+        blocks: int,
+    ) -> None:
+        stages = _pad_ptrs(staging_ptrs, world_size)
+        signals = _pad_ptrs(signal_ptrs, world_size)
+        raw(
+            _u32_ptr(local_output_ptr),
+            _f32_ptr(local_lse_ptr),
+            _u32_ptr(output_ptr),
+            *(_u8_ptr(ptr) for ptr in stages),
+            *(_u32_ptr(ptr, align=4) for ptr in signals),
+            int(lse_offset),
+            int(inbox_offset),
+            int(inbox_lse_offset),
+            int(partial_offset),
+            int(partial_lse_offset),
+            int(batch),
+            int(total_heads),
+            int(head_dim),
+            int(input_stride_batch),
+            int(input_stride_head),
+            int(output_stride_batch),
+            int(output_stride_head),
+            int(bool(natural_log)),
+            int(slot_delta_256b),
+            int(blocks),
+            current_cuda_stream(),
+        )
+
+    _PREPARED_LSE_GROUP_LAUNCHERS.add(key)
+    return run
+
+
+def lse_group_reduce(
+    *,
+    world_size: int,
+    rank: int,
+    dtype_name: str,
+    threads: int,
+    local_output_ptr: int,
+    local_lse_ptr: int,
+    output_ptr: int,
+    staging_ptrs: Sequence[int],
+    signal_ptrs: Sequence[int],
+    lse_offset: int,
+    inbox_offset: int,
+    inbox_lse_offset: int,
+    partial_offset: int,
+    partial_lse_offset: int,
+    batch: int,
+    total_heads: int,
+    head_dim: int,
+    input_stride_batch: int,
+    input_stride_head: int,
+    output_stride_batch: int,
+    output_stride_head: int,
+    natural_log: bool,
+    device_slot_selection: bool,
+    slot_delta_bytes: int,
+    blocks: int,
+) -> None:
+    """Group-reduce LSE reduce-scatter (push transport, TP9)."""
+    slot_delta_256b = _slot_delta_256b(slot_delta_bytes)
+    launcher = _get_compiled_lse_group_reduce(world_size, rank, dtype_name, threads, device_slot_selection)
+    if not device_slot_selection:
+        _get_compiled_lse_group_reduce(world_size, rank, dtype_name, threads, True)
+    launcher(
+        local_output_ptr,
+        local_lse_ptr,
+        output_ptr,
+        staging_ptrs,
+        signal_ptrs,
+        lse_offset,
+        inbox_offset,
+        inbox_lse_offset,
+        partial_offset,
+        partial_lse_offset,
+        batch,
+        total_heads,
+        head_dim,
+        input_stride_batch,
+        input_stride_head,
+        output_stride_batch,
+        output_stride_head,
+        natural_log,
+        slot_delta_256b,
+        blocks,
+    )
 
 
 def _gather_launcher_key(
