@@ -51,6 +51,62 @@ from ._twoshot_cute import (
 _PREPARED_BF16_LAUNCHERS: set[tuple[object, ...]] = set()
 _PACK_ELEMS = 8  # bf16 values per 16-byte pack
 
+# Pair relay (TP9 only): ranks (0,1) (2,3) (4,5) (6,7) are PIX pairs behind one
+# shared x16 uplink each, rank 8 is single. In the push all-reduce's publish
+# phase an owner sends its reduced shard to its own partner, to rank 8 and to
+# exactly ONE member of every other pair; the other member reads the shard
+# across the pair bridge in phase three. Bytes and the reduction are unchanged.
+PAIR_RELAY_WORLD_SIZE = 9
+PAIR_RELAY_SINGLE_RANK = 8
+
+
+def pair_relay_partner(rank: int) -> int:
+    """PIX partner of ``rank`` (``rank ^ 1``); ``PAIR_RELAY_WORLD_SIZE`` for rank 8."""
+    if rank == PAIR_RELAY_SINGLE_RANK:
+        return PAIR_RELAY_WORLD_SIZE
+    pair_base = (rank // 2) * 2
+    return pair_base + (1 - (rank - pair_base))
+
+
+def pair_relay_direct(owner: int, receiver: int) -> bool:
+    """True when ``owner`` publishes its reduced shard straight to ``receiver``.
+
+    Rank 8 and the owner's own partner always receive directly; of every
+    other pair the member ``pair_base + (owner + pair_index) % 2`` receives
+    and its partner reads the shard from it. Mirrors :func:`_pair_relay_direct`.
+    """
+    if receiver == PAIR_RELAY_SINGLE_RANK:
+        return True
+    pair_index = receiver // 2
+    pair_base = pair_index * 2
+    partner = pair_base + (1 - (receiver - pair_base))
+    if owner == partner:
+        return True
+    return pair_base + (owner + pair_index) % 2 == receiver
+
+
+@cute.jit
+def _pair_relay_partner(rank: Int32) -> Int32:
+    pair_base = (rank // Int32(2)) * Int32(2)
+    return pair_base + (Int32(1) - (rank - pair_base))
+
+
+@cute.jit
+def _pair_relay_direct(owner: Int32, receiver: Int32) -> Int32:
+    """Device mirror of :func:`pair_relay_direct` (1 = direct, 0 = via partner)."""
+    pair_index = receiver // Int32(2)
+    pair_base = pair_index * Int32(2)
+    partner = pair_base + (Int32(1) - (receiver - pair_base))
+    chosen = pair_base + (owner + pair_index) % Int32(2)
+    direct = Int32(0)
+    if receiver == Int32(PAIR_RELAY_SINGLE_RANK):
+        direct = Int32(1)
+    if owner == partner:
+        direct = Int32(1)
+    if chosen == receiver:
+        direct = Int32(1)
+    return direct
+
 
 class _TwoShotBf16Launch:
     def __init__(
@@ -939,12 +995,91 @@ class _TwoShotPushAllReduceLaunch(_TwoShotPullAllReduceLaunch):
     bit-identical between the two kernels.
     """
 
-    def __init__(self, *args, static_peers: bool = False) -> None:
+    def __init__(
+        self, *args, static_peers: bool = False, pair_relay: bool = False
+    ) -> None:
         super().__init__(*args)
         # The launcher cache and runtime already bind a specialization to one
         # rank. Keeping it constant lets the compiler resolve peer pointers
         # without changing the shard owner or its ordered FP32 accumulation.
         self._static_peers = bool(static_peers)
+        if pair_relay and self._world_size != PAIR_RELAY_WORLD_SIZE:
+            raise ValueError("the pair relay publish phase supports TP9 only")
+        self._pair_relay = bool(pair_relay)
+
+    @cute.jit
+    def _publish_reduced_pack(
+        self,
+        staging: Sequence[cute.Pointer],
+        destination: Int32,
+        staging_slot_offset: Int64,
+        reduced_offset: Int64,
+        local_rank: Int32,
+        pack_stride: Int64,
+        index: Int64,
+        word0: Uint32,
+        word1: Uint32,
+        word2: Uint32,
+        word3: Uint32,
+    ) -> None:
+        destination_reduced = (
+            self._select_address(staging, destination)
+            + staging_slot_offset
+            + reduced_offset
+            + Int64(local_rank) * pack_stride * Int64(16)
+        )
+        _st_generic_v4_u32(
+            destination_reduced + index * Int64(16),
+            word0,
+            word1,
+            word2,
+            word3,
+        )
+
+    @cute.jit
+    def _await_partner_flags(
+        self,
+        signals: Sequence[cute.Pointer],
+        local_rank: Int32,
+    ) -> None:
+        """Wait until the pair partner holds the second-barrier flag of every
+        owner whose shard this rank reads across the pair bridge.
+
+        An owner's posted writes into the partner's staging precede its flag
+        write to the partner (same destination), so observing that flag from
+        here orders the remote reads of phase three after the data. The flag
+        keeps its value until the owner's barrier two launches later, which
+        cannot start before this rank has finished this launch.
+        """
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        if tidx < Int32(self._world_size):
+            source = Int32(tidx)
+            if source != local_rank:
+                if _pair_relay_direct(source, local_rank) == Int32(0):
+                    self_base = self._select_address(signals, local_rank)
+                    self_counter_address = self_base + (
+                        Int64(bidx) * Int64(_MAX_RANKS) + Int64(tidx)
+                    ) * Int64(4)
+                    value = _ld_global_u32(self_counter_address)
+                    flag_slot = Int64(value % Uint32(2))
+                    partner_base = self._select_address(
+                        signals, _pair_relay_partner(local_rank)
+                    )
+                    flag_address = (
+                        partner_base
+                        + Int64(_SELF_COUNTER_BYTES)
+                        + (
+                            (flag_slot * Int64(_MAX_BLOCKS) + Int64(bidx))
+                            * Int64(_MAX_RANKS * _FLAG_STRIDE)
+                            + Int64(source) * Int64(_FLAG_STRIDE)
+                        )
+                        * Int64(4)
+                    )
+                    observed = _ld_relaxed_sys_u32(flag_address)
+                    while observed != value:
+                        observed = _ld_relaxed_sys_u32(flag_address)
+        cute.arch.barrier()
 
     @cute.jit
     def __call__(
@@ -1169,24 +1304,48 @@ class _TwoShotPushAllReduceLaunch(_TwoShotPullAllReduceLaunch):
             )
             for peer_index in cutlass.range_constexpr(1, self._world_size):
                 destination = (local_rank + Int32(peer_index)) % Int32(self._world_size)
-                destination_reduced = (
-                    self._select_address(staging, destination)
-                    + staging_slot_offset
-                    + reduced_offset
-                    + Int64(local_rank) * pack_stride * Int64(16)
-                )
-                _st_generic_v4_u32(
-                    destination_reduced + index * Int64(16),
-                    reduced_words[0],
-                    reduced_words[1],
-                    reduced_words[2],
-                    reduced_words[3],
-                )
+                if cutlass.const_expr(self._pair_relay):
+                    # Pair relay: rank 8, the own partner and one member of
+                    # every other pair receive the shard; the other member
+                    # reads it across the pair bridge in phase three.
+                    if _pair_relay_direct(local_rank, destination) == Int32(1):
+                        self._publish_reduced_pack(
+                            staging,
+                            destination,
+                            staging_slot_offset,
+                            reduced_offset,
+                            local_rank,
+                            pack_stride,
+                            index,
+                            reduced_words[0],
+                            reduced_words[1],
+                            reduced_words[2],
+                            reduced_words[3],
+                        )
+                else:
+                    self._publish_reduced_pack(
+                        staging,
+                        destination,
+                        staging_slot_offset,
+                        reduced_offset,
+                        local_rank,
+                        pack_stride,
+                        index,
+                        reduced_words[0],
+                        reduced_words[1],
+                        reduced_words[2],
+                        reduced_words[3],
+                    )
             index += grid_threads
 
         self._barrier(signals, local_rank)
 
-        # Phase three: copy the peers' reduced shards from local memory.
+        # Phase three: copy the peers' reduced shards from local memory. Pair
+        # relay: a shard published to the pair partner instead of to this rank
+        # is read across the pair bridge once the partner holds the owner's
+        # second-barrier flag.
+        if cutlass.const_expr(self._pair_relay):
+            self._await_partner_flags(signals, local_rank)
         for peer_index in cutlass.range_constexpr(1, self._world_size):
             source_rank = (local_rank + Int32(peer_index)) % Int32(self._world_size)
             source_reduced = (
@@ -1194,6 +1353,16 @@ class _TwoShotPushAllReduceLaunch(_TwoShotPullAllReduceLaunch):
                 + reduced_offset
                 + Int64(source_rank) * pack_stride * Int64(16)
             )
+            if cutlass.const_expr(self._pair_relay):
+                if _pair_relay_direct(source_rank, local_rank) == Int32(0):
+                    source_reduced = (
+                        self._select_address(
+                            staging, _pair_relay_partner(local_rank)
+                        )
+                        + staging_slot_offset
+                        + reduced_offset
+                        + Int64(source_rank) * pack_stride * Int64(16)
+                    )
             source_shard_base = Int64(source_rank) * base_packs + Int64(
                 cutlass.min(source_rank, remainder_packs)
             )
@@ -1214,6 +1383,9 @@ class _TwoShotPushAllReduceLaunch(_TwoShotPullAllReduceLaunch):
                 index += grid_threads
 
 
+_ALL_REDUCE_MODES = ("pull", "push", "push_static", "push_relay", "push_static_relay")
+
+
 @functools.cache
 def get_twoshot_bf16_allreduce_launcher(
     world_size: int,
@@ -1229,12 +1401,17 @@ def get_twoshot_bf16_allreduce_launcher(
 
     ``mode`` selects the remote-read (``"pull"``) or posted-write (``"push"``)
     kernel. The research-only ``"push_static"`` mode specializes the existing
-    rank operand at TP9. All retain the same shard partition and sum order.
+    rank operand at TP9; the ``"_relay"`` suffix (``"push_relay"``,
+    ``"push_static_relay"``) publishes each reduced shard once per PIX pair
+    (see ``pair_relay_direct``). All retain the same shard partition and sum
+    order.
     """
-    if mode not in ("pull", "push", "push_static"):
+    if mode not in _ALL_REDUCE_MODES:
         raise ValueError(f"invalid all-reduce mode {mode!r}")
-    if mode == "push_static" and world_size != 9:
-        raise ValueError("the static-peer push experiment supports TP9 only")
+    if mode != "pull" and mode != "push" and world_size != PAIR_RELAY_WORLD_SIZE:
+        raise ValueError(
+            "the static-peer and pair-relay push variants support TP9 only"
+        )
     operation = f"all_reduce_{mode}"
     process_key = _bf16_process_key(
         operation,
@@ -1256,9 +1433,16 @@ def get_twoshot_bf16_allreduce_launcher(
     if row_elems <= 0 or row_elems % _PACK_ELEMS != 0:
         raise ValueError("row_elems must be a positive multiple of 8")
     slot_bias = int(slot_bias) & 1
-    push = mode in ("push", "push_static")
+    push = mode.startswith("push")
     launch_cls = _TwoShotPushAllReduceLaunch if push else _TwoShotPullAllReduceLaunch
-    launch_kwargs = {"static_peers": mode == "push_static"} if push else {}
+    launch_kwargs = (
+        {
+            "static_peers": mode.startswith("push_static"),
+            "pair_relay": mode.endswith("_relay"),
+        }
+        if push
+        else {}
+    )
     launch = launch_cls(
         world_size,
         rank,

@@ -14,7 +14,9 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import logging
 import os
+from pathlib import Path
 from typing import Optional, Sequence
 
 import torch
@@ -23,6 +25,9 @@ from torch.distributed import ProcessGroup
 
 from ._cuda_ipc import CudaRTLibrary
 from ._twoshot_bf16_cute import (
+    PAIR_RELAY_SINGLE_RANK,
+    PAIR_RELAY_WORLD_SIZE,
+    pair_relay_partner,
     get_twoshot_bf16_allreduce_launcher,
     get_twoshot_bf16_launcher,
     is_twoshot_bf16_allreduce_launcher_prepared,
@@ -100,6 +105,95 @@ def _make_layout(max_rows: int, row_elems: int, world_size: int) -> _TwoShotBf16
         slot_bytes=slot_bytes,
         slab_bytes=signal_bytes + 2 * slot_bytes,
     )
+
+
+_LOG = logging.getLogger(__name__)
+_PAIR_RELAY_DEFAULT_MIN_PACKS = 7168  # eight Kimi hidden rows (112 KiB)
+
+
+def pair_relay_requested(world_size: int, row_elems: int) -> bool:
+    """``B12X_PCIE_TP9_PAIR_RELAY=1`` on the TP9 single-pack-row runtime."""
+    return (
+        int(world_size) == PAIR_RELAY_WORLD_SIZE
+        and int(row_elems) == _PACK_ELEMS
+        and os.getenv("B12X_PCIE_TP9_PAIR_RELAY", "0") == "1"
+    )
+
+
+def pair_relay_min_packs() -> int:
+    """Smallest payload (16-byte packs) the pair relay publish phase applies to.
+
+    ``B12X_PCIE_TP9_PAIR_RELAY_MIN_PACKS`` (default 7168 = eight hidden rows of
+    7168 bf16); below it the relayed read across the pair bridge costs about as
+    much latency as the switch bytes it saves.
+    """
+    raw = os.getenv("B12X_PCIE_TP9_PAIR_RELAY_MIN_PACKS", str(_PAIR_RELAY_DEFAULT_MIN_PACKS))
+    value = int(raw)
+    if value < 0:
+        raise ValueError("B12X_PCIE_TP9_PAIR_RELAY_MIN_PACKS must be non-negative")
+    return value
+
+
+def _pci_identity(device: torch.device) -> tuple[int, int, int]:
+    properties = torch.cuda.get_device_properties(device)
+    return (
+        int(properties.pci_domain_id),
+        int(properties.pci_bus_id),
+        int(properties.pci_device_id),
+    )
+
+
+def pair_relay_bridge_key(
+    identity: tuple[int, int, int], sysfs_root: str = "/sys/bus/pci/devices"
+) -> Optional[str]:
+    """The PCI bridge two levels above a GPU (the pair's shared upstream port).
+
+    On this topology each PIX pair hangs off one small switch whose upstream
+    port is that bridge; both members resolve to the same key. ``None`` when
+    sysfs does not expose the device (the check is then skipped).
+    """
+    domain, bus, device = identity
+    node = Path(sysfs_root) / f"{domain:04x}:{bus:02x}:{device:02x}.0"
+    if not node.exists():
+        return None
+    parts = Path(os.path.realpath(node)).parts
+    if len(parts) < 3:
+        return None
+    return parts[-3]
+
+
+def check_pair_relay_topology(
+    identities: Sequence[tuple[int, int, int]], sysfs_root: str = "/sys/bus/pci/devices"
+) -> bool:
+    """Every PIX pair of the relay table must share its upstream bridge.
+
+    Returns False (after logging) when sysfs is unavailable for a member;
+    raises ValueError when a pair resolves to different bridges, because the
+    relay would then route the partner's shard over the wrong link.
+    """
+    if len(identities) != PAIR_RELAY_WORLD_SIZE:
+        raise ValueError(f"pair relay expects {PAIR_RELAY_WORLD_SIZE} ranks, got {len(identities)}")
+    keys = [pair_relay_bridge_key(identity, sysfs_root) for identity in identities]
+    if any(key is None for key in keys):
+        _LOG.warning("pair relay: sysfs does not expose the GPUs; pair placement not verified")
+        return False
+    for rank in range(0, PAIR_RELAY_SINGLE_RANK, 2):
+        partner = pair_relay_partner(rank)
+        if keys[rank] != keys[partner]:
+            raise ValueError(
+                "pair relay: ranks %d and %d are not a PCIe pair (bridges %s vs %s); "
+                "unset B12X_PCIE_TP9_PAIR_RELAY or fix the device order"
+                % (rank, partner, keys[rank], keys[partner])
+            )
+    return True
+
+
+def verify_pair_relay_topology(*, exchange_group: ProcessGroup, device: torch.device) -> bool:
+    """Gather every rank's PCI identity over ``exchange_group`` and check the pairs."""
+    world_size = dist.get_world_size(group=exchange_group)
+    identities: list[Optional[tuple[int, int, int]]] = [None] * world_size
+    dist.all_gather_object(identities, _pci_identity(device), group=exchange_group)
+    return check_pair_relay_topology([identity for identity in identities if identity is not None])
 
 
 def _contiguous_storage_interval(tensor: torch.Tensor) -> tuple[int, int]:
@@ -201,6 +295,14 @@ class PCIeTwoShotBF16:
             and row_elems == _PACK_ELEMS
             and os.getenv("B12X_PCIE_TP9_STATIC_PEERS", "0") == "1"
         )
+        # Opt-in pair relay for the push all-reduce's publish phase (TP9: PIX
+        # pairs (0,1) (2,3) (4,5) (6,7) behind shared uplinks, rank 8 single):
+        # each reduced shard crosses the switch fabric once per pair and the
+        # partner reads it across the pair bridge. Same bytes, same reduction
+        # order, so outputs are bit-identical to the plain push kernel. Read
+        # once here so graph preparation and replay agree.
+        self._pair_relay_enabled = pair_relay_requested(world_size, row_elems)
+        self._pair_relay_min_packs = pair_relay_min_packs()
         # Opt-in fused RMSNorm-shard epilogue (``all_reduce_rms_norm_shard``);
         # set before graph preparation so the launcher is compiled for capture.
         self.norm_shard_enabled = False
@@ -239,6 +341,8 @@ class PCIeTwoShotBF16:
             exchange_group=exchange_group,
             setup=validate_factory_arguments,
         )
+        if pair_relay_requested(world_size, row_elems):
+            verify_pair_relay_topology(exchange_group=exchange_group, device=device_obj)
         _require_full_grid_residency(
             owner="PCIe twoshot-bf16",
             required_sms=TWOSHOT_REQUIRED_SMS,
@@ -394,12 +498,34 @@ class PCIeTwoShotBF16:
 
     def _all_reduce_kernel_mode(self, rows_per_rank: int, remainder_packs: int) -> str:
         mode = self.all_reduce_mode
+        if mode != "push":
+            return mode
         total_packs = rows_per_rank * self.world_size + remainder_packs
-        if self._static_peers_enabled and mode == "push" and total_packs <= 7168:
-            # Up to eight Kimi hidden rows (or sixteen latent rows). Larger
-            # messages retain the deployed path; they had no established gain.
+        # Up to eight Kimi hidden rows (or sixteen latent rows) the static-peer
+        # specialization applies; larger messages retain the deployed path
+        # (no established gain). The pair relay pays from the payload where
+        # the publish phase is link-bound (default: eight hidden rows).
+        static = self._static_peers_enabled and total_packs <= 7168
+        relay = self._pair_relay_enabled and total_packs >= self._pair_relay_min_packs
+        if static and relay:
+            return "push_static_relay"
+        if static:
             return "push_static"
+        if relay:
+            return "push_relay"
         return mode
+
+    def all_reduce_kernel_modes(self) -> tuple[str, ...]:
+        """Every all-reduce kernel mode a launch may select (compiled by prepare_graph)."""
+        modes = [self.all_reduce_mode]
+        if self.all_reduce_mode == "push":
+            if self._static_peers_enabled:
+                modes.append("push_static")
+            if self._pair_relay_enabled:
+                modes.append("push_relay")
+                if self._static_peers_enabled:
+                    modes.append("push_static_relay")
+        return tuple(modes)
 
     def prepare_graph(
         self,
@@ -431,10 +557,7 @@ class PCIeTwoShotBF16:
                         self.row_elems,
                         device_index,
                     )
-            modes = [self.all_reduce_mode]
-            if self._static_peers_enabled and self.all_reduce_mode == "push":
-                modes.append("push_static")
-            for mode in modes:
+            for mode in self.all_reduce_kernel_modes():
                 for slot_bias in (0, 1):
                     get_twoshot_bf16_allreduce_launcher(
                         self.world_size,
