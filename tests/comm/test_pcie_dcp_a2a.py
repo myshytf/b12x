@@ -2368,13 +2368,15 @@ def test_pair_kernel_clips_output_rows_to_the_logical_width() -> None:
         assert f"{prefix}_row_packs = Int32(self._world_size) * {prefix}_packs" in read_phase
         assert f"if output_{prefix}_packs > Int32(0):" in read_phase
         assert f"{prefix}_row_packs = output_{prefix}_packs" in read_phase
-        # Rows split across blocks; a block's threads stride over the row's
-        # clipped width and place each pack at its row-major output offset.
-        assert f"while row_pack < {prefix}_row_packs:" in read_phase
+        # Rows split across blocks (block b: rows b, b + gridDim.x, ...); the
+        # block's threads stride over its rows' clipped packs and place each
+        # pack at its row-major output offset.
+        assert f"while flat < block_rows * {prefix}_row_packs:" in read_phase
+        assert f"row_pack = flat - local_row * {prefix}_row_packs" in read_phase
         assert f"linear = batch_index * {prefix}_row_packs + row_pack" in read_phase
         assert f"source_rank = row_pack // {prefix}_packs" in read_phase
-    assert read_phase.count("batch_index = Int32(bidx)") == 2
-    assert read_phase.count("batch_index += Int32(gdim)") == 2
+    assert read_phase.count("batch_index = Int32(bidx) + local_row * Int32(gdim)") == 2
+    assert read_phase.count("block_rows = (batch - Int32(bidx) + Int32(gdim) - Int32(1)) // Int32(gdim)") == 2
 
 
 def test_pair_kernel_graph_epoch_counts_every_block() -> None:
