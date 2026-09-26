@@ -2141,14 +2141,16 @@ def test_push_pair_kernel_writes_rows_to_peers_and_copies_out_locally() -> None:
     assert "+ Int64(self._rank)" in push_write
     assert "* Int64(combined_packs)" in push_write
     assert "if pack >= first_packs:" in push_write
-    # One local load per pack, one posted store per peer, into the epoch slot.
-    assert push_write.count("ld_global_v4_u32(") == 1
+    # Destination-major: the peer loop is outer, a block streams all of its
+    # rows' packs to one peer (one non-coherent local reload per pack per
+    # peer, one posted store) into that peer's epoch slot.
+    assert push_write.count("ld_global_nc_v4_u32(") == 1
     assert push_write.count("st_global_v4_u32(") == 1
-    assert push_write.index("ld_global_v4_u32(") < push_write.index(
-        "for destination_index in cutlass.range_constexpr("
+    assert push_write.index("for destination_index in cutlass.range_constexpr(") < push_write.index(
+        "ld_global_nc_v4_u32("
     )
-    assert "Int64(staging[destination].toint())" in push_write
-    assert "+ slot_offset" in push_write
+    assert "destination_base = Int64(staging[destination].toint()) + slot_offset" in push_write
+    assert "st_global_v4_u32(\n                        destination_base + pack_offset," in push_write
     assert "local_stage" not in push_write
 
     barrier_args = read_phase.split(")", maxsplit=1)[0]
