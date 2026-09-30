@@ -131,6 +131,7 @@ _DYNAMIC_W4A8_MATERIALIZED_ENV = "B12X_DYNAMIC_W4A8_MATERIALIZED"
 _W4A8_CONVERT_SCRATCH_MB_ENV = "B12X_W4A8_CONVERT_SCRATCH_MB"
 _W4A8_CONVERT_SCRATCH_MB_DEFAULT = 64
 _FP4_SOURCE_FORMATS = {
+    "b12x_trellis": "b12x_trellis",
     "modelopt_nvfp4": "modelopt_nvfp4",
     "fp4_e8m0_k32": "fp4_e8m0_k32",
     "compressed_tensors": "compressed_tensors",
@@ -145,6 +146,7 @@ _FP4_SOURCE_FORMATS = {
     "sqg_fp16_d3l": "sqg_fp16_d3l",
 }
 _TRELLIS_SOURCE_FORMATS = {
+    "b12x_trellis",
     "exl3_trellis_mcg",
     "qsrt_sqg_e4m3",
     "sqg_fp16_d3l",
@@ -5867,6 +5869,7 @@ def plan_b12x_fp4_moe_weights(
     qsrt_storage_format: str | None = None,
     qsrt_profile: str | None = None,
     coupled_hadamard: bool | None = None,
+    trellis_source=None,
 ) -> MoEWeightPreparationPlan:
     """Plan the one canonical weight allocation used by selected recipes."""
 
@@ -5897,6 +5900,7 @@ def plan_b12x_fp4_moe_weights(
         qsrt_storage_format=qsrt_storage_format,
         qsrt_profile=qsrt_profile,
         coupled_hadamard=coupled_hadamard,
+        trellis_source=trellis_source,
     )
 
 
@@ -7765,6 +7769,13 @@ def _plan_full_rotation_w4a16_launches(
         )
 
         def compile_fused(token_count: int) -> object:
+            source = caps.weight_plan.trellis_source
+            codebook = {} if source is None else {
+                "trellis_codebook": {
+                    "mcg": "mcg", "lut_e4m3": "sqg_xor_cheb_t12",
+                    "lut_fp16": "sqg_fp16_d3l",
+                }[source.config.codebook.value]
+            }
             return compile_w4a16_fused_moe(
                 size_m=token_count,
                 hidden_size=core_plan.k,
@@ -7794,6 +7805,7 @@ def _plan_full_rotation_w4a16_launches(
                 full_rotation=True,
                 coupled_hadamard=core_plan.coupled_hadamard,
                 rotation_input_dtype=rotation_input_dtype,
+                **codebook,
             )
 
         fused_launches = tuple(

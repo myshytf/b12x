@@ -28,6 +28,10 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..fused_moe.source import TrellisSource
 
 
 class _StringEnum(str, Enum):
@@ -150,6 +154,7 @@ class OutputReduction(_StringEnum):
 
 _QUANT_MODES = {"nvfp4", "w4a16", "w4a8_mx", "w4a8_nvfp4", "w6a8_mx"}
 _SOURCE_FORMATS = {
+    "b12x_trellis",
     "modelopt_nvfp4",
     "fp4_e8m0_k32",
     "compressed_tensors",
@@ -159,7 +164,7 @@ _SOURCE_FORMATS = {
     "sqg_fp16_d3l",
 }
 _TRELLIS_SOURCE_FORMATS = frozenset(
-    {"exl3_trellis_mcg", "qsrt_sqg_e4m3", "sqg_fp16_d3l"}
+    {"b12x_trellis", "exl3_trellis_mcg", "qsrt_sqg_e4m3", "sqg_fp16_d3l"}
 )
 _QSRT_ATOMS_V2_PROFILE_H308 = "k3x22_k4x2"
 _QSRT_ATOMS_V2_PROFILE_COUPLED_K2 = "k2_coupled_h512_h128"
@@ -172,6 +177,7 @@ _SOURCES_BY_QUANT_MODE = {
     # MX-FP6 source is exclusive to the w6a8_mx recipe.
     "w4a16": frozenset(
         {
+            "b12x_trellis",
             "modelopt_nvfp4",
             "fp4_e8m0_k32",
             "compressed_tensors",
@@ -285,6 +291,7 @@ class MoEWeightPreparationPlan:
     qsrt_storage_format: str | None = None
     qsrt_profile: str | None = None
     coupled_hadamard: bool = False
+    trellis_source: TrellisSource | None = None
 
     def __post_init__(self) -> None:
         specs = tuple(self.specs)
@@ -313,9 +320,21 @@ class MoEWeightPreparationPlan:
             self, "storage_policy", WeightStoragePolicy(self.storage_policy)
         )
         object.__setattr__(self, "coupled_hadamard", bool(self.coupled_hadamard))
+        if self.source_format == "b12x_trellis":
+            from ..fused_moe.source import TrellisSource
+
+            if not isinstance(self.trellis_source, TrellisSource):
+                raise TypeError("b12x_trellis requires a TrellisSource declaration")
+            if self.trellis_bits != self.trellis_source.uniform_bits:
+                raise ValueError("declared source rate differs from the planned rate")
+        elif self.trellis_source is not None:
+            raise ValueError("TrellisSource requires source_format='b12x_trellis'")
         if self.source_format in _TRELLIS_SOURCE_FORMATS:
             bits = 3 if self.trellis_bits is None else int(self.trellis_bits)
             valid_bits = (
+                (2, 3, 4, 5, 6)
+                if self.source_format == "b12x_trellis"
+                else
                 (2, 3, 4)
                 if self.source_format == "qsrt_sqg_e4m3"
                 else (5, 6)
@@ -719,6 +738,7 @@ def plan_moe_weight_preparation(
     qsrt_storage_format: str | None = None,
     qsrt_profile: str | None = None,
     coupled_hadamard: bool | None = None,
+    trellis_source: TrellisSource | None = None,
 ) -> MoEWeightPreparationPlan:
     """Choose the minimal representation set for the requested recipes.
 
@@ -962,6 +982,7 @@ def plan_moe_weight_preparation(
         qsrt_storage_format=qsrt_storage_format,
         qsrt_profile=qsrt_profile,
         coupled_hadamard=coupled_hadamard,
+        trellis_source=trellis_source,
     )
 
 
