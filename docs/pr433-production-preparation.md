@@ -1,7 +1,7 @@
 # Common Trellis preparation for the Kimi serving branch
 
-Status: **qualified for GPU preparation and component output equality**;
-serving-model checks are pending.
+Status: **qualified and serving for Kimi QSRT K2 TP9**, including GPU
+preparation, component equality and fixed-token model-score comparison.
 The reference is B12X `0439b80e` and vLLM `08ac2c8732`. This backport takes
 the uniform preparation, descriptors and EXL3 adapter from upstream B12X
 PR433, source `437cead4d902dc549d5c9744630090fc142d9847`, and adds a QSRT
@@ -74,3 +74,13 @@ layers with equal local geometry, codebook, transforms and precision may share
 an arena. The GPU regression binds weights from one extent to an arena planned
 for another extent and compares its output with the preserved preparation.
 Codebook and I/O dtype mismatches remain incompatible.
+
+The accepted boot is healthy with zero restarts and no new Xid. All 400
+fixed-token log probabilities and returned top-1 alternatives match the
+repeat-checked reference exactly. Four sampled requests complete, including
+7,285 prompt tokens, and the gateway canary returns 200. The immediate sampled
+reference matches three cases; unchanged reference repeats already vary on
+two short cases. Sampling equality is not used as the numerical oracle.
+See `benchmarks/qualification/pr433_common_serving_20261001.json`.
+Concurrency stress, longer contexts, cache-path stress and full-model
+throughput remain unperformed.

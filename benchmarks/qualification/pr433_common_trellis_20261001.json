@@ -1,6 +1,6 @@
 {
   "status": "qualified",
-  "scope": "common preparation and GPU component; serving checks pending",
+  "scope": "common preparation and GPU component; accepted model/serving receipts in pr433_common_serving_20261001.json",
   "reference": {
     "container_id": "ccca20e9c71949a4b68253aee57cecb2f596998fc780142dcf0b8a298a161a71",
     "started_at": "2026-09-30T17:05:07.335243147Z",
