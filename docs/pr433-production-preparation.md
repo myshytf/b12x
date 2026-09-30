@@ -1,6 +1,7 @@
 # Common Trellis preparation for the Kimi serving branch
 
-Status: **implemented; research-only until the GPU and serving gates pass**.
+Status: **qualified for GPU preparation and component output equality**;
+serving-model checks are pending.
 The reference is B12X `0439b80e` and vLLM `08ac2c8732`. This backport takes
 the uniform preparation, descriptors and EXL3 adapter from upstream B12X
 PR433, source `437cead4d902dc549d5c9744630090fc142d9847`, and adds a QSRT
@@ -49,3 +50,20 @@ resident and peak CUDA allocation, eager/graph outputs for real TP9 checkpoint
 extents, decode/boundary/prefill shapes, and model token log probabilities.
 The local package and raw receipts are at
 `/home/g0san/kimi-k3-production/candidates/k3-pr433-trellis-20261001/`.
+
+GPU qualification passed four synthetic tests using the full 896-expert,
+3584-channel contract and four source extents, including both FC1 halves.
+Real checkpoint layer-1 TP9 extents (384/256 channels) have identical prepared
+tensor hashes and shared gate/up storage. All 46 decode, boundary and prefill
+cases (184 initial/mutated output hashes) match, including CUDA Graph replay
+at prefill row counts 256 and 1536 with 48-row route blocks. Compiled decode
+specializations and resources are identical. Resident CUDA allocation does
+not increase; peak preparation allocation increases by 21,964,800 bytes for
+the 384-channel extent and 14,638,080 bytes for the 256-channel extent.
+
+Raw source-pinned receipts are tracked in
+`benchmarks/qualification/pr433_common_trellis_20261001.json`. The preparation
+time samples are unbalanced separate-process measurements and do not establish
+a speedup. Five stale BTX fixture failures in the broader host suite reproduce
+on the untouched reference; 204 targeted common/host tests and 27 vLLM tests
+pass. The vLLM file's pre-commit hooks pass.
