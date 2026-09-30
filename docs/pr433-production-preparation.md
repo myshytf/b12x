@@ -65,5 +65,12 @@ Raw source-pinned receipts are tracked in
 `benchmarks/qualification/pr433_common_trellis_20261001.json`. The preparation
 time samples are unbalanced separate-process measurements and do not establish
 a speedup. Five stale BTX fixture failures in the broader host suite reproduce
-on the untouched reference; 204 targeted common/host tests and 27 vLLM tests
+on the untouched reference; 205 targeted common/host tests and 27 vLLM tests
 pass. The vLLM file's pre-commit hooks pass.
+
+Scratch sharing uses an execution compatibility key. Full preparation-plan
+equality still includes checkpoint-global source coordinates, but prepared
+layers with equal local geometry, codebook, transforms and precision may share
+an arena. The GPU regression binds weights from one extent to an arena planned
+for another extent and compares its output with the preserved preparation.
+Codebook and I/O dtype mismatches remain incompatible.
