@@ -253,15 +253,18 @@ def test_direct_lut_all_codewords_and_graph_replay(bits: int, shared: bool) -> N
     check()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        compiled(*args)
+        compiled(*args[:-1], current_cuda_stream())
     pointers = [tensor.data_ptr() for tensor in (wins, t12, direct, out)]
     for _ in range(3):
         upper.random_(0, 65536)
         wins.copy_(((upper << 16) | states[:, None]).flatten())
+        compiled(*args[:-1], current_cuda_stream())
+        expected = out.clone()
         out.fill_(0x5A5A5A5A)
         allocated = torch.cuda.memory_allocated()
         graph.replay()
         torch.cuda.synchronize()
         assert torch.cuda.memory_allocated() == allocated
         assert pointers == [tensor.data_ptr() for tensor in (wins, t12, direct, out)]
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
         check()
