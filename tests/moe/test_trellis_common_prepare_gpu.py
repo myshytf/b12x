@@ -14,10 +14,11 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 
 @pytest.mark.parametrize("first,slots", [(0, 4), (12, 12), (48, 8), (92, 4)])
 def test_common_preparation_is_byte_exact_and_graph_safe(first, slots):
-    atoms, _, args = _atoms(first, slots, hidden=3584)
+    atoms, _, args = _atoms(first, slots, hidden=3584, experts=896)
     hidden = args["hidden_size"]
-    bundles = atoms.unflatten(1, (8, atoms.shape[1] // 8))
-    scales = torch.full((slots, 8, 96), 0.05, dtype=torch.float16)
+    experts_count = args["num_experts"]
+    bundles = atoms.unflatten(1, (experts_count, atoms.shape[1] // experts_count))
+    scales = torch.full((slots, experts_count, 96), 0.05, dtype=torch.float16)
     bundles[:, :, -192:].copy_(scales.view(torch.uint8))
     source, tensors = trellis_from_qsrt_atoms_v2(atoms, **args)
     legacy_plan = fused_moe.plan_weights(
@@ -25,7 +26,7 @@ def test_common_preparation_is_byte_exact_and_graph_safe(first, slots):
         source_format="qsrt_sqg_e4m3",
         activation="situ",
         params_dtype=torch.bfloat16,
-        num_experts=8,
+        num_experts=experts_count,
         hidden_size=hidden,
         intermediate_size=slots * 32,
         trellis_bits=2,
@@ -53,7 +54,7 @@ def test_common_preparation_is_byte_exact_and_graph_safe(first, slots):
             rotation_dtype=torch.float16,
         ),
         geometry=fused_moe.MoEGeometry(
-            num_experts=8, hidden_size=hidden, intermediate_size=slots * 32
+            num_experts=experts_count, hidden_size=hidden, intermediate_size=slots * 32
         ),
     )
     common = fused_moe.prepare_weights(
@@ -82,7 +83,7 @@ def test_common_preparation_is_byte_exact_and_graph_safe(first, slots):
             fused_moe.Caps(
                 max_tokens=4,
                 num_topk=4,
-                route_num_experts=8,
+                route_num_experts=experts_count,
                 device=0,
                 weight_plan=experts.plan,
                 quant_mode="w4a16",

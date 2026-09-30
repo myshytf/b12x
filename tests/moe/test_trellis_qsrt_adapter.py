@@ -10,8 +10,7 @@ from b12x.moe.checkpoints.qsrt import trellis_from_qsrt_atoms_v2
 from b12x.moe.fused_moe.trellis_layout import assemble_uniform_slots
 
 
-def _atoms(first=0, slots=4, hidden=512):
-    experts = 8
+def _atoms(first=0, slots=4, hidden=512, experts=8):
     section = (hidden // 16) * 128
     records = torch.randint(
         0, 256, (slots, experts, 3 * section + 192), dtype=torch.uint8
@@ -28,7 +27,7 @@ def _atoms(first=0, slots=4, hidden=512):
         gate_suh=torch.ones(hidden).half(),
         up_suh=torch.full((hidden,), 2.0).half(),
         down_svh=torch.full((hidden,), 3.0).half(),
-        rotation_draws=torch.arange(experts).byte(),
+        rotation_draws=(torch.arange(experts) % 8).byte(),
     )
     return records.flatten(1), scales, args
 
