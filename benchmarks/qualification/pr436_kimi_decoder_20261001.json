@@ -1,6 +1,6 @@
 {
   "status": "qualified",
-  "scope": "Kimi QSRT K2 TP9 MoE component on RTX PRO 6000 Blackwell Max-Q; model-serving checks pending",
+  "scope": "Kimi QSRT K2 TP9 MoE component on RTX PRO 6000 Blackwell Max-Q; serving checks in pr436_kimi_serving_20261001.json",
   "upstream_pr": "https://github.com/local-inference-lab/b12x/pull/436",
   "upstream_head": "cfb27fbf2d42426e019c2d8ec4ea28cf4ee53d75",
   "reference_b12x": "a3d58239660562e0ddfd47e40c7b483774c8fe32",

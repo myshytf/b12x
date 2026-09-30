@@ -49,3 +49,13 @@ long-context and concurrency qualification are outside this component result.
 
 The shared-table probe is adapted from `6af4b96706eb582ef1098032a16e77de52b2d46d`;
 the exhaustive codeword coverage and byte-pack sequence follow PR 436.
+
+Production serving is also **qualified for three short sampled probes**.
+The target/draft `fp8_ds_mla` caches, TP9/DCP9, fixed speculation depth 3
+and namespace remain the reference's. All three messages (including reasoning),
+token counts, finish reasons and returned log probabilities match exactly
+at temperature 1.0, top_p 0.95 and seeds 436/437/438. The service is healthy,
+restart count is zero, the gateway returns 200 and no new Xid was observed.
+The [serving receipt](../benchmarks/qualification/pr436_kimi_serving_20261001.json)
+records identities and hashes. Long-context, concurrency, cache-path stress
+and full-model throughput are not newly qualified.
