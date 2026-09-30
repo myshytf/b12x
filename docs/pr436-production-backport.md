@@ -1,7 +1,9 @@
 # Full-codeword decoder backport for the Kimi serving branch
 
-Status: **implemented**. GPU qualification is recorded in the deployment
-package at `/home/g0san/kimi-k3-production/candidates/k3-pr436-lut-20261001/`.
+Status: **qualified** for the decoder and the Kimi QSRT K2 TP9 MoE component
+on RTX PRO 6000 Blackwell Max-Q. The source-pinned
+[qualification record](../benchmarks/qualification/pr436_kimi_decoder_20261001.json)
+contains raw samples, output digests, environment and compiled resources.
 
 The serving B12X reference is
 `a3d58239` (`feat/k5-dcp-geometry-20260927`). It already stages a 64 KiB
@@ -30,6 +32,20 @@ direct lookups against the compact decoder at K2/K3/K4, including all 65,536
 codewords, random crossing windows, poisoned outputs and graph replay with
 changed inputs and stable tensor addresses. Whole-MoE qualification must
 also compare actual checkpoint extents against the preserved serving tree.
+
+Qualification used the deployed image, checkpoint layer 1, 384/256-channel
+TP extents, 896 experts, top-16 routing, BF16 I/O and the serving MoE switches.
+All 55 host policy tests and 12 GPU decoder cases passed. Across rows
+1/4/8/12/16/17/48 and three route-sharing patterns, all 168 output digests
+(42 cases, initial inputs plus three replay mutations) match the reference.
+Eager and captured execution match. All 16 compiled specializations retain
+the same shared-memory footprint and thread count, have zero local memory,
+and use one to five fewer registers per thread.
+
+The median component candidate/reference latency ratio is 0.9826, measured
+in separate processes on the same physical GPU. The order was not balanced,
+so this observation does not establish a speedup. Full-model throughput,
+long-context and concurrency qualification are outside this component result.
 
 The shared-table probe is adapted from `6af4b96706eb582ef1098032a16e77de52b2d46d`;
 the exhaustive codeword coverage and byte-pack sequence follow PR 436.
