@@ -14,7 +14,8 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 
 @pytest.mark.parametrize("first,slots", [(0, 4), (12, 12), (48, 8), (92, 4)])
 def test_common_preparation_is_byte_exact_and_graph_safe(first, slots):
-    atoms, _, args = _atoms(first, slots)
+    atoms, _, args = _atoms(first, slots, hidden=3584)
+    hidden = args["hidden_size"]
     bundles = atoms.unflatten(1, (8, atoms.shape[1] // 8))
     scales = torch.full((slots, 8, 96), 0.05, dtype=torch.float16)
     bundles[:, :, -192:].copy_(scales.view(torch.uint8))
@@ -25,7 +26,7 @@ def test_common_preparation_is_byte_exact_and_graph_safe(first, slots):
         activation="situ",
         params_dtype=torch.bfloat16,
         num_experts=8,
-        hidden_size=512,
+        hidden_size=hidden,
         intermediate_size=slots * 32,
         trellis_bits=2,
         trellis_tile_config=(128, 128, 128, 128),
@@ -52,7 +53,7 @@ def test_common_preparation_is_byte_exact_and_graph_safe(first, slots):
             rotation_dtype=torch.float16,
         ),
         geometry=fused_moe.MoEGeometry(
-            num_experts=8, hidden_size=512, intermediate_size=slots * 32
+            num_experts=8, hidden_size=hidden, intermediate_size=slots * 32
         ),
     )
     common = fused_moe.prepare_weights(
@@ -72,7 +73,7 @@ def test_common_preparation_is_byte_exact_and_graph_safe(first, slots):
     assert after.gate_suh.data_ptr() == after.up_suh.data_ptr()
     assert common.plan.source_format == "b12x_trellis"
     assert after.params_dtype == before.params_dtype == torch.float16
-    x = (torch.randn(4, 512, device="cuda") * 0.2).bfloat16()
+    x = (torch.randn(4, hidden, device="cuda") * 0.2).bfloat16()
     ids = torch.arange(4, dtype=torch.int32, device="cuda").repeat(4, 1)
     routing = torch.full((4, 4), 0.25, device="cuda")
     outputs = []
