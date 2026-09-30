@@ -12,19 +12,24 @@ import json
 import os
 from pathlib import Path
 import statistics
+import time
 
 import torch
 
 
 def digest(tensor):
-    return hashlib.sha256(
-        tensor.contiguous().view(torch.uint8).cpu().numpy().tobytes()
-    ).hexdigest()
+    value = tensor.contiguous().view(torch.uint8).reshape(-1)
+    result = hashlib.sha256()
+    for part in value.split(16 * 1024 * 1024):
+        result.update(memoryview(part.cpu().numpy()))
+    return result.hexdigest()
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", type=int, choices=(0, 1, 2), required=True)
+    parser.add_argument("--preparation", choices=("legacy", "common"), default="legacy")
+    parser.add_argument("--block-size", type=int, default=8)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--layer", type=int, default=1)
     parser.add_argument("--widths", default="384,256")
@@ -33,7 +38,8 @@ def main():
     parser.add_argument("--stages", action="store_true")
     parser.add_argument("--all-invalid-check", action="store_true")
     parser.add_argument(
-        "--external-sanitizer", action="store_true",
+        "--external-sanitizer",
+        action="store_true",
         help="Correctness only: leave CUPTI to Compute Sanitizer and omit timings.",
     )
     parser.add_argument(
@@ -138,6 +144,7 @@ def main():
     )
     sizes = [int(m) for m in args.m_values.split(",")]
     records = []
+    preparation_records = []
     patterns = (
         ("independent", "shared", "partial")
         if args.route_pattern == "all"
@@ -166,17 +173,79 @@ def main():
         with open_qsrt_atom_v2_extent(
             metadata, shard_count=9, shard_index=rank, device=None
         ) as (first, atoms):
-            weights = fused_moe.prepare_weights(
-                plan=weight_plan,
-                params_dtype=torch.bfloat16,
-                qsrt_atom_payload=atoms,
-                qsrt_first_atom_slot=first,
-                qsrt_layer_index=args.layer,
-                gate_suh=metadata.gate_suh.unsqueeze(0).cuda(),
-                up_suh=metadata.up_suh.unsqueeze(0).cuda(),
-                down_svh=metadata.down_svh.unsqueeze(0).cuda(),
-                qsrt_rotation_draws=metadata.rotation_draws,
-            )
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            memory_before = torch.cuda.memory_allocated()
+            prepare_start = time.monotonic()
+            if args.preparation == "common":
+                from b12x.moe.checkpoints.qsrt import trellis_from_qsrt_atoms_v2
+
+                source, tensors = trellis_from_qsrt_atoms_v2(
+                    atoms,
+                    first_atom_slot=first,
+                    num_experts=896,
+                    hidden_size=3584,
+                    global_intermediate_size=3072,
+                    gate_suh=metadata.gate_suh,
+                    up_suh=metadata.up_suh,
+                    down_svh=metadata.down_svh,
+                    rotation_draws=metadata.rotation_draws,
+                )
+                assert tensors.codes.data_ptr() == atoms.data_ptr()
+                weight_plan = fused_moe.plan_weights(
+                    source=source,
+                    activation=fused_moe.ActivationSpec(
+                        mode="a16",
+                        nonlinearity="situ",
+                        io_dtype=torch.bfloat16,
+                        rotation_dtype=torch.float16,
+                    ),
+                    geometry=fused_moe.MoEGeometry(
+                        num_experts=896, hidden_size=3584, intermediate_size=width
+                    ),
+                )
+                weights = fused_moe.prepare_weights(
+                    plan=weight_plan, weights=tensors, device="cuda:0"
+                )
+                assert weights.plan.source_format == "b12x_trellis"
+                del tensors, source
+            else:
+                weights = fused_moe.prepare_weights(
+                    plan=weight_plan,
+                    params_dtype=torch.bfloat16,
+                    qsrt_atom_payload=atoms,
+                    qsrt_first_atom_slot=first,
+                    qsrt_layer_index=args.layer,
+                    gate_suh=metadata.gate_suh.unsqueeze(0).cuda(),
+                    up_suh=metadata.up_suh.unsqueeze(0).cuda(),
+                    down_svh=metadata.down_svh.unsqueeze(0).cuda(),
+                    qsrt_rotation_draws=metadata.rotation_draws,
+                )
+            torch.cuda.synchronize()
+            value = weights.representation.value
+            peak = torch.cuda.max_memory_allocated() - memory_before
+            prepared = {
+                "width": width,
+                "rank": rank,
+                "first_slot": first,
+                "method": args.preparation,
+                "seconds": time.monotonic() - prepare_start,
+                "peak_cuda_bytes": peak,
+                "resident_cuda_bytes": torch.cuda.memory_allocated() - memory_before,
+                "shared_gate_up": value.gate_suh.data_ptr() == value.up_suh.data_ptr(),
+                "tensors": {
+                    f.name: {
+                        "shape": list(getattr(value, f.name).shape),
+                        "dtype": str(getattr(value, f.name).dtype),
+                        "sha256": digest(getattr(value, f.name)),
+                    }
+                    for f in dataclasses.fields(value)
+                    if isinstance(getattr(value, f.name), torch.Tensor)
+                },
+            }
+            preparation_records.append(prepared)
+            print("PREPARATION " + json.dumps(prepared), flush=True)
+            del value
         plan = fused_moe.plan(
             fused_moe.Caps(
                 max_tokens=max(sizes),
@@ -185,7 +254,7 @@ def main():
                 weight_plan=weights.plan,
                 quant_mode="w4a16",
                 route_num_experts=896,
-                w4a16_block_size_m=8,
+                w4a16_block_size_m=args.block_size,
                 w4a16_shared_input_rotation=True,
             )
         )
@@ -419,7 +488,8 @@ def main():
         del weights, plan, scratch, output, mapping
         torch.accelerator.empty_cache()
     specializations_ok = all(
-        r["chosen_launch"].get("inline_builder") == (args.mode == 2 and 2 <= r["m"] <= 8)
+        r["chosen_launch"].get("inline_builder")
+        == (args.mode == 2 and 2 <= r["m"] <= 8)
         for r in records
     )
     trace_specializations_ok = all(
@@ -430,8 +500,12 @@ def main():
     if not args.external_sanitizer:
         specializations_ok = specializations_ok and trace_specializations_ok
     result = {
-        "status": "sanitizer-correctness-only" if args.external_sanitizer else "component-only",
-        "trace_validation": "external-sanitizer-owns-cupti" if args.external_sanitizer else "qualified",
+        "status": "sanitizer-correctness-only"
+        if args.external_sanitizer
+        else "component-only",
+        "trace_validation": "external-sanitizer-owns-cupti"
+        if args.external_sanitizer
+        else "qualified",
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
         "gpu": torch.cuda.get_device_name(),
@@ -441,6 +515,7 @@ def main():
         ).hexdigest(),
         "specializations": list(observed.values()),
         "records": records,
+        "preparation": preparation_records,
         "compiled_resources": [
             {
                 k: getattr(v, k, None)

@@ -42,9 +42,11 @@ from ._impl import (
 from ._impl import (
     clear_tp_moe_caches as clear_caches,
 )
-from ._impl import (
-    plan_b12x_fp4_moe_weights as plan_weights,
-)
+from .common import ActivationSpec, MoEGeometry, plan_weights, prepare_weights
+from .config import TrellisConfig
+from .source import TrellisExtent, TrellisSource
+from .trellis_layout import TrellisStaging
+from .weights import ScaleFactors, TrellisWeights
 from ._impl import (
     plan_tp_moe_execution as plan_execution,
 )
@@ -53,9 +55,6 @@ from ._impl import (
 )
 from ._impl import (
     tp_moe_required_nbytes as required_nbytes,
-)
-from ._impl import (
-    prepare_b12x_fp4_moe_weights as prepare_weights,
 )
 from ._impl import (
     prepare_w4a16_fc2_e8m0 as prepare_fc2_weights,
@@ -93,6 +92,8 @@ def is_supported(device=None) -> bool:
 
 
 __all__ = [
+    "ActivationSpec", "MoEGeometry", "TrellisConfig", "TrellisExtent",
+    "TrellisSource", "TrellisStaging", "ScaleFactors", "TrellisWeights",
     "Caps",
     "Plan",
     "ExecutionPlan",
