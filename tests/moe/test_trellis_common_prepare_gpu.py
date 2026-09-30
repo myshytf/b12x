@@ -1,6 +1,6 @@
 """Compare common preparation with the preserved atom-preparation arithmetic."""
 
-from dataclasses import fields
+from dataclasses import fields, replace
 
 import pytest
 import torch
@@ -79,13 +79,22 @@ def test_common_preparation_is_byte_exact_and_graph_safe(first, slots):
     routing = torch.full((4, 4), 0.25, device="cuda")
     outputs = []
     for experts in (legacy, common):
+        runtime_weight_plan = experts.plan
+        if experts is common:
+            # Production shares an arena across layers with equal execution
+            # geometry but different checkpoint-global source coordinates.
+            other_extent = replace(source.extent, first_slot=0 if first >= 48 else 48)
+            runtime_weight_plan = replace(
+                experts.plan, trellis_source=replace(source, extent=other_extent)
+            )
+            assert runtime_weight_plan != experts.plan
         runtime = fused_moe.plan(
             fused_moe.Caps(
                 max_tokens=4,
                 num_topk=4,
                 route_num_experts=experts_count,
                 device=0,
-                weight_plan=experts.plan,
+                weight_plan=runtime_weight_plan,
                 quant_mode="w4a16",
                 w4a16_block_size_m=8,
                 w4a16_shared_input_rotation=True,

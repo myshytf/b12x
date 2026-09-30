@@ -1590,7 +1590,7 @@ class TPMoEScratchPlan:
             raise ValueError("plan does not accept prequantized input")
         if not isinstance(experts, B12XFP4ExpertWeights):
             raise TypeError("experts must come from prepare_b12x_fp4_moe_weights")
-        if experts.plan != self.caps.weight_plan:
+        if experts.plan.execution_key != self.caps.weight_plan.execution_key:
             raise ValueError(
                 "experts do not match the plan used to size TP MoE scratch"
             )

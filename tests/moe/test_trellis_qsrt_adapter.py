@@ -127,3 +127,35 @@ def test_bfloat16_rotation_is_not_silently_lowered_to_fp16():
         fused_moe.ActivationSpec(
             mode="a16", nonlinearity="situ", io_dtype=torch.bfloat16
         )
+
+
+def test_arena_contract_ignores_load_coordinates_but_preserves_codebook_and_dtype():
+    from b12x.moe.fused_moe.config import TrellisCodebook
+
+    atoms, _, args = _atoms()
+    source, _ = trellis_from_qsrt_atoms_v2(atoms, **args)
+    source = replace(source, uniform_bits=3)
+
+    def plan(value, dtype=torch.bfloat16):
+        return fused_moe.plan_weights(
+            source=value,
+            activation=fused_moe.ActivationSpec(
+                mode="a16",
+                nonlinearity="situ",
+                io_dtype=dtype,
+                rotation_dtype=torch.float16,
+            ),
+            geometry=fused_moe.MoEGeometry(
+                num_experts=8, hidden_size=512, intermediate_size=128
+            ),
+        )
+
+    first = plan(source)
+    second = plan(replace(source, extent=replace(source.extent, first_slot=48)))
+    assert first != second
+    assert first.execution_key == second.execution_key
+    mcg = plan(
+        replace(source, config=replace(source.config, codebook=TrellisCodebook.MCG))
+    )
+    assert first.execution_key != mcg.execution_key
+    assert first.execution_key != plan(source, torch.float16).execution_key

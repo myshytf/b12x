@@ -26,7 +26,7 @@ Thus readiness, load balancing, and arithmetic precision are separate axes.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from enum import Enum
 from typing import TYPE_CHECKING
 
@@ -292,6 +292,22 @@ class MoEWeightPreparationPlan:
     qsrt_profile: str | None = None
     coupled_hadamard: bool = False
     trellis_source: TrellisSource | None = None
+
+    @property
+    def execution_key(self) -> tuple[object, ...]:
+        """Arena compatibility after source coordinates are consumed at load time.
+
+        Layers with different source extents may share scratch once their final
+        tensors exist. Codebook, transforms, precision and runtime geometry must
+        still agree; preparation-plan equality retains the full source identity.
+        """
+        contract = tuple(
+            (item.name, getattr(self, item.name))
+            for item in fields(self)
+            if item.name != "trellis_source"
+        )
+        source_config = None if self.trellis_source is None else self.trellis_source.config
+        return contract, source_config
 
     def __post_init__(self) -> None:
         specs = tuple(self.specs)
