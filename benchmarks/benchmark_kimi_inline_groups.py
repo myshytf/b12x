@@ -338,7 +338,13 @@ def main():
                     if e.get("cat") == "kernel"
                     and "FillFunctor<int>" in e.get("name", "")
                 ]
-                assert len(fills) == (0 if args.mode == 1 else 1)
+                # The serving branch can initialize the resident header once
+                # per workspace. Its warmed graph then contains no fill node.
+                expected_fills = int(
+                    args.mode != 1
+                    and kernel_module._resident_header_host_clear_every_launch()
+                )
+                assert len(fills) == expected_fills
                 if not launch_blocks or any(b[0] != 256 for b in launch_blocks):
                     raise AssertionError(
                         f"Requested stable expert grouping did not execute: {launch_blocks}"
