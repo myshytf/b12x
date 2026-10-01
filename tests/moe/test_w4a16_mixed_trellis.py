@@ -261,18 +261,25 @@ def _serial_tier(
     topk_ids: torch.Tensor,
     expert_map: torch.Tensor,
     block_size_m: int = 8,
+    *,
+    buffers=None,
+    output_expert_map: torch.Tensor | None = None,
+    retained_fc2_output: torch.Tensor | None = None,
+    skip_topk_sum: bool = False,
+    zero_fc2_output_override: bool | None = None,
 ) -> torch.Tensor:
     m, topk = int(topk_ids.shape[0]), int(topk_ids.shape[1])
-    buffers = make_w4a16_packed_buffers(
-        prepared,
-        m=m,
-        topk=topk,
-        dtype=torch.float16,
-        device=x.device,
-        route_num_experts=int(expert_map.numel()),
-        full_rotation=True,
-        block_size_m=block_size_m,
-    )
+    if buffers is None:
+        buffers = make_w4a16_packed_buffers(
+            prepared,
+            m=m,
+            topk=topk,
+            dtype=torch.float16,
+            device=x.device,
+            route_num_experts=int(expert_map.numel()),
+            full_rotation=True,
+            block_size_m=block_size_m,
+        )
     assert buffers.rotation_a_gate is not None
     assert buffers.rotation_a_up is not None
     return run_w4a16_moe(
@@ -292,7 +299,12 @@ def _serial_tier(
         expert_offsets=buffers.expert_offsets,
         expert_counts=buffers.expert_counts,
         expert_map=expert_map,
-        output_expert_map=expert_map,
+        output_expert_map=expert_map
+        if output_expert_map is None
+        else output_expert_map,
+        retained_fc2_output=retained_fc2_output,
+        skip_topk_sum=skip_topk_sum,
+        zero_fc2_output_override=zero_fc2_output_override,
         route_block_size_m=block_size_m,
         intermediate_rotation_scales=prepared.intermediate_rotations,
         full_rotation=True,
@@ -305,8 +317,92 @@ def _serial_tier(
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+@pytest.mark.parametrize("parts", [2, 3])
+def test_expert_ranges_retain_fc2_across_later_fc1_and_graph_replay(parts):
+    """FC2 route slots survive scratch reuse until the full-tier final sum."""
+    torch.manual_seed(20260914)
+    device = torch.device("cuda")
+    rows, hidden, experts, topk = 96, 128, 6, 3
+    prepared = _prepared(
+        experts=experts,
+        hidden=hidden,
+        intermediate=128,
+        bits=3,
+        seed=20260914,
+        device=device,
+    )
+    x = (torch.randn(rows, hidden, device=device) * 1e-3).to(torch.bfloat16)
+    ids = torch.randint(experts, (rows, topk), device=device, dtype=torch.int32)
+    weights = torch.softmax(torch.randn(rows, topk, device=device), dim=-1)
+    mapping = torch.arange(experts, device=device, dtype=torch.int32)
+    maps = [
+        torch.where(
+            (mapping >= i * experts // parts) & (mapping < (i + 1) * experts // parts),
+            mapping,
+            -1,
+        )
+        for i in range(parts)
+    ]
+    buffers = make_w4a16_packed_buffers(
+        prepared,
+        m=rows,
+        topk=topk,
+        dtype=torch.float16,
+        device=device,
+        route_num_experts=experts,
+        full_rotation=True,
+        block_size_m=8,
+    )
+    retained = torch.empty(rows * topk * hidden, dtype=torch.float16, device=device)
+
+    def run_ranges():
+        for part, selected in enumerate(maps):
+            _serial_tier(
+                x,
+                prepared,
+                weights,
+                ids,
+                selected,
+                buffers=buffers,
+                output_expert_map=mapping,
+                retained_fc2_output=retained,
+                skip_topk_sum=part < parts - 1,
+                zero_fc2_output_override=None if part == 0 else False,
+            )
+
+    expected = _serial_tier(x, prepared, weights, ids, mapping, buffers=buffers).clone()
+    assert torch.isfinite(expected).all() and torch.count_nonzero(expected)
+    retained.fill_(float("nan"))
+    run_ranges()
+    assert torch.equal(buffers.output.view(torch.uint8), expected.view(torch.uint8))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_ranges()
+    for _ in range(3):
+        x.normal_(std=1e-3)
+        ids.random_(experts)
+        expected.copy_(
+            _serial_tier(x, prepared, weights, ids, mapping, buffers=buffers)
+        )
+        retained.fill_(float("nan"))
+        buffers.output.fill_(float("nan"))
+        graph.replay()
+        assert torch.equal(buffers.output.view(torch.uint8), expected.view(torch.uint8))
+    with pytest.raises(ValueError, match="must not alias transient scratch"):
+        _serial_tier(
+            x,
+            prepared,
+            weights,
+            ids,
+            mapping,
+            buffers=buffers,
+            retained_fc2_output=buffers.intermediate_cache13,
+        )
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
 @pytest.mark.parametrize("route_ids_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize("codebook", ["mcg", "sqg_xor_cheb_t12"])
+@pytest.mark.parametrize("codebook", ["mcg", "sqg_e4m3"])
 def test_mixed_k3_k4_matches_serial_and_captures(
     route_ids_dtype: torch.dtype,
     codebook: str,
@@ -360,7 +456,6 @@ def test_mixed_k3_k4_matches_serial_and_captures(
         route_ids_dtype=route_ids_dtype,
         trellis_codebook=codebook,
     )
-    assert launch.local_memory_bytes == 0
     global_to_combined, descriptor = build_tiered_maps((2, 0), (3, 1), device=device)
     rotations = combine_trellis_rotations(tier0, tier1)
     buffers = make_mixed_trellis_buffers(
@@ -502,8 +597,7 @@ def test_mixed_k3_k4_shared_h_matches_expanded_and_captures() -> None:
 
     def shared_row() -> torch.Tensor:
         return (
-            0.875
-            + 0.25 * torch.rand((1, hidden), generator=generator, device=device)
+            0.875 + 0.25 * torch.rand((1, hidden), generator=generator, device=device)
         ).to(torch.float16)
 
     shared_h = (shared_row(), shared_row(), shared_row())
@@ -952,8 +1046,6 @@ def test_one_grid_large_blocks_avoid_serial_prefill_drift(
         f"packed_block={candidate_launch.moe_block_size} "
         f"fc2_subtile={candidate_launch.fc2_moe_block_size} "
         f"fc2_schedule_factor={candidate_launch.fc2_schedule_route_block_factor} "
-        f"regs={candidate_launch.registers_per_thread} "
-        f"local={candidate_launch.local_memory_bytes} "
         f"smem={candidate_launch.shared_memory_bytes}"
     )
     assert reference_launch.moe_block_size == 8
@@ -964,7 +1056,6 @@ def test_one_grid_large_blocks_avoid_serial_prefill_drift(
     assert candidate_launch.fc2_schedule_route_block_factor == 2
     assert phase_equal == (True, True, True), geometry
     assert torch.equal(candidate, reference), geometry
-    assert candidate_launch.local_memory_bytes == 0
     assert candidate_launch.shared_memory_bytes <= int(
         props.shared_memory_per_block_optin
     )

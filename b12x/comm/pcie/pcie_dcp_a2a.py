@@ -1,4 +1,32 @@
-"""PCIe one-shot DCP attention exchange with fused LSE reduction."""
+"""PCIe one-shot DCP attention exchange with fused LSE reduction.
+
+Staging transport (``B12X_PCIE_DCP_A2A_TRANSPORT``, read once per runtime):
+
+``pull`` (default)
+    A rank writes its whole contribution into its own staging slot; after the
+    block-pair barrier every peer reads the rows it needs from the owner's
+    memory over PCIe (non-posted reads).
+
+``push``
+    A rank writes each peer's rows into that peer's staging slot before the
+    barrier (posted PCIe writes); the reduce/copy-out phase reads local
+    memory only.  The staging capacity, the double-buffered slots, the
+    per-block barrier and the row-to-warp mapping are the same as for the
+    pull transport, so the safety argument for slot reuse is unchanged, and
+    the combine arithmetic is identical (the same values enter the same
+    fused multiply-adds in the same order), so both transports produce the
+    same bits.  All ranks must select the same transport; the channel layout
+    contract checks it collectively.
+
+The transport applies to the head gather, the LSE reduce-scatter and the
+paired projection gather (``all_gather_pair`` and its fused Kimi top-k
+variant).  Under ``push`` the paired gather stores a rank's combined row
+(first packs, then second packs) at row slot ``batch * world_size + rank``
+of every peer's staging, so a slot holds ``batch * world_size`` combined
+rows; that is within the capacity the layout reserves for
+``max_batch_size * total_heads`` query rows, because ``total_heads`` is a
+multiple of ``world_size`` and a paired row equals ``query_head_dim`` bytes.
+"""
 
 from __future__ import annotations
 
@@ -36,7 +64,12 @@ from .pcie_oneshot import (
 )
 
 
-SUPPORTED_WORLD_SIZES = (2, 4, 8, 16)
+# Paired projection gather: default blocks per launch (B12X_PCIE_DCP_PAIR_BLOCKS
+# overrides, B12X_PCIE_DCP_BLOCK_LIMIT caps); the kernel assigns batch rows to
+# blocks, so the batch bounds it too.
+_PAIR_GATHER_BLOCK_LIMIT = 16
+
+SUPPORTED_WORLD_SIZES = (2, 4, 8, 9, 16)
 SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 SUPPORTED_GATHER_DTYPES = (*SUPPORTED_DTYPES, torch.float8_e4m3fn)
 SUPPORTED_PAIR_DTYPES = (*SUPPORTED_GATHER_DTYPES, torch.float32)
@@ -60,19 +93,180 @@ def _env_int(name: str, fallback: int) -> int:
         return int(fallback)
 
 
+A2A_TRANSPORTS = ("pull", "push")
+
+
+def a2a_pair_transport(default: str) -> str:
+    """Return the paired projection gather's transport.
+
+    ``B12X_PCIE_DCP_A2A_PAIR_TRANSPORT`` (``pull`` or ``push``) overrides the
+    runtime transport for ``all_gather_pair`` and its fused Kimi top-k
+    variant only; unset or empty inherits ``default`` (the runtime's
+    transport). Every rank must select the same value; the channel layout
+    contract checks it collectively.
+    """
+    value = os.environ.get("B12X_PCIE_DCP_A2A_PAIR_TRANSPORT", "").strip().lower()
+    if not value:
+        return default
+    if value not in A2A_TRANSPORTS:
+        raise ValueError(
+            "B12X_PCIE_DCP_A2A_PAIR_TRANSPORT must be one of "
+            f"{A2A_TRANSPORTS} or empty, got {value!r}"
+        )
+    return value
+
+
+def a2a_gather_switch_groups(world_size: int):
+    from ._switch_gather import normalize_switch_groups
+
+    groups = normalize_switch_groups(
+        os.getenv("B12X_PCIE_DCP_GATHER_GROUPS", ""), world_size
+    )
+    if groups and a2a_transport() != "push":
+        raise ValueError("switch query gather requires push transport")
+    return groups
+
+
+def a2a_transport() -> str:
+    """Return the staging transport selected by ``B12X_PCIE_DCP_A2A_TRANSPORT``."""
+
+    raw = (os.getenv("B12X_PCIE_DCP_A2A_TRANSPORT") or "pull").strip().lower()
+    if raw not in A2A_TRANSPORTS:
+        raise ValueError(
+            "B12X_PCIE_DCP_A2A_TRANSPORT must be one of "
+            f"{', '.join(A2A_TRANSPORTS)}; got {raw!r}"
+        )
+    return raw
+
+
 def _is_supported_bhd_layout(tensor: torch.Tensor) -> bool:
     """Accept packed token-major or capacity-strided head-major BHD views."""
     if tensor.ndim != 3 or int(tensor.stride(2)) != 1:
         return False
     batch, heads, head_dim = (int(value) for value in tensor.shape)
     stride_batch, stride_head, _ = (int(value) for value in tensor.stride())
-    packed_token_major = stride_batch == heads * head_dim and stride_head == head_dim
+    packed_token_major = (
+        stride_batch >= heads * head_dim
+        and stride_batch % 8 == 0
+        and stride_head == head_dim
+    )
     capacity_strided_head_major = (
         stride_batch == head_dim
         and stride_head >= batch * head_dim
         and stride_head % 8 == 0
     )
     return packed_token_major or capacity_strided_head_major
+
+
+# Upper bound on the router rows one ``kimi_topk16`` launch selects. The
+# batched selection runs one CTA per row (``grid=(rows, 1, 1)``) with no
+# per-row shared state, so the bound only rejects shapes no decode step
+# produces; the served decode envelope stays a caller-side setting.
+KIMI_TOPK16_MAX_ROWS = 1024
+
+
+def prepare_kimi_topk16(
+    *,
+    device: torch.device | int | str,
+    threads: int = 256,
+) -> None:
+    """Compile the stateless Kimi-K3 top-16 launcher before graph capture."""
+
+    device_obj = _normalize_device(device)
+    if device_obj.type != "cuda":
+        raise ValueError("Kimi top-16 requires a CUDA device")
+    if _is_current_stream_capturing(device_obj):
+        raise RuntimeError("prepare_kimi_topk16() must run before capture")
+    from ._dcp_a2a_cute import _get_compiled_kimi_topk16
+
+    with torch.cuda.device(device_obj):
+        _get_compiled_kimi_topk16(threads)
+
+
+def kimi_topk16(
+    router_logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+    output_weights: Optional[torch.Tensor] = None,
+    output_ids: Optional[torch.Tensor] = None,
+    *,
+    threads: int = 256,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select Kimi-K3's 16 routed experts without communication state.
+
+    The operation accepts between one and ``KIMI_TOPK16_MAX_ROWS`` assembled
+    FP32 router rows (one CTA per row). It launches on the current CUDA stream
+    and is CUDA-graph safe after an eager launch or :func:`prepare_kimi_topk16`.
+    Graph capture requires caller-owned outputs.
+    """
+
+    if router_logits.ndim != 2:
+        raise ValueError("router_logits must be a contiguous rank-2 tensor")
+    rows = int(router_logits.shape[0])
+    if rows < 1 or rows > KIMI_TOPK16_MAX_ROWS:
+        raise ValueError(
+            f"Kimi top-16 rows {rows} must be between 1 and {KIMI_TOPK16_MAX_ROWS}"
+        )
+    device = router_logits.device
+    if device.type != "cuda":
+        raise ValueError("Kimi top-16 requires CUDA tensors")
+    expected = (
+        (router_logits, (rows, 896), torch.float32, "router_logits"),
+        (correction_bias, (896,), torch.float32, "correction_bias"),
+    )
+    for value, shape, dtype, name in expected:
+        if (
+            value.device != device
+            or value.shape != shape
+            or value.dtype != dtype
+            or not value.is_contiguous()
+        ):
+            raise ValueError(f"{name} must be contiguous {shape} {dtype} on {device}")
+
+    capturing = _is_current_stream_capturing(device)
+    if capturing and (output_weights is None or output_ids is None):
+        raise RuntimeError(
+            "Kimi top-16 CUDA graph capture requires caller-owned "
+            "output_weights and output_ids"
+        )
+    if output_weights is None:
+        output_weights = torch.empty((rows, 16), device=device, dtype=torch.float32)
+    if output_ids is None:
+        output_ids = torch.empty((rows, 16), device=device, dtype=torch.int32)
+    outputs = (
+        (output_weights, torch.float32, "output_weights"),
+        (output_ids, torch.int32, "output_ids"),
+    )
+    for value, dtype, name in outputs:
+        if (
+            value.device != device
+            or value.shape != (rows, 16)
+            or value.dtype != dtype
+            or not value.is_contiguous()
+        ):
+            raise ValueError(
+                f"{name} must be contiguous {(rows, 16)} {dtype} on {device}"
+            )
+    if capturing:
+        from ._dcp_a2a_cute import is_kimi_topk16_prepared
+
+        if not is_kimi_topk16_prepared(threads):
+            raise RuntimeError(
+                "cold Kimi top-16 CUDA graph capture is not allowed; call "
+                "prepare_kimi_topk16() before capture"
+            )
+
+    from ._dcp_a2a_cute import kimi_topk16 as launch_kimi_topk16
+
+    with torch.cuda.device(device):
+        launch_kimi_topk16(
+            router_logits_ptr=router_logits.data_ptr(),
+            correction_bias_ptr=correction_bias.data_ptr(),
+            output_weights_ptr=output_weights.data_ptr(),
+            output_ids_ptr=output_ids.data_ptr(),
+            rows=rows,
+            threads=threads,
+        )
+    return output_weights, output_ids
 
 
 @dataclass(frozen=True)
@@ -85,6 +279,15 @@ class _StagingLayout:
     lse_capacity: int
     slot_bytes: int
     slab_bytes: int
+
+
+def _clipped_row_bytes(output: torch.Tensor, full_columns: int) -> int:
+    """Row bytes of a caller-owned gather output narrower than the full
+    gathered width (0 when it holds the full width)."""
+    columns = int(output.shape[1])
+    if columns >= full_columns:
+        return 0
+    return columns * output.element_size()
 
 
 def _staging_layout(
@@ -361,6 +564,7 @@ class PCIeDCPA2A:
                     self.output_capacity_elems,
                     self.lse_offset,
                     self.lse_capacity,
+                    self.gather_switch_groups,
                 ),
             )
 
@@ -442,9 +646,28 @@ class PCIeDCPA2A:
         self._device_slot_selection = False
         self._graph_base_slot = 0
         self._threads_override = _env_int("B12X_PCIE_DCP_THREADS", 0)
+        # Paired projection gather: blocks per launch (batch rows split across
+        # blocks). 1 reproduces the single-block launch served before
+        # 2026-09-26; B12X_PCIE_DCP_BLOCK_LIMIT still caps it.
+        self._pair_block_limit = (
+            _env_int("B12X_PCIE_DCP_PAIR_BLOCKS", 0) or _PAIR_GATHER_BLOCK_LIMIT
+        )
         self._block_limit_override = _env_int(
             "B12X_PCIE_DCP_BLOCK_LIMIT", 0
         )
+        # Per-operation geometry (``lse``: LSE reduce-scatter, ``heads``:
+        # query head gather) takes precedence over the two settings above, so
+        # one collective can be retuned without moving the others. A warp
+        # owns a whole row in both kernels, so geometry never changes results.
+        self._op_launch_overrides = {
+            op: (
+                _env_int(f"B12X_PCIE_DCP_{op.upper()}_THREADS", 0),
+                _env_int(f"B12X_PCIE_DCP_{op.upper()}_BLOCK_LIMIT", 0),
+            )
+            for op in ("lse", "heads")
+        }
+        self._transport = a2a_transport()
+        self.gather_switch_groups = a2a_gather_switch_groups(self.world_size)
         self._stream_affine = bool(stream_affine)
         self._owner_stream_key: Optional[int] = None
         self._closed = False
@@ -573,6 +796,9 @@ class PCIeDCPA2A:
                 int(head_dim),
                 int(query_head_dim),
                 layout,
+                a2a_transport(),
+                a2a_pair_transport(a2a_transport()),
+                a2a_gather_switch_groups(world_size),
             ),
         )
         slab = PCIeOneshotAllReduce._allocate_shared_buffer(
@@ -666,18 +892,42 @@ class PCIeDCPA2A:
             return
         self._bind_stream_key(_current_stream_key(self.device, stream))
 
+    @property
+    def transport(self) -> str:
+        """Staging transport of the gather and LSE kernels (``pull``/``push``)."""
+
+        return self._transport
+
+    @property
+    def push_transport(self) -> bool:
+        return self._transport == "push"
+
+    @property
+    def pair_push_transport(self) -> bool:
+        """Transport of the paired projection gather (see ``a2a_pair_transport``)."""
+        return a2a_pair_transport(self._transport) == "push"
+
     def _resolve_launch_config(
         self,
         *,
         threads: int,
         block_limit: int,
+        op: Optional[str] = None,
     ) -> tuple[int, int]:
         threads = int(threads)
         block_limit = int(block_limit)
-        if self._threads_override > 0:
-            threads = min(512, max(64, (self._threads_override // 32) * 32))
-        if self._block_limit_override > 0:
-            block_limit = min(self._block_limit_override, _MAX_BLOCKS)
+        threads_override = self._threads_override
+        block_limit_override = self._block_limit_override
+        if op is not None:
+            op_threads, op_block_limit = self._op_launch_overrides[op]
+            if op_threads > 0:
+                threads_override = op_threads
+            if op_block_limit > 0:
+                block_limit_override = op_block_limit
+        if threads_override > 0:
+            threads = min(512, max(64, (threads_override // 32) * 32))
+        if block_limit_override > 0:
+            block_limit = min(block_limit_override, _MAX_BLOCKS)
         if (
             threads < self.world_size
             or threads > 512
@@ -702,7 +952,9 @@ class PCIeDCPA2A:
             )
         if dtype not in SUPPORTED_DTYPES:
             raise ValueError(f"unsupported output dtype {dtype}")
-        threads, _ = self._resolve_launch_config(threads=threads, block_limit=1)
+        threads, _ = self._resolve_launch_config(
+            threads=threads, block_limit=1, op="lse"
+        )
         dtype_name = "fp16" if dtype == torch.float16 else "bf16"
         from ._dcp_a2a_cute import _get_compiled_lse_reduce_scatter
 
@@ -713,6 +965,7 @@ class PCIeDCPA2A:
                 dtype_name,
                 threads,
                 True,
+                self.push_transport,
             )
 
     def prepare_graph_all_gather_heads(self, *, threads: int = 256) -> None:
@@ -722,7 +975,9 @@ class PCIeDCPA2A:
             raise RuntimeError(
                 "prepare_graph_all_gather_heads() must run before capture"
             )
-        threads, _ = self._resolve_launch_config(threads=threads, block_limit=1)
+        threads, _ = self._resolve_launch_config(
+            threads=threads, block_limit=1, op="heads"
+        )
         from ._dcp_a2a_cute import _get_compiled_all_gather_heads
 
         with torch.cuda.device(self.device):
@@ -731,6 +986,8 @@ class PCIeDCPA2A:
                 self.rank,
                 threads,
                 True,
+                self.push_transport,
+                self.gather_switch_groups,
             )
 
     def prepare_graph_all_gather_pair(self, *, threads: int = 512) -> None:
@@ -750,6 +1007,7 @@ class PCIeDCPA2A:
                 threads,
                 True,
                 False,
+                self.pair_push_transport,
             )
 
     def prepare_graph_all_gather_pair_kimi_topk(self) -> None:
@@ -773,7 +1031,20 @@ class PCIeDCPA2A:
                 512,
                 True,
                 True,
+                self.pair_push_transport,
             )
+
+    def prepare_graph_kimi_topk16(self, *, threads: int = 256) -> None:
+        """Compile/load batched Kimi expert selection before graph capture."""
+
+        if _is_current_stream_capturing(self.device):
+            raise RuntimeError(
+                "prepare_graph_kimi_topk16() must run before capture"
+            )
+        from ._dcp_a2a_cute import _get_compiled_kimi_topk16
+
+        with torch.cuda.device(self.device):
+            _get_compiled_kimi_topk16(threads)
 
     def _validate(
         self,
@@ -867,6 +1138,7 @@ class PCIeDCPA2A:
         threads, block_limit = self._resolve_launch_config(
             threads=threads,
             block_limit=block_limit,
+            op="lse",
         )
         rows = int(partial_output.shape[0]) * self.heads_per_rank
         warps_per_block = threads // 32
@@ -885,6 +1157,7 @@ class PCIeDCPA2A:
                 dtype_name,
                 threads,
                 True,
+                self.push_transport,
             ):
                 raise RuntimeError(
                     "cold PCIe DCP LSE CUDA graph capture is not allowed; "
@@ -950,6 +1223,7 @@ class PCIeDCPA2A:
                     self._slot_bytes if slot == 0 else -self._slot_bytes
                 ),
                 blocks=blocks,
+                push=self.push_transport,
             )
 
     def all_gather_heads(
@@ -1018,6 +1292,7 @@ class PCIeDCPA2A:
         threads, block_limit = self._resolve_launch_config(
             threads=threads,
             block_limit=block_limit,
+            op="heads",
         )
         rows = int(batch) * self.total_heads
         warps_per_block = threads // 32
@@ -1034,6 +1309,8 @@ class PCIeDCPA2A:
                 self.rank,
                 threads,
                 True,
+                self.push_transport,
+                self.gather_switch_groups,
             ):
                 raise RuntimeError(
                     "cold PCIe DCP gather CUDA graph capture is not allowed; "
@@ -1087,6 +1364,8 @@ class PCIeDCPA2A:
                     self._slot_bytes if slot == 0 else -self._slot_bytes
                 ),
                 blocks=blocks,
+                push=self.push_transport,
+                switch_groups=self.gather_switch_groups,
             )
 
     def all_gather_pair(
@@ -1175,13 +1454,28 @@ class PCIeDCPA2A:
         ):
             if output.device != self.device or output.dtype != source.dtype:
                 raise ValueError(f"{name} output device and dtype must match input")
-            if output.shape != expected:
+            # A caller-owned output may hold the logical row (the gathered
+            # width without the last rank's trailing padding): a narrower
+            # row-major tensor whose row is a multiple of 16 bytes.
+            if (
+                output.ndim != 2
+                or int(output.shape[0]) != expected[0]
+                or int(output.shape[1]) > expected[1]
+                or (int(output.shape[1]) * output.element_size()) % 16
+                or int(output.shape[1]) <= 0
+            ):
                 raise ValueError(
-                    f"{name} output shape must be {expected}, got {tuple(output.shape)}"
+                    f"{name} output shape must be {expected} or a narrower "
+                    f"16-byte-aligned row, got {tuple(output.shape)}"
                 )
             if not output.is_contiguous():
                 raise ValueError(f"{name} output must be contiguous")
-        threads, _ = self._resolve_launch_config(threads=threads, block_limit=1)
+        threads, block_limit = self._resolve_launch_config(
+            threads=threads, block_limit=self._pair_block_limit
+        )
+        # One block per batch row up to the limit: the kernel splits rows
+        # across blocks in every phase (see _AllGatherPairLaunch).
+        blocks = max(1, min(block_limit, batch))
         capturing = _is_current_stream_capturing(self.device)
         if capturing:
             from ._dcp_a2a_cute import is_all_gather_pair_prepared
@@ -1192,6 +1486,7 @@ class PCIeDCPA2A:
                 threads,
                 True,
                 False,
+                self.pair_push_transport,
             ):
                 raise RuntimeError(
                     "cold PCIe DCP paired gather CUDA graph capture is not "
@@ -1213,6 +1508,7 @@ class PCIeDCPA2A:
             slot=slot,
             threads=threads,
             device_slot_selection=self._device_slot_selection,
+            blocks=blocks,
         )
         return out_first, out_second
 
@@ -1226,6 +1522,7 @@ class PCIeDCPA2A:
         slot: int,
         threads: int,
         device_slot_selection: bool,
+        blocks: int = 1,
     ) -> None:
         from ._dcp_a2a_cute import all_gather_pair
 
@@ -1249,6 +1546,14 @@ class PCIeDCPA2A:
                 slot_delta_bytes=(
                     self._slot_bytes if slot == 0 else -self._slot_bytes
                 ),
+                push=self.pair_push_transport,
+                output_first_row_bytes=_clipped_row_bytes(
+                    out_first, int(local_first.shape[1]) * self.world_size
+                ),
+                output_second_row_bytes=_clipped_row_bytes(
+                    out_second, int(local_second.shape[1]) * self.world_size
+                ),
+                blocks=blocks,
             )
 
     def all_gather_pair_kimi_topk(
@@ -1279,7 +1584,17 @@ class PCIeDCPA2A:
         topk_weights: Optional[torch.Tensor] = None,
         topk_ids: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Gather Kimi-K3's sharded latent row and select its 16 experts."""
+        """Gather Kimi-K3's sharded latent rows and select their 16 experts.
+
+        ``local_down`` (``[batch, W_d]`` bf16) and ``local_router``
+        (``[batch, W_r]`` fp32) are this rank's shards; a rank may pad its
+        share to whole 16-byte packs (the last rank of nine ranks holds 384
+        latent columns and 64 experts in 400- and 104-wide rows), in which
+        case the gathered rows are clipped to the logical 3,584 columns and
+        896 experts. ``out_down`` holds the logical (default) or the full
+        gathered latent row; ``topk_weights`` / ``topk_ids`` are
+        ``[batch, 16]`` fp32 / int32.
+        """
         self._check_stream()
         if self._closed:
             raise RuntimeError("PCIeDCPA2A is closed")
@@ -1288,21 +1603,22 @@ class PCIeDCPA2A:
                 "Kimi paired gather+top-k requires a supported PCIe DCP "
                 f"world size, got TP{self.world_size}"
             )
-        local_down_width = 3584 // self.world_size
-        local_router_width = 896 // self.world_size
+        if local_down.ndim != 2 or local_router.ndim != 2:
+            raise ValueError("paired inputs must have shape [batch, width]")
+        batch = int(local_down.shape[0])
+        capacity = min(self.max_batch_size, 8)
+        if batch <= 0 or batch > capacity:
+            raise ValueError(
+                f"Kimi paired gather+top-k batch {batch} must be between 1 "
+                f"and the supported capacity {capacity}"
+            )
+        if int(local_router.shape[0]) != batch:
+            raise ValueError("paired inputs must have the same batch size")
+        down_width = int(local_down.shape[1])
+        router_width = int(local_router.shape[1])
         expected = (
-            (
-                local_down,
-                (1, local_down_width),
-                torch.bfloat16,
-                "local_down",
-            ),
-            (
-                local_router,
-                (1, local_router_width),
-                torch.float32,
-                "local_router",
-            ),
+            (local_down, (batch, down_width), torch.bfloat16, "local_down"),
+            (local_router, (batch, router_width), torch.float32, "local_router"),
             (correction_bias, (896,), torch.float32, "correction_bias"),
         )
         for value, shape, dtype, name in expected:
@@ -1315,16 +1631,51 @@ class PCIeDCPA2A:
                 raise ValueError(
                     f"{name} must be contiguous {shape} {dtype} on {self.device}"
                 )
+        down_row_bytes = down_width * 2
+        router_row_bytes = router_width * 4
+        if down_row_bytes % 16 or router_row_bytes % 16:
+            raise ValueError("paired row widths must be multiples of 16 bytes")
+        if down_row_bytes + router_row_bytes != self.query_head_dim:
+            raise ValueError(
+                "paired row bytes must match the runtime query dimension: "
+                f"got {down_row_bytes + router_row_bytes}, "
+                f"expected {self.query_head_dim}"
+            )
+        full_down = down_width * self.world_size
+        full_router = router_width * self.world_size
+        if full_down < 3584 or full_router < 896:
+            raise ValueError(
+                "the gathered rows must cover Kimi-K3's 3,584 latent columns "
+                f"and 896 experts, got {full_down} and {full_router}"
+            )
         if out_down is None:
-            out_down = torch.empty((1, 3584), device=self.device, dtype=torch.bfloat16)
+            out_down = torch.empty(
+                (batch, 3584), device=self.device, dtype=torch.bfloat16
+            )
         if topk_weights is None:
-            topk_weights = torch.empty((1, 16), device=self.device, dtype=torch.float32)
+            topk_weights = torch.empty(
+                (batch, 16), device=self.device, dtype=torch.float32
+            )
         if topk_ids is None:
-            topk_ids = torch.empty((1, 16), device=self.device, dtype=torch.int32)
+            topk_ids = torch.empty(
+                (batch, 16), device=self.device, dtype=torch.int32
+            )
+        if (
+            out_down.device != self.device
+            or out_down.dtype != torch.bfloat16
+            or out_down.ndim != 2
+            or int(out_down.shape[0]) != batch
+            or not 3584 <= int(out_down.shape[1]) <= full_down
+            or (int(out_down.shape[1]) * 2) % 16
+            or not out_down.is_contiguous()
+        ):
+            raise ValueError(
+                f"out_down must be a contiguous [{batch}, 3584..{full_down}] "
+                f"bfloat16 row-major tensor on {self.device}"
+            )
         outputs = (
-            (out_down, (1, 3584), torch.bfloat16, "out_down"),
-            (topk_weights, (1, 16), torch.float32, "topk_weights"),
-            (topk_ids, (1, 16), torch.int32, "topk_ids"),
+            (topk_weights, (batch, 16), torch.float32, "topk_weights"),
+            (topk_ids, (batch, 16), torch.int32, "topk_ids"),
         )
         for value, shape, dtype, name in outputs:
             if (
@@ -1346,6 +1697,7 @@ class PCIeDCPA2A:
                 512,
                 True,
                 True,
+                self.pair_push_transport,
             ):
                 raise RuntimeError(
                     "cold PCIe DCP Kimi CUDA graph capture is not allowed; "
@@ -1385,6 +1737,7 @@ class PCIeDCPA2A:
     ) -> None:
         from ._dcp_a2a_cute import all_gather_pair_kimi_topk
 
+        full_router_bytes = int(local_router.shape[1]) * 4 * self.world_size
         with torch.cuda.device(self.device):
             all_gather_pair_kimi_topk(
                 world_size=self.world_size,
@@ -1401,6 +1754,136 @@ class PCIeDCPA2A:
                 slot_delta_bytes=(
                     self._slot_bytes if slot == 0 else -self._slot_bytes
                 ),
+                push=self.pair_push_transport,
+                batch=int(local_down.shape[0]),
+                down_row_bytes=int(local_down.shape[1]) * 2,
+                router_row_bytes=int(local_router.shape[1]) * 4,
+                output_down_row_bytes=_clipped_row_bytes(
+                    out_down, int(local_down.shape[1]) * self.world_size
+                ),
+                output_router_row_bytes=(
+                    0 if full_router_bytes == 896 * 4 else 896 * 4
+                ),
+            )
+
+    def kimi_topk16(
+        self,
+        router_logits: torch.Tensor,
+        correction_bias: torch.Tensor,
+        output_weights: Optional[torch.Tensor] = None,
+        output_ids: Optional[torch.Tensor] = None,
+        *,
+        threads: int = 256,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Select Kimi-K3's 16 routed experts for up to ``max_batch_size``
+        tokens (the runtime's configured decode batch)."""
+
+        with _device_guard(self.device):
+            self._check_stream()
+            if self._closed:
+                raise RuntimeError("PCIeDCPA2A is closed")
+            if router_logits.ndim != 2:
+                raise ValueError(
+                    "router_logits must be a contiguous rank-2 tensor"
+                )
+            rows = int(router_logits.shape[0])
+            capacity = min(self.max_batch_size, KIMI_TOPK16_MAX_ROWS)
+            if rows <= 0 or rows > capacity:
+                raise ValueError(
+                    f"Kimi top-16 rows {rows} must be between 1 and the "
+                    f"supported capacity {capacity}"
+                )
+            expected = (
+                (
+                    router_logits,
+                    (rows, 896),
+                    torch.float32,
+                    "router_logits",
+                ),
+                (
+                    correction_bias,
+                    (896,),
+                    torch.float32,
+                    "correction_bias",
+                ),
+            )
+            for value, shape, dtype, name in expected:
+                if (
+                    value.device != self.device
+                    or value.shape != shape
+                    or value.dtype != dtype
+                    or not value.is_contiguous()
+                ):
+                    raise ValueError(
+                        f"{name} must be contiguous {shape} {dtype} on "
+                        f"{self.device}"
+                    )
+            capturing = _is_current_stream_capturing(self.device)
+            if capturing and (output_weights is None or output_ids is None):
+                raise RuntimeError(
+                    "Kimi top-16 CUDA graph capture requires caller-owned "
+                    "output_weights and output_ids"
+                )
+            if output_weights is None:
+                output_weights = torch.empty(
+                    (rows, 16), device=self.device, dtype=torch.float32
+                )
+            if output_ids is None:
+                output_ids = torch.empty(
+                    (rows, 16), device=self.device, dtype=torch.int32
+                )
+            outputs = (
+                (output_weights, torch.float32, "output_weights"),
+                (output_ids, torch.int32, "output_ids"),
+            )
+            for value, dtype, name in outputs:
+                if (
+                    value.device != self.device
+                    or value.shape != (rows, 16)
+                    or value.dtype != dtype
+                    or not value.is_contiguous()
+                ):
+                    raise ValueError(
+                        f"{name} must be contiguous {(rows, 16)} {dtype} on "
+                        f"{self.device}"
+                    )
+            if capturing:
+                from ._dcp_a2a_cute import is_kimi_topk16_prepared
+
+                if not is_kimi_topk16_prepared(threads):
+                    raise RuntimeError(
+                        "cold PCIe DCP Kimi top-16 CUDA graph capture is not "
+                        "allowed; call prepare_graph_kimi_topk16() before "
+                        "capture"
+                    )
+            self._launch_kimi_topk16(
+                router_logits,
+                correction_bias,
+                output_weights,
+                output_ids,
+                threads=threads,
+            )
+            return output_weights, output_ids
+
+    def _launch_kimi_topk16(
+        self,
+        router_logits: torch.Tensor,
+        correction_bias: torch.Tensor,
+        output_weights: torch.Tensor,
+        output_ids: torch.Tensor,
+        *,
+        threads: int,
+    ) -> None:
+        from ._dcp_a2a_cute import kimi_topk16
+
+        with torch.cuda.device(self.device):
+            kimi_topk16(
+                router_logits_ptr=router_logits.data_ptr(),
+                correction_bias_ptr=correction_bias.data_ptr(),
+                output_weights_ptr=output_weights.data_ptr(),
+                output_ids_ptr=output_ids.data_ptr(),
+                rows=int(router_logits.shape[0]),
+                threads=threads,
             )
 
     def _closed_import_indices(self) -> set[tuple[int, int]]:
@@ -1947,6 +2430,20 @@ class PCIeDCPA2APool:
                 stream, channel_id=channel_id
             ).prepare_graph_all_gather_pair_kimi_topk()
 
+    def prepare_graph_kimi_topk16(
+        self,
+        *,
+        threads: int = 256,
+        stream: object = None,
+        channel_id: Optional[str] = None,
+    ) -> None:
+        """Prepare batched Kimi expert selection before graph capture."""
+
+        with _device_guard(self.device):
+            self.for_stream(
+                stream, channel_id=channel_id
+            ).prepare_graph_kimi_topk16(threads=threads)
+
     def lse_reduce_scatter(
         self,
         partial_output: torch.Tensor,
@@ -2110,6 +2607,35 @@ class PCIeDCPA2APool:
             topk_ids,
         )
 
+    def kimi_topk16(
+        self,
+        router_logits: torch.Tensor,
+        correction_bias: torch.Tensor,
+        output_weights: Optional[torch.Tensor] = None,
+        output_ids: Optional[torch.Tensor] = None,
+        *,
+        threads: int = 256,
+        stream: object = None,
+        channel_id: Optional[str] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        channel = self.for_stream(stream, channel_id=channel_id)
+        if stream is not None and self.device.type == "cuda":
+            with torch.cuda.stream(stream):
+                return channel.kimi_topk16(
+                    router_logits,
+                    correction_bias,
+                    output_weights,
+                    output_ids,
+                    threads=threads,
+                )
+        return channel.kimi_topk16(
+            router_logits,
+            correction_bias,
+            output_weights,
+            output_ids,
+            threads=threads,
+        )
+
     @contextmanager
     def capture(self, stream: object = None, *, channel_id: Optional[str] = None):
         """Bind capture to a globally named channel.
@@ -2236,5 +2762,7 @@ __all__ = [
     "PCIeDCPA2A",
     "PCIeDCPA2APool",
     "SUPPORTED_WORLD_SIZES",
+    "kimi_topk16",
     "lse_reduce_scatter_reference",
+    "prepare_kimi_topk16",
 ]

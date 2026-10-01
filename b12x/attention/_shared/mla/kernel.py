@@ -35,6 +35,7 @@ from b12x._lib.compiler import (
 from b12x._lib.intrinsics import shared_ptr_to_u32
 
 from .decode_math import (
+    s0_load_packed_q_to_smem,
     s0_load_q_bf16_to_smem,
     s0_quantize_q_to_smem,
     s1_qk_nope_block_scaled,
@@ -77,6 +78,8 @@ _DSV4_HEAD_DIM = 512
 _GLM_HEAD_DIM = 576
 # GLM per-token packed cache record (reference.pack_mla_kv_cache_reference).
 _GLM_KV_GMEM_STRIDE = 656
+_GLM_NOPE_SCALE_BYTES_SMEM = 528  # rope offset inside a packed 656-byte staged row
+_PACKED_QUERY_RECORD_BYTES = 656  # packed query: 512 e4m3 + 16 scale + 128 rope bytes
 # DSV4 H8 packs the contiguous 576-byte data record into a 592-byte smem row.
 # The 16-byte pad preserves KV_SMEM_STRIDE/4 % 32 == 20, matching the generic
 # 464-byte row's bank rotation while allowing one bulk copy per candidate.
@@ -282,6 +285,71 @@ def _wave_balanced_num_splits(
 # land on chunk boundaries (a candidate is processed by exactly one split ->
 # multi-split is numerically identical to single-split).
 # ---------------------------------------------------------------------------
+_MLA_SM120_BALANCED_WAVES_ENV = "B12X_MLA_SM120_BALANCED_WAVES"
+_MLA_SM120_GLM_FASTPATH_ENV = "B12X_MLA_SM120_GLM_FASTPATH"
+_MLA_SM120_GLM_W_HW_DEQUANT_ENV = "B12X_MLA_SM120_GLM_W_HW_DEQUANT"
+
+
+def _env_glm_w_hw_dequant_enabled() -> bool:
+    """GLM fast path: reconstruct the W HIGH byte with cvt.rn.f16x2.e4m3x2.
+
+    Exact for every E4M3 value; the software expansion it replaces mis-decodes
+    subnormals and -0, so LOW residual bytes (and results) change slightly.
+    Off by default; requires the fast path.
+    """
+    raw = os.environ.get(_MLA_SM120_GLM_W_HW_DEQUANT_ENV)
+    return raw is not None and raw.strip().lower() in {"1", "true", "on", "yes"}
+
+
+def _env_glm_fastpath_enabled() -> bool:
+    """GLM generic (HPB=16) per-token decode fast path (sm_120a).
+
+    Packed 656-byte KV staging (one bulk copy per token), PV B-fragments via
+    ``ldmatrix.m16n16.x2.trans.b8`` and W hi/lo slots without the residual
+    serialization barrier. Bit-identical to the base path; off by default so
+    existing compile keys and PTX are unchanged.
+    """
+    raw = os.environ.get(_MLA_SM120_GLM_FASTPATH_ENV)
+    return raw is not None and raw.strip().lower() in {"1", "true", "on", "yes"}
+
+
+def _env_balanced_waves() -> float:
+    """CTA waves the balanced split policy fills (default 1.0)."""
+    raw = os.environ.get(_MLA_SM120_BALANCED_WAVES_ENV)
+    if raw is None:
+        return 1.0
+    try:
+        waves = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{_MLA_SM120_BALANCED_WAVES_ENV} must be a positive number, got {raw!r}"
+        ) from exc
+    if not waves > 0:
+        raise ValueError(
+            f"{_MLA_SM120_BALANCED_WAVES_ENV} must be a positive number, got {raw!r}"
+        )
+    return waves
+
+
+def balanced_split_target_for(
+    *,
+    num_splits: int,
+    rows: int,
+    h_blocks: int,
+    sm_count: int,
+) -> int:
+    """Return the balanced policy's bound on active splits per row.
+
+    ``floor(waves * sm_count / (rows * h_blocks))`` CTAs per row fill ``waves``
+    CTA waves (one CTA per SM); the bound is clamped to ``[1, num_splits]``.
+    The kernel additionally never uses fewer splits than the static ranges
+    would for the same row.
+    """
+    ctas_per_row = max(1, int(rows) * int(h_blocks))
+    target = int(_env_balanced_waves() * int(sm_count)) // ctas_per_row
+    return max(1, min(int(num_splits), target))
+
+
 def plan_unified_decode_splits(
     *,
     topk: int,
@@ -393,11 +461,46 @@ class UnifiedDecodeKernel:
         native_glm_h8=False,
         native_dsv4_h8=False,
         native_dsv4_h16=False,
+        balanced_splits=False,
+        glm_fastpath=False,
+        glm_w_hw_dequant=False,
+        q_packed=False,
     ):
         self.traits = traits
         self.layout = layout
         self.page_block_size = int(page_block_size)
         self.chunks_per_split = int(chunks_per_split)
+        # GLM generic (HPB=16, 8 math warps) per-token fast path: the IO warp
+        # stages each 656-byte record with one bulk copy (rope inline at +528,
+        # row stride 656 over the contiguous kv_fp8+kv_rope allocation), the PV
+        # stage loads V B-fragments with ldmatrix.m16n16.x2.trans.b8 and keeps
+        # W hi/lo in fixed slots (see decode_math.s6_xv_nope), and the epilogue
+        # maps each warp's 16 consecutive V dims. Bytes and MMA order are
+        # unchanged, so results are bit-identical to the base path.
+        self.glm_fastpath = bool(
+            glm_fastpath
+            and per_token_len
+            and int(traits.scale_format) == int(ScaleFormat.ARBITRARY_FP32)
+            and int(traits.nt_per_warp_xv) == 2
+            and not (native_glm_h8 or native_dsv4_h8 or native_dsv4_h16)
+        )
+        # Hardware E4M3 -> f16 reconstruction of the W HIGH byte for the LOW
+        # residual (fast path only; not bit-identical to the software expansion).
+        self.glm_w_hw_dequant = bool(glm_w_hw_dequant and self.glm_fastpath)
+        # Packed query: q_all is a uint8 (rows, heads, 656) record per head
+        # (E4M3 nope, four fp32 pow2 tile scales, bf16 rope) and S0 copies it
+        # into the Q stages instead of quantizing a bf16 query (GLM generic
+        # per-token entry; bit-identical to the bf16-query path).
+        self.q_packed = bool(q_packed and self.glm_fastpath)
+        # Balanced split policy (per-token single-cache entry only). False keeps
+        # the static chunk ranges ``[split * chunks_per_split, +chunks_per_split)``
+        # and the existing entry points byte-identical. True selects
+        # ``kernel_pertok_balanced``, whose runtime ``split_target`` T makes every
+        # CTA derive its range from the row's live chunk count n at replay time:
+        # chunks per split = min(ceil(n / T), chunks_per_split), so at most
+        # max(T, planned splits) splits are active with contiguous ranges of
+        # near-equal length. The launch grid stays capacity-based.
+        self.balanced_splits = bool(balanced_splits)
         self.h_blocks = int(h_blocks)
         self.num_splits = int(num_splits)
         self.num_heads = int(num_heads)
@@ -407,6 +510,7 @@ class UnifiedDecodeKernel:
         self.q_stride_row = int(q_stride[0])
         self.q_stride_head = int(q_stride[1])
         self.q_stride_dim = int(q_stride[2])
+        self.q_row_bytes = _PACKED_QUERY_RECORD_BYTES
         self.swa_indices_stride_row = int(swa_indices_stride0)
         self.extra_indices_stride_row = int(extra_indices_stride0)
         self.mid_out_stride_row = int(mid_out_stride[0])
@@ -592,6 +696,44 @@ class UnifiedDecodeKernel:
         )
 
     @cute.jit
+    def call_pertok_balanced(
+        self,
+        q_all: cute.Tensor,  # (rows, heads, D_QK) bf16
+        kv_cache_u8: cute.Tensor,  # flat (pages*page_nbytes,) u8 (MAIN cache)
+        swa_indices: cute.Tensor,  # (rows, topk) int32 (MAIN indices)
+        mid_out: cute.Tensor,  # (rows, heads, splits, D_V) bf16/f32 partials
+        mid_lse: cute.Tensor,  # (rows, heads, splits) f32 base-2 LSE
+        sm_scale_log2: Float32,
+        latent_scale: Float32,
+        topk_length: cute.Tensor,  # (rows,) int32 per-token MAIN valid length
+        stride_kv_block: Int64,  # MAIN per-block byte stride
+        split_target: Int32,  # balanced policy: active splits per row bound
+        num_tokens: Int32,
+        stream: cuda.CUstream,
+    ):
+        # SINGLE-CACHE PER-TOKEN entry with runtime-balanced chunk ranges. The
+        # grid stays capacity-based; ``split_target`` is a plain kernel argument,
+        # so one compiled kernel serves every row count and CUDA-graph replay
+        # keeps the value captured with the launch.
+        self.kernel_pertok_balanced(
+            q_all,
+            kv_cache_u8,
+            swa_indices,
+            mid_out,
+            mid_lse,
+            sm_scale_log2,
+            latent_scale,
+            topk_length,
+            stride_kv_block,
+            split_target,
+        ).launch(
+            grid=(num_tokens, self.h_blocks, self.num_splits),
+            block=[self.block_threads, 1, 1],
+            min_blocks_per_mp=1,
+            stream=stream,
+        )
+
+    @cute.jit
     def call_extra_pertok(
         self,
         q_all: cute.Tensor,
@@ -671,9 +813,6 @@ class UnifiedDecodeKernel:
         # row, and retire a wholly empty CTA before it allocates/initializes the KV
         # pipeline.  The merge treats LSE=-inf as a neutral partial and does not
         # read the corresponding (potentially stale) mid_out row.
-        cps = Int32(self.chunks_per_split)
-        split_first_chunk = split_idx * cps
-        split_last_chunk = split_first_chunk + cps
         main_valid_chunks = (section_len + Int32(_CAND_WINDOW - 1)) // Int32(
             _CAND_WINDOW
         )
@@ -682,6 +821,9 @@ class UnifiedDecodeKernel:
         max_main_chunks = Int32((self.topk + _CAND_WINDOW - 1) // _CAND_WINDOW)
         if main_valid_chunks > max_main_chunks:
             main_valid_chunks = max_main_chunks
+        cps = Int32(self.chunks_per_split)
+        split_first_chunk = split_idx * cps
+        split_last_chunk = split_first_chunk + cps
         main_chunk_end = split_last_chunk
         if main_chunk_end > main_valid_chunks:
             main_chunk_end = main_valid_chunks
@@ -980,7 +1122,7 @@ class UnifiedDecodeKernel:
                         lane,
                     )
                     p = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
-                    p, wr0, wr1 = s4_online_softmax_glm_h8_swap_ab(
+                    p, wr0, wr1, acc_nope, acc_rope, global_max, global_sum = s4_online_softmax_glm_h8_swap_ab(
                         qk,
                         p,
                         acc_nope,
@@ -998,6 +1140,7 @@ class UnifiedDecodeKernel:
                         num_threads=self.math_threads,
                         barrier_id=3,
                         rope_tiles_per_warp=(2 if self.native_dsv4_h8 else 0),
+                        return_state=True,
                     )
                     w_pre = [
                         p[0] * wr0,
@@ -1091,7 +1234,7 @@ class UnifiedDecodeKernel:
                         lane,
                     )
                     p = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
-                    p, wr0, wr1 = s4_online_softmax(
+                    p, wr0, wr1, acc_nope, acc_rope, global_max, global_sum = s4_online_softmax(
                         qk,
                         p,
                         acc_nope,
@@ -1111,6 +1254,7 @@ class UnifiedDecodeKernel:
                         num_threads=self.math_threads,
                         barrier_id=3,
                         n_acc_tiles=n_acc_tiles,
+                        return_state=True,
                     )
                     w_pre = [
                         p[0] * wr0,
@@ -1159,6 +1303,7 @@ class UnifiedDecodeKernel:
                         sm_p_full_addr=sm_p_full_addr,
                         sm_p_stride=L.sm_p_full_stride,
                         latent_scale_per_token=t.latent_scale_per_token,
+                        v_ldsm_b8=False,
                     )
 
                 # S6b (XV-RoPE) is DSV4-only (V_HAS_ROPE). const_expr-elided for GLM.
@@ -1275,6 +1420,7 @@ class UnifiedDecodeKernel:
                 nt_per_warp_xv=t.nt_per_warp_xv,
                 v_has_rope=t.v_has_rope,
                 rope_tiles_per_warp=(2 if self.native_dsv4_h8 else 1),
+                warp_contiguous_dims=False,
             )
 
     @cute.kernel
@@ -1314,6 +1460,7 @@ class UnifiedDecodeKernel:
             stride_extra_kv_block,
             swa_indices,
             extra_indices,  # length tensors unused (per_token_len=False)
+            Int32(0),
             has_extra=True,
             per_token_len=False,
         )
@@ -1354,8 +1501,49 @@ class UnifiedDecodeKernel:
             stride_kv_block,
             topk_length,
             swa_indices,
+            Int32(0),
             has_extra=False,
             per_token_len=True,
+        )
+
+    @cute.kernel
+    def kernel_pertok_balanced(
+        self,
+        q_all: cute.Tensor,
+        kv_cache_u8: cute.Tensor,
+        swa_indices: cute.Tensor,
+        mid_out: cute.Tensor,
+        mid_lse: cute.Tensor,
+        sm_scale_log2: Float32,
+        latent_scale: Float32,
+        topk_length: cute.Tensor,
+        stride_kv_block: Int64,
+        split_target: Int32,
+    ):
+        # SINGLE-CACHE PER-TOKEN entry with the balanced split policy: the
+        # runtime ``split_target`` bounds the active splits per row (see
+        # __init__). A distinct mangled name keeps ``kernel_pertok`` unchanged.
+        self._kernel_body(
+            q_all,
+            kv_cache_u8,
+            swa_indices,
+            mid_out,
+            mid_lse,
+            sm_scale_log2,
+            latent_scale,
+            Int32(0),
+            stride_kv_block,
+            kv_cache_u8,
+            swa_indices,
+            Int32(0),
+            Int32(0),
+            stride_kv_block,
+            topk_length,
+            swa_indices,
+            split_target,
+            has_extra=False,
+            per_token_len=True,
+            balanced=True,
         )
 
     @cute.kernel
@@ -1397,6 +1585,7 @@ class UnifiedDecodeKernel:
             stride_extra_kv_block,
             topk_length,
             extra_topk_length,
+            Int32(0),
             has_extra=True,
             per_token_len=True,
         )
@@ -1420,9 +1609,11 @@ class UnifiedDecodeKernel:
         stride_extra_kv_block: Int64,
         topk_length: cute.Tensor,
         extra_topk_length: cute.Tensor,
+        split_target: Int32,
         *,
         has_extra: cutlass.Constexpr,
         per_token_len: cutlass.Constexpr,
+        balanced: cutlass.Constexpr = False,
     ):
         t = self.traits
         L = self.layout
@@ -1462,10 +1653,6 @@ class UnifiedDecodeKernel:
         # and extra chunk prefixes. This also handles a short-main gap before the
         # fixed extra-section boundary. Producer and consumer use the same compact
         # order, so their mbarrier phases remain matched.
-        cps = Int32(self.chunks_per_split)
-        split_first_chunk = split_idx * cps
-        split_last_chunk = split_first_chunk + cps
-
         main_valid_chunks = (section_len + Int32(_CAND_WINDOW - 1)) // Int32(
             _CAND_WINDOW
         )
@@ -1474,6 +1661,19 @@ class UnifiedDecodeKernel:
         max_main_chunks = Int32((self.topk + _CAND_WINDOW - 1) // _CAND_WINDOW)
         if main_valid_chunks > max_main_chunks:
             main_valid_chunks = max_main_chunks
+        cps = Int32(self.chunks_per_split)
+        if cutlass.const_expr(balanced):
+            # Balanced policy over the main section only (the launcher rejects
+            # it for dual-cache launches): chunks per split =
+            # min(ceil(live main chunks / split_target), chunks_per_split), so a
+            # row never uses fewer splits than the static ranges would.
+            balanced_cps = (main_valid_chunks + split_target - Int32(1)) // split_target
+            if balanced_cps < Int32(1):
+                balanced_cps = Int32(1)
+            if balanced_cps < cps:
+                cps = balanced_cps
+        split_first_chunk = split_idx * cps
+        split_last_chunk = split_first_chunk + cps
         main_chunk_end = split_last_chunk
         if main_chunk_end > main_valid_chunks:
             main_chunk_end = main_valid_chunks
@@ -1542,7 +1742,7 @@ class UnifiedDecodeKernel:
 
         # Match the single-cache body's allocation-preserving packed H8 layout.
         staged_kv_stride = t.kv_smem_stride
-        if cutlass.const_expr(self.native_glm_h8):
+        if cutlass.const_expr(self.native_glm_h8 or self.glm_fastpath):
             staged_kv_stride = _GLM_KV_GMEM_STRIDE
         if cutlass.const_expr(self.native_dsv4_h8 or self.native_dsv4_h16):
             staged_kv_stride = _DSV4_PACKED_SMEM_STRIDE
@@ -1553,6 +1753,12 @@ class UnifiedDecodeKernel:
             kv_rope_addr = kv_fp8_addr + Int32(_DSV4_PACKED_ROPE_OFFSET)
             kv_rope_buf = kv_fp8_buf
             kv_sc_addr = kv_fp8_addr + Int32(2) * kv_fp8_buf
+        if cutlass.const_expr(self.glm_fastpath):
+            # Packed GLM record staging: rope follows the 528-byte nope+scales
+            # inside each 656-byte row of the kv_fp8 stage (the two 64x656
+            # stages exactly cover the kv_fp8 + kv_rope allocation).
+            kv_rope_addr = kv_fp8_addr + Int32(_GLM_NOPE_SCALE_BYTES_SMEM)
+            kv_rope_buf = kv_fp8_buf
         tok_buf_elems = Int32(L.token_idx_buf_bytes // 4)
 
         # mbarrier array: full[0], full[1], empty[0], empty[1] (u64 each).
@@ -1598,11 +1804,12 @@ class UnifiedDecodeKernel:
             )
         else:
             extra_row = topk_row
-        # q for THIS token row: a 2-D (heads, D_QK) view (s0 indexes [head_base+h, d]).
+        # q for THIS token row: a 2-D (heads, D_QK) view (s0 indexes [head_base+h, d]);
+        # with a packed query the row is (heads, 656) bytes.
         q_token = cute.make_tensor(
             q_all.iterator + token_idx.to(Int64) * Int64(self.q_stride_row),
             cute.make_layout(
-                (self.num_heads, self.q_head_dim),
+                (self.num_heads, self.q_row_bytes if self.q_packed else self.q_head_dim),
                 stride=(self.q_stride_head, self.q_stride_dim),
             ),
         )
@@ -1655,7 +1862,7 @@ class UnifiedDecodeKernel:
                     io_threads=self.io_threads,
                     split_mbar_arrival=self.native_dsv4_h16,
                     fp8_rope=t.fp8_rope,
-                    packed_glm=self.native_glm_h8,
+                    packed_glm=self.native_glm_h8 or self.glm_fastpath,
                     packed_dsv4=self.native_dsv4_h8 or self.native_dsv4_h16,
                     overlap_footer_gather=self.native_dsv4_h16,
                     per_token_latent_scale=t.latent_scale_per_token,
@@ -1781,7 +1988,25 @@ class UnifiedDecodeKernel:
                     cute.make_layout(int(L.w_head_sc_bytes // 4)),
                 )
 
-            if cutlass.const_expr(t.scale_format == ScaleFormat.NVFP4_E4M3):
+            if cutlass.const_expr(self.q_packed):
+                s0_load_packed_q_to_smem(
+                    q_token,
+                    q_fp8_stage,
+                    q_sc_stage_view,
+                    q_rope_stage,
+                    head_base_stage,
+                    Int32(self.valid_hpb),
+                    tid_sel,
+                    d_nope=t.d_nope,
+                    d_rope=t.d_rope,
+                    num_scales=t.num_scales,
+                    hpb=t.hpb,
+                    q_nope_stride=t.q_nope_stride,
+                    q_rope_stride=L.q_rope_stride,
+                    num_threads=nt_stage,
+                    barrier_id=2,
+                )
+            elif cutlass.const_expr(t.scale_format == ScaleFormat.NVFP4_E4M3):
                 s0_load_q_bf16_to_smem(
                     q_token,
                     q_fp8_stage,
@@ -1947,7 +2172,7 @@ class UnifiedDecodeKernel:
                         lane,
                     )
                     p = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
-                    p, wr0, wr1 = s4_online_softmax_glm_h8_swap_ab(
+                    p, wr0, wr1, acc_nope, acc_rope, global_max, global_sum = s4_online_softmax_glm_h8_swap_ab(
                         qk,
                         p,
                         acc_nope,
@@ -1968,6 +2193,7 @@ class UnifiedDecodeKernel:
                             2 if (self.native_dsv4_h8 or self.native_dsv4_h16) else 0
                         ),
                         barrier_threads=bt_stage,
+                        return_state=True,
                     )
                     w_pre = [
                         p[0] * wr0,
@@ -2036,7 +2262,7 @@ class UnifiedDecodeKernel:
                         num_scales=t.num_scales,
                         quant_tile=t.quant_tile,
                         q_nope_stride=t.q_nope_stride,
-                        kv_smem_stride=t.kv_smem_stride,
+                        kv_smem_stride=staged_kv_stride,
                         scale_bytes_per_token=8,
                         scale_format=t.scale_format,
                         latent_scale_per_token=t.latent_scale_per_token,
@@ -2050,6 +2276,9 @@ class UnifiedDecodeKernel:
                         d_rope=t.d_rope,
                         q_rope_stride=L.q_rope_stride,
                         fp8_rope=t.fp8_rope,
+                        kv_rope_stride_bytes=(
+                            _GLM_KV_GMEM_STRIDE if self.glm_fastpath else t.d_rope * 2
+                        ),
                     )
 
                     # Per-chunk section dispatch for the S3 mask: compare the
@@ -2089,7 +2318,7 @@ class UnifiedDecodeKernel:
                         )
 
                     p = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
-                    p, wr0, wr1 = s4_online_softmax(
+                    p, wr0, wr1, acc_nope, acc_rope, global_max, global_sum = s4_online_softmax(
                         qk,
                         p,
                         acc_nope,
@@ -2109,6 +2338,8 @@ class UnifiedDecodeKernel:
                         num_threads=self.math_threads,
                         barrier_id=3,
                         n_acc_tiles=n_acc_tiles,
+                        skip_unit_rescale=self.glm_fastpath,
+                        return_state=True,
                     )
                     w_pre = [
                         p[0] * wr0,
@@ -2146,7 +2377,7 @@ class UnifiedDecodeKernel:
                         v_chunk=t.quant_tile,
                         hpb=t.hpb,
                         bi=t.bi,
-                        kv_smem_stride=t.kv_smem_stride,
+                        kv_smem_stride=staged_kv_stride,
                         w_fp8_stride=t.bi + 16,
                         n_warps=8,
                         scale_bytes_per_token=8,
@@ -2157,6 +2388,8 @@ class UnifiedDecodeKernel:
                         sm_p_full_addr=sm_p_full_addr,
                         sm_p_stride=L.sm_p_full_stride,
                         latent_scale_per_token=t.latent_scale_per_token,
+                        v_ldsm_b8=self.glm_fastpath,
+                        w_hw_dequant=self.glm_w_hw_dequant,
                     )
 
                 # S6b (XV-RoPE) is DSV4-only (V_HAS_ROPE). const_expr-elided for GLM.
@@ -2275,6 +2508,7 @@ class UnifiedDecodeKernel:
                 rope_tiles_per_warp=(
                     2 if (self.native_dsv4_h8 or self.native_dsv4_h16) else 1
                 ),
+                warp_contiguous_dims=self.glm_fastpath,
             )
 
 
@@ -2378,9 +2612,21 @@ def _sparse_mla_decode_grid_flat_launch(
     has_extra: bool,
     per_token_len: bool,
     latent_scale_per_token: bool = False,
+    balanced_split_target: int = 0,
 ) -> None:
-    q_head_dim = int(q_all.shape[-1])
+    q_packed = bool(
+        q_all.dtype == torch.uint8 and int(q_all.shape[-1]) == _PACKED_QUERY_RECORD_BYTES
+    )
+    q_head_dim = _GLM_HEAD_DIM if q_packed else int(q_all.shape[-1])
     rows = int(q_all.shape[0])
+    balanced_splits = int(balanced_split_target) > 0
+    if balanced_splits and (has_extra or not per_token_len):
+        raise ValueError(
+            "SM120 sparse MLA decode balanced splits require the single-cache "
+            "per-token entry"
+        )
+    glm_fastpath = _env_glm_fastpath_enabled()
+    glm_w_hw_dequant = _env_glm_w_hw_dequant_enabled()
     heads = int(q_all.shape[1])
     native_glm_h8 = bool(
         int(model_type) == int(ModelType.GLM_NSA)
@@ -2434,13 +2680,24 @@ def _sparse_mla_decode_grid_flat_launch(
     hpb = int(traits.hpb)
     d_v = int(traits.d_v)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    q_all_cute_dtype = cutlass.Uint8 if q_packed else cutlass.BFloat16
+    # Split partials are bf16 by default; an fp32 partial workspace keeps every
+    # split result exact until the merge rounds once at the output.
+    if mid_out.dtype == torch.bfloat16:
+        mid_out_cute_dtype = cutlass.BFloat16
+    elif mid_out.dtype == torch.float32:
+        mid_out_cute_dtype = cutlass.Float32
+    else:
+        raise TypeError(
+            f"SM120 sparse MLA decode mid_out must be bf16 or fp32, got {mid_out.dtype}"
+        )
 
     if per_token_len:
         pertok_base = (
-            _to_cute(q_all, cutlass.BFloat16, dynamic_layout=True),
+            _to_cute(q_all, q_all_cute_dtype, dynamic_layout=True),
             _to_cute(kv_flat, cutlass.Uint8, align=16),
             _to_cute(swa_indices, cutlass.Int32, align=4, dynamic_layout=True),
-            _to_cute(mid_out, cutlass.BFloat16, align=16, dynamic_layout=True),
+            _to_cute(mid_out, mid_out_cute_dtype, align=16, dynamic_layout=True),
             _to_cute(mid_lse, cutlass.Float32, align=4, dynamic_layout=True),
             Float32(float(sm_scale) * LOG2_E),
             Float32(float(latent_scale)),
@@ -2457,14 +2714,16 @@ def _sparse_mla_decode_grid_flat_launch(
                 Int32(rows),
                 stream,
             )
+        elif balanced_split_target > 0:
+            args = pertok_base + (Int32(balanced_split_target), Int32(rows), stream)
         else:
             args = pertok_base + (Int32(rows), stream)
     else:
         base_args = (
-            _to_cute(q_all, cutlass.BFloat16, dynamic_layout=True),
+            _to_cute(q_all, q_all_cute_dtype, dynamic_layout=True),
             _to_cute(kv_flat, cutlass.Uint8, align=16),
             _to_cute(swa_indices, cutlass.Int32, align=4, dynamic_layout=True),
-            _to_cute(mid_out, cutlass.BFloat16, align=16, dynamic_layout=True),
+            _to_cute(mid_out, mid_out_cute_dtype, align=16, dynamic_layout=True),
             _to_cute(mid_lse, cutlass.Float32, align=4, dynamic_layout=True),
             Float32(float(sm_scale) * LOG2_E),
             Float32(float(latent_scale)),
@@ -2508,9 +2767,22 @@ def _sparse_mla_decode_grid_flat_launch(
         native_glm_h8=native_glm_h8,
         native_dsv4_h8=native_dsv4_h8,
         native_dsv4_h16=native_dsv4_h16,
+        balanced_splits=balanced_splits,
+        glm_fastpath=glm_fastpath,
+        glm_w_hw_dequant=glm_w_hw_dequant,
+        q_packed=q_packed,
     )
+    if q_packed and not kernel.q_packed:
+        raise ValueError(
+            "SM120 sparse MLA decode packed query requires the GLM generic "
+            "per-token fast path (B12X_MLA_SM120_GLM_FASTPATH=1)"
+        )
     spec_fields = [
         key_field("model_type", traits.model_type),
+        key_field("balanced_splits", int(balanced_splits)),
+        key_field("glm_fastpath", int(kernel.glm_fastpath)),
+        key_field("glm_w_hw_dequant", int(kernel.glm_w_hw_dequant)),
+        key_field("q_packed", int(kernel.q_packed)),
         key_field("compute_mode", traits.compute_mode),
         key_field("scale_format", traits.scale_format),
         key_field("fp8_rope", int(traits.fp8_rope)),
@@ -2537,7 +2809,7 @@ def _sparse_mla_decode_grid_flat_launch(
             dims=(
                 DimKey.dynamic(),
                 DimKey.exact(heads),
-                DimKey.exact(q_head_dim),
+                DimKey.exact(int(q_all.shape[-1])),
             ),
         ),
         tensor_key(
@@ -2601,7 +2873,12 @@ def _sparse_mla_decode_grid_flat_launch(
         *spec_fields,
     )
     if per_token_len:
-        entry = kernel.call_extra_pertok if has_extra else kernel.call_pertok
+        if has_extra:
+            entry = kernel.call_extra_pertok
+        elif balanced_splits:
+            entry = kernel.call_pertok_balanced
+        else:
+            entry = kernel.call_pertok
     else:
         entry = kernel.call_extra if has_extra else kernel
     b12x_launch(
@@ -2647,6 +2924,7 @@ def _sparse_mla_decode_grid_op(
     has_extra: bool,
     per_token_len: bool,
     latent_scale_per_token: bool = False,
+    balanced_split_target: int = 0,
 ) -> None:
     _sparse_mla_decode_grid_flat_launch(
         q_all,
@@ -2679,6 +2957,7 @@ def _sparse_mla_decode_grid_op(
         has_extra,
         per_token_len,
         latent_scale_per_token,
+        balanced_split_target,
     )
 
 
@@ -2714,6 +2993,7 @@ def _sparse_mla_decode_grid_fake(
     has_extra: bool,
     per_token_len: bool,
     latent_scale_per_token: bool = False,
+    balanced_split_target: int = 0,
 ) -> None:
     return None
 
@@ -2741,8 +3021,25 @@ def run_unified_decode(
     scale_format_override: int | None = None,
     fp8_rope_override: bool | None = None,
     latent_scale_per_token: bool = False,
+    split_policy: str = "static",
 ):
     """Active SM120 sparse-MLA decode: kernel (split-K partials) + merge.
+
+    ``split_policy`` selects how the launched splits partition a row's live
+    64-candidate chunks. ``"static"`` assigns split ``s`` the fixed range
+    ``[s * chunks_per_split, (s + 1) * chunks_per_split)`` of the planned
+    capacity, so a short row keeps only its leading splits busy while each of
+    them scans up to ``chunks_per_split`` chunks serially. ``"balanced"`` makes
+    each CTA derive the range from the row's live chunk count n: chunks per
+    split = ``min(ceil(n / T), chunks_per_split)`` with
+    ``T = min(num_splits, floor(waves * sm_count / (rows * head_blocks)))``
+    (``B12X_MLA_SM120_BALANCED_WAVES``, default one CTA wave), so a short row
+    spreads over up to T splits with near-equal ranges while a long row keeps
+    the static ranges. T is a runtime kernel argument of a dedicated per-token
+    entry; the grid and the workspace stay capacity-based, so both policies
+    are CUDA-graph safe. ``"balanced"`` changes which chunks each partial
+    covers and therefore the merge rounding, not the attention math. It
+    requires per-token lengths and a single-cache launch.
 
     Routes DSV4 (q_head_dim==512, UE8M0 footer) AND GLM_NSA (q_head_dim==576,
     ARBITRARY_FP32 inline scales) to the SAME warp-specialized kernel via the
@@ -2795,7 +3092,10 @@ def run_unified_decode(
                 "(q_head_dim==512); GLM/DSV3.2 has no extra cache"
             )
 
-    q_head_dim = int(q_all.shape[-1])
+    q_packed = bool(
+        q_all.dtype == torch.uint8 and int(q_all.shape[-1]) == _PACKED_QUERY_RECORD_BYTES
+    )
+    q_head_dim = _GLM_HEAD_DIM if q_packed else int(q_all.shape[-1])
     if q_head_dim not in (_DSV4_HEAD_DIM, _GLM_HEAD_DIM):
         raise NotImplementedError(
             f"SM120 sparse MLA decode supports q_head_dim 512 (DSV4) or 576 (GLM); "
@@ -3018,6 +3318,34 @@ def run_unified_decode(
         extra_topk=extra_topk,
         preferred_num_splits=preferred_num_splits,
     )
+    if split_policy not in ("static", "balanced"):
+        raise ValueError(
+            f"SM120 sparse MLA decode split_policy must be 'static' or "
+            f"'balanced', got {split_policy!r}"
+        )
+    balanced_split_target = 0
+    if split_policy == "balanced":
+        if has_extra:
+            raise ValueError(
+                "SM120 sparse MLA decode split_policy='balanced' supports "
+                "single-cache launches only"
+            )
+        if not per_token_len:
+            raise ValueError(
+                "SM120 sparse MLA decode split_policy='balanced' requires "
+                "per-token lengths (swa_topk_lengths on a CUDA device)"
+            )
+        if sm_count is None:
+            raise ValueError(
+                "SM120 sparse MLA decode split_policy='balanced' requires a CUDA "
+                "device (SM count unavailable)"
+            )
+        balanced_split_target = balanced_split_target_for(
+            num_splits=int(num_splits),
+            rows=rows,
+            h_blocks=int(h_blocks),
+            sm_count=int(sm_count),
+        )
     # Side-channel record of the chosen split plan (benchmarks / AutoTuner read
     # LAST_DECODE_PLAN["num_splits"]). Informational only.
     native_glm_h8 = bool(
@@ -3069,6 +3397,28 @@ def run_unified_decode(
         h_blocks=int(h_blocks),
         sm_count=(int(sm_count) if sm_count else None),
         per_token_len=bool(per_token_len),
+        split_policy=str(split_policy),
+        balanced_split_target=int(balanced_split_target),
+        glm_fastpath=bool(
+            _env_glm_fastpath_enabled()
+            and per_token_len
+            and int(traits.scale_format) == int(ScaleFormat.ARBITRARY_FP32)
+            and int(traits.nt_per_warp_xv) == 2
+            and not (native_glm_h8 or native_dsv4_h8 or native_dsv4_h16)
+        ),
+        glm_w_hw_dequant=bool(
+            _env_glm_w_hw_dequant_enabled()
+            and _env_glm_fastpath_enabled()
+            and per_token_len
+            and int(traits.scale_format) == int(ScaleFormat.ARBITRARY_FP32)
+            and int(traits.nt_per_warp_xv) == 2
+            and not (native_glm_h8 or native_dsv4_h8 or native_dsv4_h16)
+        ),
+        partial_dtype=(
+            str(workspace.tmp_output.dtype)
+            if workspace.tmp_output is not None
+            else None
+        ),
     )
     # Workspace mid_out/mid_lse must hold num_splits partials per (token, head).
     if num_splits > max_chunks:
@@ -3171,6 +3521,7 @@ def run_unified_decode(
             bool(has_extra),
             bool(per_token_len),
             bool(latent_scale_per_token),
+            int(balanced_split_target),
         )
 
     if h_blocks_full > 0:

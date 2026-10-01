@@ -41,8 +41,9 @@ from benchmarks.common import (
 )
 from b12x.moe._shared.kernels.w4a16.host import make_w4a16_packed_buffers
 from b12x.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
-from b12x.moe._shared.kernels.w4a16.prepare import (
-    prepare_qsrt_atom_v2_moe_weights,
+from b12x.moe._shared.kernels.w4a16.btx import prepare_btx_moe_weights
+from b12x.moe._shared.kernels.w4a16.btx_compat import (
+    lift_qsrt_atoms_v2_extent,
 )
 
 
@@ -414,21 +415,27 @@ def _prepare_profile(source: LayerSource, *, tp_rank: int, device: torch.device)
     )
 
     started = time.perf_counter()
-    prepared = prepare_qsrt_atom_v2_moe_weights(
+    btx_layer = lift_qsrt_atoms_v2_extent(
         atoms,
+        profile=source.contract.profile,
         first_atom_slot=first_atom_slot,
         layer_index=source.layer,
-        profile=source.contract.profile,
-        rotation_draws=source.rotation_draws,
         hidden_size=_HIDDEN_SIZE,
-        intermediate_size=atoms.shape[0] * _ATOM_CHANNELS,
+        global_intermediate_size=96 * _ATOM_CHANNELS,
         num_experts=_EXPERTS,
+        gate_suh=source.gate_suh,
+        up_suh=source.up_suh,
+        down_svh=source.down_svh,
+        rotation_draws=(
+            source.rotation_draws
+            if source.contract.coupled_hadamard
+            else None
+        ),
+    )
+    prepared = prepare_btx_moe_weights(
+        btx_layer,
         activation=_ACTIVATION,
-        gate_suh=source.gate_suh.unsqueeze(0).to(device),
-        up_suh=source.up_suh.unsqueeze(0).to(device),
-        down_svh=source.down_svh.unsqueeze(0).to(device),
-        params_dtype=torch.float16,
-        codebook=_CODEBOOK,
+        device=device,
         tile_config=source.contract.tile_config,
     )
     torch.cuda.synchronize(device)

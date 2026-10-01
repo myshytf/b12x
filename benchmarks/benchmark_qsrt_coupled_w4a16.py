@@ -112,21 +112,25 @@ def main() -> None:
         params_dtype=torch.float16,
         fc1_tile_n=tile_config[1],
         fc2_tile_n=tile_config[3],
-        w13_layout="trellis3_t256_proj",
+        w13_layout="trellis_t256_proj",
         trellis_bits=bits,
-        codebook="sqg_xor_cheb_t12",
+        codebook="sqg_e4m3",
         gate_suh=h_scale,
         up_suh=h_scale,
         intermediate_rotations=ordinary_i,
         down_svh=h_scale,
         tile_config=tile_config,
     )
+    assert ordinary.trellis is not None
     coupled = replace(
         ordinary,
-        intermediate_rotations=torch.cat(
-            (ordinary_i, coupled_signs), dim=1
-        ).contiguous(),
-        coupled_hadamard=True,
+        trellis=replace(
+            ordinary.trellis,
+            intermediate_rotations=torch.cat(
+                (ordinary_i, coupled_signs), dim=1
+            ).contiguous(),
+            coupled_hadamard=True,
+        ),
     )
     source = (
         torch.randn((1, h), dtype=torch.float32, device=device) * 1.0e-3

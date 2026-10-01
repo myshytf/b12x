@@ -77,7 +77,7 @@ def _run_micro_trellis(
         activation="situ",
         a8_mx_mode=True,
         scale_format="e8m0_k32",
-        weight_layout="trellis3_t256",
+        weight_layout="trellis_t256",
         trellis_bits=_BITS,
         trellis_coupled=coupled,
         share_input_across_experts=True,

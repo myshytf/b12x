@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import ctypes
+import datetime
+import json
 import os
 import socket
+import sys
 import time
 
 import pytest
@@ -25,11 +28,17 @@ pytestmark = pytest.mark.skipif(
     reason="set B12X_RUN_PCIE_DCP_A2A_TEST=1 to run PCIe DCP A2A GPU tests",
 )
 
-TOTAL_HEADS = 16
+# 16 heads serve world sizes 2/4/8/16; a multiple of 9 (18, 99) serves 9.
+TOTAL_HEADS = int(os.getenv("B12X_PCIE_DCP_A2A_TEST_TOTAL_HEADS", "16"))
 HEAD_DIM = 512
 QUERY_HEAD_DIM = 576
 MAX_BATCH = 64
 TEST_BATCHES = (1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64)
+# Paired projection gather rows: a bf16 row and an fp32 row whose bytes sum to
+# the query head dimension the channel is laid out for (512 + 64 = 576 B).
+PAIR_FIRST_WIDTH = 256
+PAIR_SECOND_WIDTH = 16
+PAIR_BATCHES = (1, 2, 4, 8, 16, 64)
 
 
 def _free_port() -> int:
@@ -104,7 +113,153 @@ def _reference(
     )
 
 
+def _rank_pair(
+    step: int,
+    source_rank: int,
+    batch: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    generator = torch.Generator(device="cpu").manual_seed(30000 * step + source_rank)
+    first = torch.randn(
+        batch, PAIR_FIRST_WIDTH, generator=generator, dtype=torch.float32
+    ).to(device=device, dtype=torch.bfloat16)
+    second = torch.randn(
+        batch, PAIR_SECOND_WIDTH, generator=generator, dtype=torch.float32
+    ).to(device=device)
+    return first, second
+
+
+def _expected_pair(
+    step: int,
+    world_size: int,
+    batch: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rows = [_rank_pair(step, source, batch, device) for source in range(world_size)]
+    return (
+        torch.cat([row[0] for row in rows], dim=1),
+        torch.cat([row[1] for row in rows], dim=1),
+    )
+
+
+def _check_pair_eager(
+    pool: PCIeDCPA2APool,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+) -> None:
+    """Paired projection gather (latent + router rows) against torch.cat."""
+    for step, batch in enumerate(PAIR_BATCHES, start=300):
+        first, second = _rank_pair(step, rank, batch, device)
+        out_first, out_second = pool.all_gather_pair(
+            first, second, channel_id="eager:dcp"
+        )
+        torch.cuda.synchronize(device)
+        expected_first, expected_second = _expected_pair(step, world_size, batch, device)
+        assert torch.equal(out_first, expected_first), f"pair first rows batch {batch}"
+        assert torch.equal(out_second, expected_second), f"pair second rows batch {batch}"
+        _stage(rank, f"pair_eager_batch{batch}_ok")
+    # Caller-owned outputs clipped to a logical width (the last rank's tail
+    # packs dropped): 8 bf16 columns and 4 fp32 columns fewer than the full
+    # gathered rows, both 16-byte multiples.
+    for step, batch in enumerate((1, 4, 8), start=400):
+        first, second = _rank_pair(step, rank, batch, device)
+        first_width = world_size * PAIR_FIRST_WIDTH - 8
+        second_width = world_size * PAIR_SECOND_WIDTH - 4
+        out_first = torch.full((batch, first_width), 7.0, dtype=torch.bfloat16, device=device)
+        out_second = torch.full((batch, second_width), 7.0, dtype=torch.float32, device=device)
+        pool.all_gather_pair(first, second, out_first, out_second, channel_id="eager:dcp")
+        torch.cuda.synchronize(device)
+        expected_first, expected_second = _expected_pair(step, world_size, batch, device)
+        assert torch.equal(out_first, expected_first[:, :first_width]), f"clipped first rows batch {batch}"
+        assert torch.equal(out_second, expected_second[:, :second_width]), f"clipped second rows batch {batch}"
+        _stage(rank, f"pair_eager_clipped_batch{batch}_ok")
+
+
+def _check_pair_graph(
+    pool: PCIeDCPA2APool,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+) -> None:
+    """Paired projection gather captured once and replayed with new inputs.
+
+    The capture alternates the two staging slots across layers; every replay
+    rewrites the captured inputs and checks the gathered rows of every layer.
+    """
+    layers = 3
+    batch = 4
+    stream = torch.cuda.Stream(device=device)
+    firsts = [
+        torch.empty(batch, PAIR_FIRST_WIDTH, dtype=torch.bfloat16, device=device)
+        for _ in range(layers)
+    ]
+    seconds = [
+        torch.empty(batch, PAIR_SECOND_WIDTH, dtype=torch.float32, device=device)
+        for _ in range(layers)
+    ]
+    out_firsts = [
+        torch.empty(
+            batch, world_size * PAIR_FIRST_WIDTH, dtype=torch.bfloat16, device=device
+        )
+        for _ in range(layers)
+    ]
+    out_seconds = [
+        torch.empty(
+            batch, world_size * PAIR_SECOND_WIDTH, dtype=torch.float32, device=device
+        )
+        for _ in range(layers)
+    ]
+    # The eager paired checks already prepared the graph (device-slot) variant
+    # of the launcher (channels are stream-affine, so no prepare call on an
+    # existing channel here); `capture` prepares the new logical channel
+    # collectively on this stream.
+    graph = torch.cuda.CUDAGraph()
+    _stage(rank, "pair_graph_capture")
+    with pool.capture(stream, channel_id="graph:pair") as graph_channel, torch.cuda.graph(
+        graph, stream=stream
+    ):
+        for layer in range(layers):
+            graph_channel.all_gather_pair(
+                firsts[layer], seconds[layer], out_firsts[layer], out_seconds[layer]
+            )
+    stream.synchronize()
+    _stage(rank, "pair_graph_captured")
+    for replay in range(4):
+        for layer in range(layers):
+            step = 4000 + 10 * replay + layer
+            first, second = _rank_pair(step, rank, batch, device)
+            firsts[layer].copy_(first)
+            seconds[layer].copy_(second)
+        torch.cuda.synchronize(device)
+        dist.barrier()
+        with torch.cuda.stream(stream):
+            graph.replay()
+        stream.synchronize()
+        for layer in range(layers):
+            step = 4000 + 10 * replay + layer
+            expected_first, expected_second = _expected_pair(
+                step, world_size, batch, device
+            )
+            assert torch.equal(out_firsts[layer], expected_first), (
+                f"pair graph first rows replay {replay} layer {layer}"
+            )
+            assert torch.equal(out_seconds[layer], expected_second), (
+                f"pair graph second rows replay {replay} layer {layer}"
+            )
+        _stage(rank, f"pair_graph_replay{replay}_ok")
+    del graph
+    torch.cuda.synchronize(device)
+
+
 def _local_staging_words(channel, stream: torch.cuda.Stream) -> tuple[int, int]:
+    """Sample one gather staging word per slot that a gather call rewrites.
+
+    Pull transport: a rank stages its own rows compactly from offset 0 of
+    its slot, so the first word is its own row 0. Push transport: a rank's
+    slot holds only its peers' rows, at their output positions, so the
+    sample is the first word of the next rank's row 0.
+    """
     assert channel._ipc is not None
     assert len(channel._owned_buffers) == 1
     layout = _staging_layout(
@@ -115,11 +270,15 @@ def _local_staging_words(channel, stream: torch.cuda.Stream) -> tuple[int, int]:
         head_dim=channel.head_dim,
         query_head_dim=channel.query_head_dim,
     )
+    row_offset = 0
+    if channel.push_transport:
+        peer = (channel.rank + 1) % channel.world_size
+        row_offset = peer * channel.heads_per_rank * channel.query_head_dim * 2
     words = (ctypes.c_uint16(), ctypes.c_uint16())
     local_ptr = channel._owned_buffers[0].local_ptr
     for word, offset in zip(
         words,
-        (layout.staging0_offset, layout.staging1_offset),
+        (layout.staging0_offset + row_offset, layout.staging1_offset + row_offset),
         strict=True,
     ):
         channel._ipc.cudaMemcpyAsync(
@@ -489,15 +648,25 @@ def _check_graph(
         for value in (11.0, 12.0):
             odd_input.fill_(value)
             channel.all_gather_heads(odd_input, odd_output)
+    # Under the push transport the sampled word is written by a peer, and a
+    # peer's next launch pushes into the other slot before its barrier, so
+    # every rank must have finished a launch before any rank samples or
+    # launches again; the rank barrier after each sample closes that window.
+    stream.synchronize()
+    dist.barrier()
     snapshots = [_local_staging_words(channel, stream)]
+    dist.barrier()
     for value in (1.0, 2.0):
         with torch.cuda.stream(stream):
             odd_input.fill_(value)
             odd_graph.replay()
+        stream.synchronize()
+        dist.barrier()
         snapshots.append(_local_staging_words(channel, stream))
         torch.testing.assert_close(
             odd_output, torch.full_like(odd_output, value), rtol=0, atol=0
         )
+        dist.barrier()
 
     changed_slots = [
         {
@@ -784,6 +953,269 @@ def _check_queued_mixed_grid_graph(
         )
 
 
+KIMI_LATENT_WIDTH = 3584
+KIMI_ROUTER_WIDTH = 896
+KIMI_PAIR_BATCHES = (1, 2, 3, 4, 5, 8)
+
+
+def _kimi_shard_width(width: int, world_size: int) -> int:
+    """This rank's share of a Kimi projection padded to whole 16-byte packs
+    (the model pads every shard to a multiple of eight elements, so nine
+    ranks hold 400 latent columns and 104 experts each)."""
+    return -(-width // world_size // 8) * 8
+
+
+def _kimi_rank_rows(
+    step: int, source_rank: int, batch: int, world_size: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Kimi decode projection shards with router logits that exercise the
+    selection's tie and non-finite handling: a few distinct values repeated
+    across experts, one row of all-equal logits, and +-inf / NaN entries."""
+    generator = torch.Generator(device="cpu").manual_seed(50000 * step + source_rank)
+    down_width = _kimi_shard_width(KIMI_LATENT_WIDTH, world_size)
+    router_width = _kimi_shard_width(KIMI_ROUTER_WIDTH, world_size)
+    down = torch.randn(batch, down_width, generator=generator, dtype=torch.float32)
+    router = torch.randn(batch, router_width, generator=generator, dtype=torch.float32)
+    # Ties: quantize half of the rows to sixteen distinct logit values.
+    quantized = (router * 2).round() / 2
+    router[: (batch + 1) // 2] = quantized[: (batch + 1) // 2]
+    if batch >= 2:
+        router[1] = 0.25  # every expert equal: ids must follow the index order
+    if batch >= 3:
+        router[2, ::7] = float("inf")
+        router[2, 3::11] = float("-inf")
+        router[2, 5::13] = float("nan")
+    # Padding columns beyond the logical width are never selected: poison them.
+    return (
+        down.to(device=device, dtype=torch.bfloat16),
+        router.to(device=device),
+    )
+
+
+def _kimi_correction_bias(world_size: int, device: torch.device) -> torch.Tensor:
+    generator = torch.Generator(device="cpu").manual_seed(777 + world_size)
+    bias = torch.randn(KIMI_ROUTER_WIDTH, generator=generator, dtype=torch.float32) * 0.1
+    bias[::5] = 0.0  # exact-zero selections must canonicalize the same way
+    return bias.to(device=device)
+
+
+def _check_pair_kimi_topk(rank: int, world_size: int, device: torch.device) -> None:
+    """The fused pair gather + expert selection equals the served two-launch
+    path (paired gather clipped to the logical widths, then the batched
+    selection kernel) bit for bit: gathered latent rows, weights and ids,
+    eagerly and under CUDA graph replay, for padded shards and batches of
+    one to eight rows."""
+    down_width = _kimi_shard_width(KIMI_LATENT_WIDTH, world_size)
+    router_width = _kimi_shard_width(KIMI_ROUTER_WIDTH, world_size)
+    combined = down_width * 2 + router_width * 4
+    pool = PCIeDCPA2APool.from_process_group(
+        process_group=dist.group.WORLD,
+        device=device,
+        max_batch_size=8,
+        total_heads=world_size,
+        head_dim=combined,
+        query_head_dim=combined,
+        max_concurrent_channels=2,
+    )
+    try:
+        pool.prepare_channels(("eager:kimi", "graph:kimi"))
+        bias = _kimi_correction_bias(world_size, device)
+        for step, batch in enumerate(KIMI_PAIR_BATCHES, start=600):
+            down, router = _kimi_rank_rows(step, rank, batch, world_size, device)
+            expected_down = torch.empty(
+                batch, KIMI_LATENT_WIDTH, dtype=torch.bfloat16, device=device
+            )
+            expected_router = torch.empty(
+                batch, KIMI_ROUTER_WIDTH, dtype=torch.float32, device=device
+            )
+            pool.all_gather_pair(
+                down, router, expected_down, expected_router, channel_id="eager:kimi"
+            )
+            expected_weights, expected_ids = pool.kimi_topk16(
+                expected_router, bias, channel_id="eager:kimi"
+            )
+            fused_down, fused_weights, fused_ids = pool.all_gather_pair_kimi_topk(
+                down, router, bias, channel_id="eager:kimi"
+            )
+            torch.cuda.synchronize(device)
+            assert torch.equal(fused_down, expected_down), f"fused latent rows batch {batch}"
+            assert torch.equal(fused_ids, expected_ids), f"fused expert ids batch {batch}"
+            assert torch.equal(
+                fused_weights.view(torch.int32), expected_weights.view(torch.int32)
+            ), f"fused expert weights batch {batch}"
+            _stage(rank, f"pair_kimi_topk_eager_batch{batch}_ok")
+
+        # Graph replay: two layers captured once, replayed with new inputs.
+        layers = 2
+        batch = 4
+        stream = torch.cuda.Stream(device=device)
+        downs = [
+            torch.empty(batch, down_width, dtype=torch.bfloat16, device=device)
+            for _ in range(layers)
+        ]
+        routers = [
+            torch.empty(batch, router_width, dtype=torch.float32, device=device)
+            for _ in range(layers)
+        ]
+        out_downs = [
+            torch.empty(batch, KIMI_LATENT_WIDTH, dtype=torch.bfloat16, device=device)
+            for _ in range(layers)
+        ]
+        out_weights = [
+            torch.empty(batch, 16, dtype=torch.float32, device=device)
+            for _ in range(layers)
+        ]
+        out_ids = [
+            torch.empty(batch, 16, dtype=torch.int32, device=device)
+            for _ in range(layers)
+        ]
+        graph = torch.cuda.CUDAGraph()
+        _stage(rank, "pair_kimi_topk_graph_capture")
+        with pool.capture(stream, channel_id="graph:kimi") as graph_channel, torch.cuda.graph(
+            graph, stream=stream
+        ):
+            for layer in range(layers):
+                graph_channel.all_gather_pair_kimi_topk(
+                    downs[layer],
+                    routers[layer],
+                    bias,
+                    out_downs[layer],
+                    out_weights[layer],
+                    out_ids[layer],
+                )
+        stream.synchronize()
+        _stage(rank, "pair_kimi_topk_graph_captured")
+        for replay in range(3):
+            for layer in range(layers):
+                step = 7000 + 10 * replay + layer
+                down, router = _kimi_rank_rows(step, rank, batch, world_size, device)
+                downs[layer].copy_(down)
+                routers[layer].copy_(router)
+            torch.cuda.synchronize(device)
+            dist.barrier()
+            with torch.cuda.stream(stream):
+                graph.replay()
+            stream.synchronize()
+            for layer in range(layers):
+                step = 7000 + 10 * replay + layer
+                down, router = _kimi_rank_rows(step, rank, batch, world_size, device)
+                expected_down = torch.empty(
+                    batch, KIMI_LATENT_WIDTH, dtype=torch.bfloat16, device=device
+                )
+                expected_router = torch.empty(
+                    batch, KIMI_ROUTER_WIDTH, dtype=torch.float32, device=device
+                )
+                pool.all_gather_pair(
+                    down, router, expected_down, expected_router, channel_id="eager:kimi"
+                )
+                expected_weights, expected_ids = pool.kimi_topk16(
+                    expected_router, bias, channel_id="eager:kimi"
+                )
+                torch.cuda.synchronize(device)
+                assert torch.equal(out_downs[layer], expected_down), f"replay {replay} layer {layer} latent"
+                assert torch.equal(out_ids[layer], expected_ids), f"replay {replay} layer {layer} ids"
+                assert torch.equal(
+                    out_weights[layer].view(torch.int32), expected_weights.view(torch.int32)
+                ), f"replay {replay} layer {layer} weights"
+            _stage(rank, f"pair_kimi_topk_graph_replay{replay}_ok")
+        torch.cuda.synchronize(device)
+        dist.barrier()
+    finally:
+        pool.close()
+
+
+
+def _time_pair_kimi_topk(rank: int, world_size: int, device: torch.device) -> None:
+    """Replay timing of the served two-launch selection (paired gather, then
+    the batched top-16 kernel) against the fused launch, for batches of one to
+    eight rows, ``B12X_PCIE_DCP_A2A_TIME_LAYERS`` layers per graph (default 30)
+    and ``B12X_PCIE_DCP_A2A_TIME_REPLAYS`` replays (default 20). Every rank
+    prints the median per-layer time; the collective's time is the slowest
+    rank's. One pool of two channels per variant (the residency preflight
+    admits 64 SMs per channel on a 188-SM device). Enabled by
+    ``B12X_PCIE_DCP_A2A_TIME=1``."""
+    import json
+    import statistics
+
+    layers = int(os.getenv("B12X_PCIE_DCP_A2A_TIME_LAYERS", "30"))
+    replays = int(os.getenv("B12X_PCIE_DCP_A2A_TIME_REPLAYS", "20"))
+    down_width = _kimi_shard_width(KIMI_LATENT_WIDTH, world_size)
+    router_width = _kimi_shard_width(KIMI_ROUTER_WIDTH, world_size)
+    combined = down_width * 2 + router_width * 4
+    bias = _kimi_correction_bias(world_size, device)
+    timings: dict[int, dict[str, float]] = {batch: {} for batch in (1, 2, 4, 8)}
+    # A captured channel id cannot be captured again, and a pool admits two
+    # channels on this device, so every (variant, batch) graph gets its own
+    # pool with one eager and one graph channel.
+    for variant in ("legacy", "fused"):
+        for batch in (1, 2, 4, 8):
+            pool = PCIeDCPA2APool.from_process_group(
+                process_group=dist.group.WORLD,
+                device=device,
+                max_batch_size=8,
+                total_heads=world_size,
+                head_dim=combined,
+                query_head_dim=combined,
+                max_concurrent_channels=2,
+            )
+            try:
+                pool.prepare_channels(("eager:time", "graph:time"))
+                stream = torch.cuda.Stream(device=device)
+                down, router = _kimi_rank_rows(9000 + batch, rank, batch, world_size, device)
+                # Eager launches prepare the launcher variant on this stream.
+                with torch.cuda.stream(stream):
+                    out_down = torch.empty(batch, KIMI_LATENT_WIDTH, dtype=torch.bfloat16, device=device)
+                    out_router = torch.empty(batch, KIMI_ROUTER_WIDTH, dtype=torch.float32, device=device)
+                    if variant == "legacy":
+                        pool.all_gather_pair(down, router, out_down, out_router, channel_id="eager:time")
+                        pool.kimi_topk16(out_router, bias, channel_id="eager:time")
+                    else:
+                        pool.all_gather_pair_kimi_topk(down, router, bias, channel_id="eager:time")
+                stream.synchronize()
+                dist.barrier()
+                out_downs = [torch.empty(batch, KIMI_LATENT_WIDTH, dtype=torch.bfloat16, device=device) for _ in range(layers)]
+                out_routers = [torch.empty(batch, KIMI_ROUTER_WIDTH, dtype=torch.float32, device=device) for _ in range(layers)]
+                out_weights = [torch.empty(batch, 16, dtype=torch.float32, device=device) for _ in range(layers)]
+                out_ids = [torch.empty(batch, 16, dtype=torch.int32, device=device) for _ in range(layers)]
+                graph = torch.cuda.CUDAGraph()
+                with pool.capture(stream, channel_id="graph:time") as channel, torch.cuda.graph(graph, stream=stream):
+                    for layer in range(layers):
+                        if variant == "legacy":
+                            channel.all_gather_pair(down, router, out_downs[layer], out_routers[layer])
+                            channel.kimi_topk16(out_routers[layer], bias, out_weights[layer], out_ids[layer])
+                        else:
+                            channel.all_gather_pair_kimi_topk(down, router, bias, out_downs[layer], out_weights[layer], out_ids[layer])
+                stream.synchronize()
+                samples = []
+                for _ in range(replays):
+                    dist.barrier()
+                    start = torch.cuda.Event(enable_timing=True)
+                    end = torch.cuda.Event(enable_timing=True)
+                    with torch.cuda.stream(stream):
+                        start.record(stream)
+                        graph.replay()
+                        end.record(stream)
+                    stream.synchronize()
+                    samples.append(start.elapsed_time(end) * 1000.0 / layers)
+                timings[batch][variant] = statistics.median(samples)
+                del graph
+                torch.cuda.synchronize(device)
+                dist.barrier()
+            finally:
+                pool.close()
+            torch.cuda.synchronize(device)
+            dist.barrier()
+    for batch in (1, 2, 4, 8):
+        print(json.dumps({"stage": "pair_kimi_topk_timing", "rank": rank, "batch": batch,
+                          "legacy_us": timings[batch]["legacy"], "fused_us": timings[batch]["fused"]}), flush=True)
+
+
+def _stage(rank: int, name: str) -> None:
+    """One JSON line per rank and check boundary, so a hang or a collective
+    sequence mismatch can be attributed to the check a rank was in."""
+    print(json.dumps({"stage": name, "rank": rank}), flush=True)
+
+
 def _worker(rank: int, world_size: int, port: int) -> None:
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
@@ -792,6 +1224,11 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         init_method=f"tcp://127.0.0.1:{port}",
         rank=rank,
         world_size=world_size,
+        # A collective that never completes fails the run after this long
+        # instead of NCCL's ten-minute default.
+        timeout=datetime.timedelta(
+            seconds=int(os.getenv("B12X_PCIE_DCP_A2A_TEST_NCCL_TIMEOUT_S", "600"))
+        ),
     )
     pool = PCIeDCPA2APool.from_process_group(
         process_group=dist.group.WORLD,
@@ -807,25 +1244,61 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         pool.prepare_channels(("eager:dcp", "graph"))
         if rank == 0:
             print("A2A GPU gate: eager", flush=True)
+        _stage(rank, "eager")
         _check_eager(pool, rank, world_size, device)
         dist.barrier()
+        _stage(rank, "eager_adjacency")
         _check_eager_adjacency(pool, rank, world_size, device)
         dist.barrier()
+        _stage(rank, "semantic_capture_warmup")
         _check_semantic_capture_warmup(pool, rank, world_size, device)
         dist.barrier()
         if rank == 0:
             print("A2A GPU gate: graph replay", flush=True)
+        _stage(rank, "graph")
         _check_graph(pool, rank, world_size, device)
         dist.barrier()
         if rank == 0:
             print("A2A GPU gate: queued mixed-grid skew", flush=True)
+        _stage(rank, "queued_mixed_grid_graph")
         _check_queued_mixed_grid_graph(pool, rank, world_size, device)
+        dist.barrier()
+        # The paired projection gather runs after the head/LSE checks so a
+        # failure in either family is attributable to it alone.
+        _stage(rank, "pair_eager")
+        _check_pair_eager(pool, rank, world_size, device)
+        dist.barrier()
+        _stage(rank, "pair_graph")
+        _check_pair_graph(pool, rank, world_size, device)
+        dist.barrier()
+        # The fused Kimi router path needs its own pool (Kimi row widths).
+        _stage(rank, "pair_kimi_topk")
+        _check_pair_kimi_topk(rank, world_size, device)
+        if os.getenv("B12X_PCIE_DCP_A2A_TIME", "0") == "1":
+            _stage(rank, "pair_kimi_topk_timing")
+            _time_pair_kimi_topk(rank, world_size, device)
+        _stage(rank, "complete")
         if rank == 0:
             print("A2A GPU gate: complete", flush=True)
         torch.cuda.synchronize(device)
         if os.getenv("B12X_PCIE_DCP_TEST_TEARDOWN_RETRY", "0") == "1":
             _check_teardown_retry(pool, rank, device)
             closed = True
+    except BaseException as exc:  # noqa: BLE001
+        # A rank that raises must fail loudly and at once: its teardown
+        # collectives would otherwise pair with the other ranks' next
+        # collectives and every rank hangs until the NCCL timeout, hiding
+        # the exception. Print the traceback and end the process.
+        import traceback
+
+        print(
+            json.dumps({"stage": "exception", "rank": rank, "error": repr(exc)[:400]}),
+            flush=True,
+        )
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(3)
     finally:
         if not closed:
             pool.close()
@@ -924,8 +1397,13 @@ def test_pcie_dcp_a2a_eager_and_cuda_graph_correctness():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
     world_size = int(os.getenv("B12X_PCIE_DCP_A2A_WORLD_SIZE", "2"))
-    if world_size not in (2, 4, 8, 16):
-        pytest.skip("PCIe DCP A2A supports world sizes 2, 4, 8, and 16")
+    if world_size not in (2, 4, 8, 9, 16):
+        pytest.skip("PCIe DCP A2A supports world sizes 2, 4, 8, 9, and 16")
+    if TOTAL_HEADS % world_size:
+        pytest.skip(
+            f"B12X_PCIE_DCP_A2A_TEST_TOTAL_HEADS={TOTAL_HEADS} is not divisible "
+            f"by world size {world_size}"
+        )
     if torch.cuda.device_count() < world_size:
         pytest.skip(
             f"need {world_size} CUDA devices, found {torch.cuda.device_count()}"

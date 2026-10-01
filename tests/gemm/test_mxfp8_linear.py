@@ -90,6 +90,85 @@ def test_mm_matches_quantized_reference_small_n() -> None:
     )
 
 
+def test_mm_persistent_ctas_complete_single_stage_epilogue_stores() -> None:
+    require_b12x()
+    require_mxf8_mma()
+
+    tokens, in_features, out_features = 1372, 128, 4096
+    source_values = torch.ones(
+        (tokens, in_features), device="cuda", dtype=torch.float8_e4m3fn
+    )
+    source_scale = torch.full(
+        (tokens, in_features // 32), 127, device="cuda", dtype=torch.uint8
+    )
+    weight = torch.ones(
+        (out_features, in_features), device="cuda", dtype=torch.float8_e4m3fn
+    )
+    weight_scale = torch.full(
+        (out_features, in_features // 32),
+        127,
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    packed = mxfp8_linear.pack_weight(weight, weight_scale)
+
+    for _ in range(4):
+        actual = mxfp8_linear.mm(
+            (source_values, source_scale), packed, expected_m=tokens
+        )
+        torch.cuda.synchronize()
+        assert torch.all(actual == in_features)
+
+
+@pytest.mark.parametrize("tokens", (2, 3, 8, 15, 16, 17, 32, 99))
+def test_mm_writes_all_rows_for_unaligned_output_width(tokens: int) -> None:
+    """A small-batch GEMM must store every live row when N spans multiple tiles."""
+    require_b12x()
+    require_mxf8_mma()
+    torch.manual_seed(20260814 + tokens)
+
+    source, _, packed = _make_inputs(tokens, 7168, 132)
+    actual = mxfp8_linear.mm(source, packed, expected_m=tokens)
+    expected = _reference_from_packed(source, packed)
+    torch.cuda.synchronize()
+
+    assert actual.shape == (tokens, 132)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(
+        actual.float(),
+        expected.to(actual.dtype).float(),
+        rtol=1e-2,
+        atol=2e-2,
+    )
+
+
+def test_mm_unaligned_output_stride_captures_and_replays() -> None:
+    require_b12x()
+    require_mxf8_mma()
+    torch.manual_seed(20260822)
+
+    source, _, packed = _make_inputs(8, 7168, 132)
+    replacement = torch.randn_like(source).div_(4)
+    mxfp8_linear.mm(source, packed)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = mxfp8_linear.mm(source, packed)
+    source.copy_(replacement)
+    expected = _reference_from_packed(source, packed)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(
+        actual.float(),
+        expected.to(actual.dtype).float(),
+        rtol=1e-2,
+        atol=2e-2,
+    )
+
+
 def test_mm_pads_k32_to_dense_tile() -> None:
     require_b12x()
     require_mxf8_mma()
@@ -136,3 +215,66 @@ def test_mm_default_fused_path_captures_with_k_padding() -> None:
     torch.cuda.synchronize()
 
     torch.testing.assert_close(actual, eager, rtol=0, atol=0)
+
+
+def test_mm_uses_quantizer_without_scale_padding_initialization(monkeypatch) -> None:
+    require_b12x()
+    require_mxf8_mma()
+    torch.manual_seed(20260903)
+
+    from b12x.gemm._shared import block_fp8
+    from b12x.gemm.mxfp8_linear import _kernel as mxfp8_kernel
+
+    calls = 0
+    original = block_fp8._quantize_block_fp8_linear_input_for_immediate_gemm
+
+    def record_call(source: torch.Tensor):
+        nonlocal calls
+        calls += 1
+        return original(source)
+
+    monkeypatch.setattr(
+        mxfp8_kernel,
+        "_quantize_block_fp8_linear_input_for_immediate_gemm",
+        record_call,
+    )
+    source, _, packed = _make_inputs(9, 256, 384)
+
+    actual = mxfp8_linear.mm(source, packed)
+    expected = _reference_from_packed(source, packed)
+    torch.cuda.synchronize()
+
+    assert calls == 1
+    torch.testing.assert_close(
+        actual.float(), expected.to(actual.dtype).float(), rtol=0, atol=0
+    )
+
+
+def test_fused_quant_a_shape_list_routes_past_the_n_cap(monkeypatch) -> None:
+    """A listed KxN shape takes the fused path above the N cap; others do not."""
+    from b12x.gemm.mxfp8_linear import _kernel as mxfp8_kernel
+
+    monkeypatch.setenv("B12X_MXFP8_LINEAR_FUSED_QUANT_A_MAX_N", "4096")
+    monkeypatch.setenv(
+        "B12X_MXFP8_LINEAR_FUSED_QUANT_A_SHAPES", " 1536x7168, 7168X4608 ,"
+    )
+    use = mxfp8_kernel._use_fused_quant_a
+    assert use(4, torch.bfloat16, 1536, 1536, 7168)
+    assert use(8, torch.bfloat16, 7168, 7168, 4608)
+    assert use(4, torch.bfloat16, 7168, 7168, 2112)
+    assert not use(4, torch.bfloat16, 1408, 1408, 7168)
+    assert not use(9, torch.bfloat16, 1536, 1536, 7168)
+    assert not use(4, torch.float16, 1536, 1536, 7168)
+    assert not use(4, torch.bfloat16, 1536, 1664, 7168)
+    monkeypatch.setenv("B12X_MXFP8_LINEAR_FUSED_QUANT_A_SHAPES", "1536x7168x2")
+    with pytest.raises(ValueError, match="KxN"):
+        use(4, torch.bfloat16, 1536, 1536, 7168)
+
+
+def test_fused_quant_a_shape_list_defaults_to_empty(monkeypatch) -> None:
+    from b12x.gemm.mxfp8_linear import _kernel as mxfp8_kernel
+
+    monkeypatch.delenv("B12X_MXFP8_LINEAR_FUSED_QUANT_A_SHAPES", raising=False)
+    monkeypatch.setenv("B12X_MXFP8_LINEAR_FUSED_QUANT_A_MAX_N", "4096")
+    assert mxfp8_kernel._fused_quant_a_shapes() == frozenset()
+    assert not mxfp8_kernel._use_fused_quant_a(4, torch.bfloat16, 1536, 1536, 7168)

@@ -8,7 +8,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from b12x.comm.pcie import kimi_topk16
 from b12x.comm.pcie.pcie_dcp_a2a import (
+    KIMI_TOPK16_MAX_ROWS,
     PCIeDCPA2A,
     PCIeDCPA2APool,
     _SINGLE_CHANNEL_ID,
@@ -29,7 +31,9 @@ class _FakeExt:
 
 
 class _FakeRuntime(PCIeDCPA2A):
-    def __init__(self) -> None:
+    pair_blocks: list = []
+
+    def __init__(self, max_batch_size: int = 4) -> None:
         self.run_calls = []
         super().__init__(
             rank=0,
@@ -38,12 +42,12 @@ class _FakeRuntime(PCIeDCPA2A):
             signal_ptrs=(100, 200),
             staging0_ptrs=(300, 400),
             staging1_ptrs=(500, 600),
-            max_batch_size=4,
+            max_batch_size=max_batch_size,
             total_heads=32,
             head_dim=64,
-            output_capacity_elems=4 * 32 * 64,
-            lse_offset=4 * 32 * 64 * 2,
-            lse_capacity=4 * 32,
+            output_capacity_elems=max_batch_size * 32 * 64,
+            lse_offset=max_batch_size * 32 * 64 * 2,
+            lse_capacity=max_batch_size * 32,
             ext_module=_FakeExt(),
         )
 
@@ -104,6 +108,7 @@ class _FakeRuntime(PCIeDCPA2A):
         slot,
         threads,
         device_slot_selection,
+        blocks=1,
     ):
         self.run_calls.append(
             (
@@ -115,11 +120,14 @@ class _FakeRuntime(PCIeDCPA2A):
                 tuple(local_second.shape),
             )
         )
+        self.pair_blocks.append(blocks)
         out_first.copy_(torch.cat((local_first, local_first), dim=1))
         out_second.copy_(torch.cat((local_second, local_second), dim=1))
 
 
 class _FakeKimiRuntime(PCIeDCPA2A):
+    kimi_calls: list = []
+
     def _launch_all_gather_pair_kimi_topk(
         self,
         local_down,
@@ -132,19 +140,61 @@ class _FakeKimiRuntime(PCIeDCPA2A):
         slot,
         device_slot_selection,
     ):
-        del local_router, correction_bias, slot, device_slot_selection
-        out_down.copy_(torch.cat((local_down,) * self.world_size, dim=1))
+        del correction_bias, slot, device_slot_selection
+        self.kimi_calls.append(
+            (tuple(local_down.shape), tuple(local_router.shape), tuple(out_down.shape))
+        )
+        gathered = torch.cat((local_down,) * self.world_size, dim=1)
+        out_down.copy_(gathered[:, : out_down.shape[1]])
         topk_weights.fill_(1.0 / 16.0)
-        topk_ids.copy_(torch.arange(16, dtype=torch.int32).view(1, 16))
+        topk_ids.copy_(
+            torch.arange(16, dtype=torch.int32)
+            .view(1, 16)
+            .expand(topk_ids.shape[0], -1)
+        )
 
-def _make_runtime() -> PCIeDCPA2A:
-    return _FakeRuntime()
+    def _launch_kimi_topk16(
+        self,
+        router_logits,
+        correction_bias,
+        output_weights,
+        output_ids,
+        *,
+        threads,
+    ):
+        del router_logits, correction_bias, threads
+        output_weights.fill_(1.0 / 16.0)
+        output_ids.copy_(
+            torch.arange(16, dtype=torch.int32)
+            .view(1, 16)
+            .expand(output_ids.shape[0], -1)
+        )
+
+
+def _make_runtime(max_batch_size: int = 4) -> PCIeDCPA2A:
+    return _FakeRuntime(max_batch_size)
+
+
+def _kimi_shard_width(width: int, world_size: int) -> int:
+    """A rank's share of a Kimi projection padded to eight elements, the
+    model's shard alignment (nine ranks: 400 latent columns, 104 experts)."""
+    return -(-width // world_size // 8) * 8
 
 
 def _make_kimi_runtime(
-    world_size: int, ext: _FakeExt | None = None
+    world_size: int,
+    ext: _FakeExt | None = None,
+    *,
+    max_batch_size: int = 8,
+    padded: bool = False,
 ) -> PCIeDCPA2A:
-    query_head_dim = 7168 // world_size + 3584 // world_size
+    if padded:
+        query_head_dim = (
+            _kimi_shard_width(3584, world_size) * 2
+            + _kimi_shard_width(896, world_size) * 4
+        )
+    else:
+        query_head_dim = 7168 // world_size + 3584 // world_size
     return _FakeKimiRuntime(
         rank=0,
         world_size=world_size,
@@ -152,12 +202,12 @@ def _make_kimi_runtime(
         signal_ptrs=tuple(range(100, 100 + world_size)),
         staging0_ptrs=tuple(range(200, 200 + world_size)),
         staging1_ptrs=tuple(range(300, 300 + world_size)),
-        max_batch_size=1,
+        max_batch_size=max_batch_size,
         total_heads=world_size,
         head_dim=query_head_dim,
-        output_capacity_elems=world_size * query_head_dim,
-        lse_offset=world_size * query_head_dim * 2,
-        lse_capacity=world_size,
+        output_capacity_elems=max_batch_size * world_size * query_head_dim,
+        lse_offset=max_batch_size * world_size * query_head_dim * 2,
+        lse_capacity=max_batch_size * world_size,
         query_head_dim=query_head_dim,
         ext_module=ext or _FakeExt(),
     )
@@ -236,12 +286,12 @@ def test_a2a_epoch_change_bumps_both_compile_specs() -> None:
         (
             kernels._get_compiled_lse_reduce_scatter,
             "comm.pcie.dcp_a2a.lse_reduce_scatter",
-            35,
+            36,
         ),
         (
             kernels._get_compiled_all_gather_heads,
             "comm.pcie.dcp_a2a.all_gather_heads",
-            12,
+            13,
         ),
     )
     for launcher, identity, version in identities:
@@ -259,12 +309,18 @@ def test_block_pair_barrier_selects_once_and_keeps_scaled_offsets_int64() -> Non
     assert "for peer in cutlass.range_constexpr(1, world_size):" not in prefix
     assert "for peer in cutlass.range_constexpr(1, world_size):" in body
     assert "peer_signal_address = Int64(signals[peer].toint())" in body
-    assert body.count("_membar_sys()") == 1
+    assert body.count("_membar_sys()") == 2
     assert body.count("_store_relaxed_sys_u32(") == 1
     assert body.count("_load_relaxed_sys_u32(") == 2
     assert "Int64(bidx) * Int64(_MAX_RANKS)" in body
     assert "Int64(tidx) * Int64(_FLAG_STRIDE)" in body
     assert body.index("_membar_sys()") < body.index("cute.arch.load(self_ptr")
+    # The second fence is the push transport's acquire, after the wait only.
+    acquire = body.split("if cutlass.const_expr(acquire):", maxsplit=1)[1]
+    assert acquire.lstrip().startswith("_membar_sys()")
+    assert body.index("while observed != value:") < body.index(
+        "if cutlass.const_expr(acquire):"
+    )
 
 
 def test_graph_slot_delta_encoding_keeps_scaled_offsets_64_bit() -> None:
@@ -295,7 +351,7 @@ def test_lse_log_base_is_a_runtime_kernel_argument() -> None:
     from b12x.comm.pcie import _dcp_a2a_cute as kernels
 
     key = kernels._lse_launcher_key(8, 0, "bf16", 256, True)
-    assert key == (8, 0, "bf16", 256, True)
+    assert key == (8, 0, "bf16", 256, True, False)
     assert "natural_log" in inspect.signature(
         kernels._LseReduceScatterLaunch.__call__
     ).parameters
@@ -456,7 +512,7 @@ def test_graph_lse_prepare_warms_shared_runtime_log_launcher(
 
     runtime.prepare_graph_lse_reduce_scatter(dtype=torch.bfloat16, threads=256)
 
-    assert calls == [(2, 0, "bf16", 256, True)]
+    assert calls == [(2, 0, "bf16", 256, True, False)]
 
 
 @pytest.mark.parametrize("natural_log", [False, True])
@@ -487,7 +543,7 @@ def test_graph_capture_checks_the_shared_runtime_log_launcher(
             is_lse_base_on_e=natural_log,
         )
 
-    assert lookups == [(2, 0, "bf16", 256, True)]
+    assert lookups == [(2, 0, "bf16", 256, True, False)]
 
 
 def test_reference_selects_destination_heads_and_combines_lse_weights():
@@ -589,6 +645,43 @@ def test_runtime_validates_and_dispatches_to_cute_plan():
     assert runtime._closed
 
 
+@pytest.mark.parametrize(
+    ("batch", "limit_env", "pair_env", "expected_blocks"),
+    (
+        (1, None, None, 1),
+        (4, None, None, 4),
+        (16, None, None, 16),
+        (24, None, None, 16),
+        (24, "8", None, 8),
+        (24, "1", None, 1),
+        (24, None, "1", 1),
+        (24, None, "32", 24),
+        (24, "8", "32", 8),
+    ),
+)
+def test_all_gather_pair_splits_batch_rows_across_blocks(
+    monkeypatch: pytest.MonkeyPatch, batch: int, limit_env, pair_env, expected_blocks: int
+) -> None:
+    """The paired gather launches min(batch, pair block limit) blocks: one
+    row per block up to _PAIR_GATHER_BLOCK_LIMIT (B12X_PCIE_DCP_PAIR_BLOCKS
+    overrides; 1 = the served single block), capped by
+    B12X_PCIE_DCP_BLOCK_LIMIT when set."""
+    for name, value in (("B12X_PCIE_DCP_BLOCK_LIMIT", limit_env), ("B12X_PCIE_DCP_PAIR_BLOCKS", pair_env)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    runtime = _make_runtime(max_batch_size=32)
+    runtime.pair_blocks = []
+    local_first = torch.arange(batch * 16, dtype=torch.bfloat16).reshape(batch, 16)
+    local_second = torch.arange(batch * 8, dtype=torch.float32).reshape(batch, 8)
+    try:
+        runtime.all_gather_pair(local_first, local_second, threads=256)
+    finally:
+        runtime.close()
+    assert runtime.pair_blocks == [expected_blocks]
+
+
 def test_first_capture_freezes_the_next_eager_slot_as_graph_base(monkeypatch) -> None:
     runtime = _make_runtime()
     partial_output = torch.zeros(1, 32, 64, dtype=torch.bfloat16)
@@ -636,6 +729,15 @@ def test_runtime_accepts_head_major_input_and_output():
     torch.testing.assert_close(actual, partial_output[:, :16])
 
 
+def test_runtime_accepts_token_major_head_tail_capacity():
+    runtime = _make_runtime()
+    storage = torch.arange(2 * 40 * 64, dtype=torch.bfloat16).reshape(2, 40, 64)
+    partial_output = storage[:, :32]
+    partial_lse = torch.zeros(2, 32, dtype=torch.float32)
+    actual = runtime.lse_reduce_scatter(partial_output, partial_lse)
+    torch.testing.assert_close(actual, partial_output[:, :16])
+
+
 @pytest.mark.parametrize("world_size", (2, 4, 8, 16))
 def test_kimi_pair_topk_dispatches_compact_outputs(world_size: int) -> None:
     ext = _FakeExt()
@@ -664,13 +766,233 @@ def test_kimi_pair_topk_dispatches_compact_outputs(world_size: int) -> None:
     runtime.close()
 
 
+@pytest.mark.parametrize("world_size", (9, 8))
+@pytest.mark.parametrize("batch", (1, 3, 8))
+def test_kimi_pair_topk_accepts_padded_shards_and_batches(
+    world_size: int, batch: int
+) -> None:
+    """Padded shards (nine ranks: 400 latent columns and 104 experts per
+    rank) and one to eight rows dispatch to the fused launch with the
+    logical 3,584-column latent output and [batch, 16] selections."""
+    runtime = _make_kimi_runtime(world_size, padded=True)
+    down_width = _kimi_shard_width(3584, world_size)
+    router_width = _kimi_shard_width(896, world_size)
+    local_down = torch.arange(
+        batch * down_width, dtype=torch.float32
+    ).to(torch.bfloat16).view(batch, down_width)
+    local_router = torch.arange(
+        batch * router_width, dtype=torch.float32
+    ).view(batch, router_width)
+    correction_bias = torch.zeros(896, dtype=torch.float32)
+    _FakeKimiRuntime.kimi_calls.clear()
+
+    down, weights, ids = runtime.all_gather_pair_kimi_topk(
+        local_down, local_router, correction_bias
+    )
+
+    assert down.shape == (batch, 3584)
+    assert weights.shape == (batch, 16)
+    assert ids.shape == (batch, 16)
+    assert _FakeKimiRuntime.kimi_calls == [
+        ((batch, down_width), (batch, router_width), (batch, 3584))
+    ]
+    torch.testing.assert_close(weights, torch.full_like(weights, 1.0 / 16.0))
+    assert torch.equal(
+        ids, torch.arange(16, dtype=torch.int32).view(1, 16).expand(batch, -1)
+    )
+    runtime.close()
+
+
+def test_kimi_pair_topk_rejects_shapes_the_fused_selection_cannot_serve() -> None:
+    runtime = _make_kimi_runtime(9, padded=True)
+    correction_bias = torch.zeros(896, dtype=torch.float32)
+    good_down = torch.zeros((1, 400), dtype=torch.bfloat16)
+    good_router = torch.zeros((1, 104), dtype=torch.float32)
+    with pytest.raises(ValueError, match="batch"):
+        runtime.all_gather_pair_kimi_topk(
+            torch.zeros((9, 400), dtype=torch.bfloat16),
+            torch.zeros((9, 104), dtype=torch.float32),
+            correction_bias,
+        )
+    with pytest.raises(ValueError, match="multiples of 16 bytes"):
+        runtime.all_gather_pair_kimi_topk(
+            torch.zeros((1, 396), dtype=torch.bfloat16),
+            torch.zeros((1, 106), dtype=torch.float32),
+            correction_bias,
+        )
+    with pytest.raises(ValueError, match="query dimension"):
+        runtime.all_gather_pair_kimi_topk(
+            torch.zeros((1, 408), dtype=torch.bfloat16),
+            good_router,
+            correction_bias,
+        )
+    with pytest.raises(ValueError, match="must cover"):
+        runtime.all_gather_pair_kimi_topk(
+            torch.zeros((1, 416), dtype=torch.bfloat16),
+            torch.zeros((1, 96), dtype=torch.float32),
+            correction_bias,
+        )
+    with pytest.raises(ValueError, match="out_down"):
+        runtime.all_gather_pair_kimi_topk(
+            good_down,
+            good_router,
+            correction_bias,
+            torch.zeros((1, 3576), dtype=torch.bfloat16),
+        )
+    runtime.close()
+
+
+def test_kimi_pair_topk_kernel_wrapper_requires_an_896_wide_router_row() -> None:
+    from b12x.comm.pcie import _dcp_a2a_cute as cute_module
+
+    kwargs = dict(
+        world_size=9,
+        rank=0,
+        local_down_ptr=16,
+        local_router_ptr=32,
+        correction_bias_ptr=48,
+        output_down_ptr=64,
+        topk_weights_ptr=80,
+        topk_ids_ptr=96,
+        staging_ptrs=tuple(range(200, 209)),
+        signal_ptrs=tuple(range(300, 309)),
+        device_slot_selection=True,
+        slot_delta_bytes=0,
+        push=True,
+    )
+    with pytest.raises(ValueError, match="896-wide"):
+        cute_module.all_gather_pair_kimi_topk(
+            **kwargs, batch=1, down_row_bytes=800, router_row_bytes=416
+        )
+    with pytest.raises(ValueError, match="one to eight rows"):
+        cute_module.all_gather_pair_kimi_topk(
+            **kwargs,
+            batch=9,
+            down_row_bytes=800,
+            router_row_bytes=416,
+            output_down_row_bytes=7168,
+            output_router_row_bytes=3584,
+        )
+    with pytest.raises(ValueError, match="sixteen warps"):
+        cute_module.all_gather_pair_kimi_topk(
+            **kwargs,
+            batch=1,
+            down_row_bytes=800,
+            router_row_bytes=416,
+            output_down_row_bytes=7168,
+            output_router_row_bytes=3584,
+            threads=256,
+        )
+
+
+@pytest.mark.parametrize("world_size", (2, 4, 8, 16))
+@pytest.mark.parametrize("rows", (1, 8))
+def test_kimi_topk16_dispatches_compact_outputs(
+    world_size: int, rows: int
+) -> None:
+    runtime = _make_kimi_runtime(world_size)
+    router_logits = torch.arange(
+        rows * 896, dtype=torch.float32
+    ).view(rows, 896)
+    correction_bias = torch.zeros(896, dtype=torch.float32)
+
+    weights, ids = runtime.kimi_topk16(router_logits, correction_bias)
+
+    assert weights.shape == (rows, 16)
+    assert ids.shape == (rows, 16)
+    torch.testing.assert_close(weights, torch.full_like(weights, 1.0 / 16.0))
+    assert torch.equal(
+        ids,
+        torch.arange(16, dtype=torch.int32).view(1, 16).expand(rows, -1),
+    )
+    runtime.close()
+
+
+@pytest.mark.parametrize("rows", (0, 9))
+def test_kimi_topk16_rejects_rows_past_the_runtime_batch(rows: int) -> None:
+    runtime = _make_kimi_runtime(2)
+    router_logits = torch.zeros((rows, 896), dtype=torch.float32)
+    correction_bias = torch.zeros(896, dtype=torch.float32)
+
+    try:
+        with pytest.raises(ValueError, match="must be between 1 and the supported capacity 8"):
+            runtime.kimi_topk16(router_logits, correction_bias)
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("rows", (9, 16, 32))
+def test_kimi_topk16_serves_the_configured_batch_past_eight_rows(rows: int) -> None:
+    runtime = _make_kimi_runtime(2, max_batch_size=32)
+    router_logits = torch.zeros((rows, 896), dtype=torch.float32)
+    correction_bias = torch.zeros(896, dtype=torch.float32)
+
+    try:
+        weights, ids = runtime.kimi_topk16(router_logits, correction_bias)
+    finally:
+        runtime.close()
+
+    assert weights.shape == (rows, 16)
+    assert ids.shape == (rows, 16)
+
+
+def test_stateless_kimi_topk16_bounds_rows_before_the_device_check() -> None:
+    too_many = KIMI_TOPK16_MAX_ROWS + 1
+    with pytest.raises(ValueError, match=f"must be between 1 and {KIMI_TOPK16_MAX_ROWS}"):
+        kimi_topk16(
+            torch.zeros((too_many, 896), dtype=torch.float32),
+            torch.zeros(896, dtype=torch.float32),
+        )
+
+
+def test_kimi_topk16_capture_requires_caller_owned_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _make_kimi_runtime(2)
+    router_logits = torch.zeros((1, 896), dtype=torch.float32)
+    correction_bias = torch.zeros(896, dtype=torch.float32)
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_dcp_a2a._is_current_stream_capturing",
+        lambda device: True,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="caller-owned output_weights"):
+            runtime.kimi_topk16(router_logits, correction_bias)
+    finally:
+        runtime.close()
+
+
+def test_stateless_kimi_topk16_rejects_cpu_tensors() -> None:
+    with pytest.raises(ValueError, match="requires CUDA tensors"):
+        kimi_topk16(
+            torch.zeros((1, 896), dtype=torch.float32),
+            torch.zeros(896, dtype=torch.float32),
+        )
+
+
+def test_stateless_kimi_topk16_requires_no_communication_state() -> None:
+    parameters = inspect.signature(kimi_topk16).parameters
+    communication_state = {
+        "rank",
+        "world_size",
+        "process_group",
+        "runtime",
+        "pool",
+        "dcp_pool",
+        "channel",
+        "channel_id",
+    }
+    assert communication_state.isdisjoint(parameters)
+
+
 @pytest.mark.parametrize("world_size", (2, 4, 8, 16))
 def test_kimi_pair_topk_graph_prewarm_uses_runtime_world_size(
     monkeypatch: pytest.MonkeyPatch,
     world_size: int,
 ) -> None:
     runtime = _make_kimi_runtime(world_size)
-    compiled: list[tuple[int, int, int, bool, bool]] = []
+    compiled: list[tuple[int, int, int, bool, bool, bool]] = []
     monkeypatch.setattr(
         "b12x.comm.pcie.pcie_dcp_a2a._is_current_stream_capturing",
         lambda device: False,
@@ -686,7 +1008,8 @@ def test_kimi_pair_topk_graph_prewarm_uses_runtime_world_size(
 
     runtime.prepare_graph_all_gather_pair_kimi_topk()
 
-    assert compiled == [(world_size, 0, 512, True, True)]
+    # The pull transport is the default; the trailing flag is the transport.
+    assert compiled == [(world_size, 0, 512, True, True, False)]
     runtime.close()
 
 
@@ -704,7 +1027,7 @@ def test_runtime_rejects_shape_dtype_and_capacity_mismatches():
             torch.zeros(5, 32, 64, dtype=torch.bfloat16),
             torch.zeros(5, 32, dtype=torch.float32),
         )
-    unsupported_view = torch.zeros(1, 33, 64, dtype=torch.bfloat16)[:, :32]
+    unsupported_view = torch.zeros(1, 32, 128, dtype=torch.bfloat16)[:, :, ::2]
     with pytest.raises(ValueError, match="packed token-major or head-major"):
         runtime.lse_reduce_scatter(unsupported_view, good_lse)
 
@@ -1422,3 +1745,765 @@ def test_pool_rejects_channel_rollback_during_capture():
 
     with pool.capture(7), pytest.raises(RuntimeError, match="during capture"):
         pool.rollback_channels(checkpoint)
+
+
+def test_a2a_transport_env_selects_push_and_rejects_unknown(monkeypatch) -> None:
+    from b12x.comm.pcie import pcie_dcp_a2a as module
+
+    monkeypatch.delenv("B12X_PCIE_DCP_A2A_TRANSPORT", raising=False)
+    assert module.a2a_transport() == "pull"
+    assert _make_runtime().transport == "pull"
+    assert not _make_runtime().push_transport
+
+    monkeypatch.setenv("B12X_PCIE_DCP_A2A_TRANSPORT", " Push ")
+    assert module.a2a_transport() == "push"
+    runtime = _make_runtime()
+    assert runtime.transport == "push"
+    assert runtime.push_transport
+
+    monkeypatch.setenv("B12X_PCIE_DCP_A2A_TRANSPORT", "copy_engine")
+    with pytest.raises(ValueError, match="B12X_PCIE_DCP_A2A_TRANSPORT"):
+        module.a2a_transport()
+    with pytest.raises(ValueError, match="B12X_PCIE_DCP_A2A_TRANSPORT"):
+        _make_runtime()
+
+
+def test_push_transport_reaches_graph_prepare_and_capture_checks(monkeypatch) -> None:
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    monkeypatch.setenv("B12X_PCIE_DCP_A2A_TRANSPORT", "push")
+    runtime = _make_runtime()
+    calls = []
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_dcp_a2a._is_current_stream_capturing",
+        lambda device: False,
+    )
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+    monkeypatch.setattr(
+        kernels,
+        "_get_compiled_lse_reduce_scatter",
+        lambda *args: calls.append(args),
+    )
+    monkeypatch.setattr(
+        kernels,
+        "_get_compiled_all_gather_heads",
+        lambda *args: calls.append(args),
+    )
+    runtime.prepare_graph_lse_reduce_scatter(dtype=torch.bfloat16, threads=256)
+    runtime.prepare_graph_all_gather_heads(threads=256)
+    assert calls == [(2, 0, "bf16", 256, True, True), (2, 0, 256, True, True)]
+
+    lookups = []
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_dcp_a2a._is_current_stream_capturing",
+        lambda device: True,
+    )
+    monkeypatch.setattr(
+        kernels,
+        "is_lse_reduce_scatter_prepared",
+        lambda *args: lookups.append(args) or False,
+    )
+    monkeypatch.setattr(
+        kernels,
+        "is_all_gather_heads_prepared",
+        lambda *args: lookups.append(args) or False,
+    )
+    partial_output = torch.zeros(1, 32, 64, dtype=torch.bfloat16)
+    partial_lse = torch.zeros(1, 32, dtype=torch.float32)
+    with pytest.raises(RuntimeError, match="cold PCIe DCP LSE"):
+        runtime.lse_reduce_scatter(partial_output, partial_lse)
+    with pytest.raises(RuntimeError, match="cold PCIe DCP gather"):
+        runtime.all_gather_heads(partial_output[:, :16].contiguous())
+    assert lookups == [(2, 0, "bf16", 256, True, True), (2, 0, 256, True, True)]
+
+
+def test_kernel_wrappers_forward_the_push_flag_to_both_launcher_variants(
+    monkeypatch,
+) -> None:
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    compiled = []
+    launched = []
+
+    def fake_compile(*args):
+        compiled.append(args)
+        return lambda *launch_args: launched.append(launch_args)
+
+    monkeypatch.setattr(kernels, "_get_compiled_lse_reduce_scatter", fake_compile)
+    monkeypatch.setattr(kernels, "_get_compiled_all_gather_heads", fake_compile)
+    kernels.lse_reduce_scatter(
+        world_size=2,
+        rank=0,
+        dtype_name="bf16",
+        threads=256,
+        local_output_ptr=16,
+        local_lse_ptr=16,
+        output_ptr=16,
+        staging_ptrs=(16, 32),
+        signal_ptrs=(16, 32),
+        lse_offset=256,
+        batch=1,
+        total_heads=32,
+        head_dim=64,
+        input_stride_batch=256,
+        input_stride_head=8,
+        output_stride_batch=128,
+        output_stride_head=8,
+        natural_log=False,
+        device_slot_selection=False,
+        slot_delta_bytes=256,
+        blocks=1,
+        push=True,
+    )
+    kernels.all_gather_heads(
+        world_size=2,
+        rank=0,
+        threads=256,
+        local_input_ptr=16,
+        output_ptr=16,
+        staging_ptrs=(16, 32),
+        signal_ptrs=(16, 32),
+        batch=1,
+        local_heads=16,
+        head_dim=64,
+        element_size=2,
+        device_slot_selection=True,
+        slot_delta_bytes=256,
+        blocks=1,
+        push=True,
+    )
+    # The eager launch also warms the graph (device slot selection) variant
+    # of the same transport.
+    assert compiled == [
+        (2, 0, "bf16", 256, False, True),
+        (2, 0, "bf16", 256, True, True),
+        (2, 0, 256, True, True),
+    ]
+    assert len(launched) == 2
+
+
+def test_launcher_keys_and_compile_specs_carry_the_transport() -> None:
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    assert kernels._lse_launcher_key(2, 0, "bf16", 256, True) == (
+        2, 0, "bf16", 256, True, False,
+    )
+    assert kernels._lse_launcher_key(2, 0, "bf16", 256, True, True)[-1] is True
+    assert kernels._gather_launcher_key(2, 0, 256, True) == (2, 0, 256, True, False)
+    assert kernels._gather_launcher_key(2, 0, 256, True, True)[-1] is True
+    for launcher in (
+        kernels._get_compiled_lse_reduce_scatter,
+        kernels._get_compiled_all_gather_heads,
+    ):
+        labels = inspect.getsource(launcher).split("labels=(", maxsplit=1)[1]
+        assert '"push",' in labels.split(")", maxsplit=1)[0]
+
+
+def test_push_lse_kernel_writes_peers_before_the_barrier_and_reads_locally() -> None:
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    source = inspect.getsource(kernels._LseReduceScatterLaunch.kernel)
+    write_phase, read_phase = source.split("block_pair_barrier(", maxsplit=1)
+    push_write = write_phase.split("if cutlass.const_expr(self._push):", 1)[1]
+    push_write = push_write.split("else:", 1)[0]
+    assert "push_row = Int64(self._rank) * Int64(rows) + Int64(row)" in push_write
+    assert "for destination_index in cutlass.range_constexpr(" in push_write
+    assert "Int64(staging[destination].toint()) + slot_offset" in push_write
+    assert "push_row * Int64(packs_per_head) * Int64(16)" in push_write
+    assert "_copy_16b_addr(" in push_write
+    assert "st_global_f32(" in push_write
+    assert "lse_offset + push_row * Int64(4)" in push_write
+    assert "local_stage_words" not in push_write
+    assert "local_stage_lse" not in push_write
+
+    barrier_args = read_phase.split(")", maxsplit=1)[0]
+    assert "acquire=self._push," in barrier_args
+    push_reads = read_phase.split("if cutlass.const_expr(self._push):")[1:]
+    assert len(push_reads) == 2
+    lse_base, payload = push_reads
+    lse_base = lse_base.split("if lane == Int32(source_index):", 1)[0]
+    assert "Int64(staging[self._rank].toint())" in lse_base
+    assert "- source_row" in lse_base
+    assert "Int64(source) * Int64(rows)" in lse_base
+    assert "staging[source]" not in lse_base
+    payload = payload.split("else:", 1)[0]
+    assert "staging[self._rank].toint()," in payload
+    assert "(Int64(source) * Int64(rows) + Int64(row))" in payload
+    assert "* Int64(packs_per_head)" in payload
+    assert "staging[source]" not in payload
+
+
+def test_push_gather_kernel_writes_output_rows_to_peers_and_copies_out_locally() -> None:
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    source = inspect.getsource(kernels._AllGatherHeadsLaunch.kernel)
+    write_phase, read_phase = source.split("block_pair_barrier(", maxsplit=1)
+    push_write = write_phase.split("if cutlass.const_expr(self._push):", 1)[1]
+    push_write = push_write.split("else:", 1)[0]
+    assert "push_base = Int64(row) * Int64(packs_per_head)" in push_write
+    assert "Int64(staging[destination].toint())" in push_write
+    assert "pack_offset = (push_base + Int64(pack)) * Int64(16)" in push_write
+    # One local load per pack, one posted store per peer.
+    assert push_write.count("ld_global_v4_u32(") == 1
+    assert push_write.count("st_global_v4_u32(") == 1
+    assert push_write.index("ld_global_v4_u32(") < push_write.index(
+        "for destination_index in cutlass.range_constexpr("
+    )
+    assert "local_stage" not in push_write
+
+    barrier_args = read_phase.split(")", maxsplit=1)[0]
+    assert "acquire=self._push," in barrier_args
+    push_read = read_phase.split("if cutlass.const_expr(self._push):", 1)[1]
+    push_read = push_read.split("else:", 1)[0]
+    assert "if source_rank != Int32(self._rank):" in push_read
+    assert "(local_stage + output_base * Int64(4)).toint()" in push_read
+    assert "staging[source]" not in push_read
+
+
+def _emulate_push_staging(world_size: int, batch: int, heads_per_rank: int, head_dim: int):
+    """Model the push transport's staging addressing on the host.
+
+    Returns, for every rank, the per-source partial tensors and LSE rows that
+    its reduce phase reads back from its own staging (or from its local input
+    for its own rank) and the gathered query tensor its copy-out phase
+    produces, both built with the kernels' index formulas: a writer stores
+    row ``row`` of destination ``d`` at compact row ``self * rows + row`` of
+    ``d``'s staging (LSE at the same compact row), and a gather writer stores
+    output row ``row`` at output position ``row`` of every peer's staging.
+    """
+
+    total_heads = world_size * heads_per_rank
+    rows = batch * heads_per_rank
+    generator = torch.Generator().manual_seed(7)
+    partials = [
+        torch.randn(batch, total_heads, head_dim, generator=generator).to(torch.bfloat16)
+        for _ in range(world_size)
+    ]
+    lses = [torch.randn(batch, total_heads, generator=generator) for _ in range(world_size)]
+    queries = [
+        torch.randn(batch, heads_per_rank, head_dim, generator=generator).to(torch.bfloat16)
+        for _ in range(world_size)
+    ]
+
+    staging = [torch.zeros(world_size * rows, head_dim, dtype=torch.bfloat16) for _ in range(world_size)]
+    staging_lse = [torch.full((world_size * rows,), float("nan")) for _ in range(world_size)]
+    gather_staging = [torch.zeros(batch * total_heads, head_dim, dtype=torch.bfloat16) for _ in range(world_size)]
+    for rank in range(world_size):
+        for row in range(rows):
+            batch_index, local_head = divmod(row, heads_per_rank)
+            push_row = rank * rows + row
+            for destination in range(world_size):
+                if destination == rank:
+                    continue
+                source_head = destination * heads_per_rank + local_head
+                staging[destination][push_row] = partials[rank][batch_index, source_head]
+                staging_lse[destination][push_row] = lses[rank][batch_index, source_head]
+        for row in range(batch * total_heads):
+            batch_index, global_head = divmod(row, total_heads)
+            if global_head // heads_per_rank != rank:
+                continue
+            local_head = global_head - rank * heads_per_rank
+            for destination in range(world_size):
+                if destination != rank:
+                    gather_staging[destination][row] = queries[rank][batch_index, local_head]
+
+    reads = []
+    gathers = []
+    for rank in range(world_size):
+        per_source = torch.empty(world_size, batch, heads_per_rank, head_dim, dtype=torch.bfloat16)
+        per_source_lse = torch.empty(world_size, batch, heads_per_rank)
+        for row in range(rows):
+            batch_index, local_head = divmod(row, heads_per_rank)
+            global_head = rank * heads_per_rank + local_head
+            source_row = batch_index * total_heads + global_head
+            for source in range(world_size):
+                if source == rank:
+                    per_source[source, batch_index, local_head] = partials[rank][batch_index, global_head]
+                    per_source_lse[source, batch_index, local_head] = lses[rank][batch_index, global_head]
+                else:
+                    compact = source * rows + row
+                    # The kernel keeps one shared ``base + source_row`` load per
+                    # lane; the push base pre-subtracts source_row.
+                    lse_index = (compact - source_row) + source_row
+                    per_source[source, batch_index, local_head] = staging[rank][compact]
+                    per_source_lse[source, batch_index, local_head] = staging_lse[rank][lse_index]
+        gathered = torch.empty(batch * total_heads, head_dim, dtype=torch.bfloat16)
+        for row in range(batch * total_heads):
+            batch_index, global_head = divmod(row, total_heads)
+            source_rank, local_head = divmod(global_head, heads_per_rank)
+            if source_rank == rank:
+                gathered[row] = queries[rank][batch_index, local_head]
+            else:
+                gathered[row] = gather_staging[rank][row]
+        reads.append((per_source, per_source_lse))
+        gathers.append(gathered.view(batch, total_heads, head_dim))
+    return partials, lses, queries, reads, gathers
+
+
+@pytest.mark.parametrize("world_size,batch", [(2, 1), (4, 3), (9, 4)])
+def test_push_staging_layout_reassembles_every_peer_row(world_size: int, batch: int) -> None:
+    heads_per_rank = 2
+    head_dim = 16
+    partials, lses, queries, reads, gathers = _emulate_push_staging(
+        world_size, batch, heads_per_rank, head_dim
+    )
+    for rank in range(world_size):
+        per_source, per_source_lse = reads[rank]
+        heads = slice(rank * heads_per_rank, (rank + 1) * heads_per_rank)
+        for source in range(world_size):
+            assert torch.equal(per_source[source], partials[source][:, heads])
+            assert torch.equal(per_source_lse[source], lses[source][:, heads])
+        assert torch.equal(gathers[rank], torch.cat(queries, dim=1))
+
+
+def test_pair_wrappers_forward_the_push_flag_to_both_launcher_variants(
+    monkeypatch,
+) -> None:
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    compiled = []
+    launched = []
+
+    def fake_compile(*args):
+        compiled.append(args)
+        return lambda *launch_args: launched.append(launch_args)
+
+    monkeypatch.setattr(kernels, "_get_compiled_all_gather_pair", fake_compile)
+    kernels.all_gather_pair(
+        world_size=2,
+        rank=0,
+        threads=512,
+        local_first_ptr=16,
+        local_second_ptr=16,
+        output_first_ptr=16,
+        output_second_ptr=16,
+        staging_ptrs=(16, 32),
+        signal_ptrs=(16, 32),
+        batch=1,
+        first_row_bytes=32,
+        second_row_bytes=16,
+        device_slot_selection=False,
+        slot_delta_bytes=256,
+        push=True,
+    )
+    kernels.all_gather_pair_kimi_topk(
+        world_size=2,
+        rank=0,
+        local_down_ptr=16,
+        local_router_ptr=16,
+        correction_bias_ptr=16,
+        output_down_ptr=16,
+        topk_weights_ptr=16,
+        topk_ids_ptr=16,
+        staging_ptrs=(16, 32),
+        signal_ptrs=(16, 32),
+        device_slot_selection=True,
+        slot_delta_bytes=256,
+        push=True,
+    )
+    # The eager pair launch also warms the graph (device slot selection)
+    # variant of the same transport; the fused Kimi variant is graph-only.
+    assert compiled == [
+        (2, 0, 512, False, False, True),
+        (2, 0, 512, True, False, True),
+        (2, 0, 512, True, True, True),
+    ]
+    assert len(launched) == 2
+
+
+def test_pair_launcher_key_and_compile_spec_carry_the_transport() -> None:
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    assert kernels._pair_launcher_key(2, 0, 512, True, False) == (
+        2, 0, 512, True, False, False,
+    )
+    assert kernels._pair_launcher_key(2, 0, 512, True, True, True)[-1] is True
+    assert kernels.is_all_gather_pair_prepared(2, 0, 512, True, False, True) is False
+    source = inspect.getsource(kernels._get_compiled_all_gather_pair)
+    labels = source.split("labels=(", maxsplit=1)[1]
+    assert '"push",' in labels.split(")", maxsplit=1)[0]
+    # The spec version moved past the transport-less, unclipped layouts; the
+    # fused Kimi selection variant moved again when it took padded shards,
+    # batches and the batched kernel's arithmetic.
+    spec = source.split("compile_spec=KernelCompileSpec.from_key(", 1)[1]
+    assert "            4 if kimi_topk else 3,\n            key," in spec
+
+
+def test_push_pair_kernel_writes_rows_to_peers_and_copies_out_locally() -> None:
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    source = inspect.getsource(kernels._AllGatherPairLaunch.kernel)
+    write_phase, read_phase = source.split("block_pair_barrier(", maxsplit=1)
+    push_write = write_phase.split("if cutlass.const_expr(self._push):", 1)[1]
+    push_write = push_write.split("else:", 1)[0]
+    # A rank's combined row (first packs, then second packs) goes to the row
+    # slot of this rank: rows are ordered by batch index, then source rank.
+    assert "+ Int64(self._rank)" in push_write
+    assert "* Int64(combined_packs)" in push_write
+    assert "if pack >= first_packs:" in push_write
+    # Destination-major: the peer loop is outer, a block streams all of its
+    # rows' packs to one peer (one non-coherent local reload per pack per
+    # peer, one posted store) into that peer's epoch slot.
+    assert push_write.count("ld_global_nc_v4_u32(") == 1
+    assert push_write.count("st_global_v4_u32(") == 1
+    assert push_write.index("for destination_index in cutlass.range_constexpr(") < push_write.index(
+        "ld_global_nc_v4_u32("
+    )
+    assert "destination_base = Int64(staging[destination].toint()) + slot_offset" in push_write
+    assert "st_global_v4_u32(\n                        destination_base + pack_offset," in push_write
+    assert "local_stage" not in push_write
+
+    barrier_args = read_phase.split(")", maxsplit=1)[0]
+    assert "acquire=self._push," in barrier_args
+    push_reads = [
+        segment.split("else:", 1)[0]
+        for segment in read_phase.split("if cutlass.const_expr(self._push):")[1:]
+    ]
+    # First rows, second rows, and the fused Kimi router-row pull.
+    assert len(push_reads) == 3
+    for segment in push_reads:
+        assert "if source_rank != Int32(self._rank):" in segment
+        assert "local_stage" in segment
+        assert "staging[source]" not in segment
+    assert "+ Int64(first_packs)" in push_reads[1]
+    assert "+ Int64(first_packs)" in push_reads[2]
+    assert "+ Int64(first_packs)" not in push_reads[0]
+
+
+def _emulate_pair_push_staging(
+    world_size: int, batch: int, first_packs: int, second_packs: int
+):
+    """Model the paired gather's push addressing on the host.
+
+    A writer stores its combined row (``first_packs`` packs of the first
+    tensor, then ``second_packs`` packs of the second) at row slot
+    ``batch_index * world_size + rank`` of every peer's staging; a reader
+    takes its own rows from its inputs and every other rank's rows from that
+    slot of its own staging. Returns the per-rank inputs and the gathered
+    outputs both readers produce.
+    """
+
+    combined = first_packs + second_packs
+    generator = torch.Generator().manual_seed(11)
+    firsts = [
+        torch.randint(0, 1 << 16, (batch, first_packs * 8), generator=generator, dtype=torch.int32)
+        .to(torch.int16)
+        for _ in range(world_size)
+    ]
+    seconds = [
+        torch.randint(0, 1 << 16, (batch, second_packs * 8), generator=generator, dtype=torch.int32)
+        .to(torch.int16)
+        for _ in range(world_size)
+    ]
+    staging = [
+        torch.zeros(batch * world_size * combined, 8, dtype=torch.int16)
+        for _ in range(world_size)
+    ]
+    for rank in range(world_size):
+        for batch_index in range(batch):
+            for pack in range(combined):
+                if pack < first_packs:
+                    values = firsts[rank][batch_index, pack * 8 : pack * 8 + 8]
+                else:
+                    offset = (pack - first_packs) * 8
+                    values = seconds[rank][batch_index, offset : offset + 8]
+                slot = (batch_index * world_size + rank) * combined + pack
+                for destination in range(world_size):
+                    if destination != rank:
+                        staging[destination][slot] = values
+    gathered_first = []
+    gathered_second = []
+    for rank in range(world_size):
+        out_first = torch.empty(batch, world_size * first_packs * 8, dtype=torch.int16)
+        out_second = torch.empty(batch, world_size * second_packs * 8, dtype=torch.int16)
+        for batch_index in range(batch):
+            for source in range(world_size):
+                for pack in range(first_packs):
+                    column = (source * first_packs + pack) * 8
+                    if source == rank:
+                        values = firsts[rank][batch_index, pack * 8 : pack * 8 + 8]
+                    else:
+                        slot = (batch_index * world_size + source) * combined + pack
+                        values = staging[rank][slot]
+                    out_first[batch_index, column : column + 8] = values
+                for pack in range(second_packs):
+                    column = (source * second_packs + pack) * 8
+                    if source == rank:
+                        values = seconds[rank][batch_index, pack * 8 : pack * 8 + 8]
+                    else:
+                        slot = (
+                            (batch_index * world_size + source) * combined
+                            + first_packs
+                            + pack
+                        )
+                        values = staging[rank][slot]
+                    out_second[batch_index, column : column + 8] = values
+        gathered_first.append(out_first)
+        gathered_second.append(out_second)
+    return firsts, seconds, gathered_first, gathered_second
+
+
+@pytest.mark.parametrize("world_size,batch", [(2, 1), (4, 3), (9, 4), (9, 8)])
+def test_pair_push_staging_layout_reassembles_every_peer_row(
+    world_size: int, batch: int
+) -> None:
+    # Kimi-K3 TP9 decode rows: 400 bf16 latent columns (50 packs) and 104
+    # fp32 router columns (26 packs).
+    firsts, seconds, gathered_first, gathered_second = _emulate_pair_push_staging(
+        world_size, batch, 50, 26
+    )
+    expected_first = torch.cat(firsts, dim=1)
+    expected_second = torch.cat(seconds, dim=1)
+    for rank in range(world_size):
+        assert torch.equal(gathered_first[rank], expected_first)
+        assert torch.equal(gathered_second[rank], expected_second)
+
+
+def test_push_transport_reaches_pair_prepare_and_capture_checks(monkeypatch) -> None:
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    monkeypatch.setenv("B12X_PCIE_DCP_A2A_TRANSPORT", "push")
+    runtime = _make_runtime()
+    calls = []
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_dcp_a2a._is_current_stream_capturing",
+        lambda device: False,
+    )
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+    monkeypatch.setattr(
+        kernels,
+        "_get_compiled_all_gather_pair",
+        lambda *args: calls.append(args),
+    )
+    runtime.prepare_graph_all_gather_pair(threads=512)
+    runtime.prepare_graph_all_gather_pair_kimi_topk()
+    assert calls == [(2, 0, 512, True, False, True), (2, 0, 512, True, True, True)]
+
+    lookups = []
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_dcp_a2a._is_current_stream_capturing",
+        lambda device: True,
+    )
+    monkeypatch.setattr(
+        kernels,
+        "is_all_gather_pair_prepared",
+        lambda *args: lookups.append(args) or False,
+    )
+    # 16 bf16 + 8 fp32 columns = 64 bytes, the fake runtime's query row.
+    first = torch.zeros(1, 16, dtype=torch.bfloat16)
+    second = torch.zeros(1, 8, dtype=torch.float32)
+    with pytest.raises(RuntimeError, match="cold PCIe DCP paired gather"):
+        runtime.all_gather_pair(first, second, threads=512)
+    assert lookups == [(2, 0, 512, True, False, True)]
+
+
+def test_kimi_topk_select_env_and_prepared_key(monkeypatch) -> None:
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    monkeypatch.delenv("B12X_PCIE_KIMI_TOPK_SELECT", raising=False)
+    assert kernels.kimi_topk_select() == "register"
+    monkeypatch.setenv("B12X_PCIE_KIMI_TOPK_SELECT", " Scan ")
+    assert kernels.kimi_topk_select() == "scan"
+    monkeypatch.setenv("B12X_PCIE_KIMI_TOPK_SELECT", "bitonic")
+    with pytest.raises(ValueError, match="B12X_PCIE_KIMI_TOPK_SELECT"):
+        kernels.kimi_topk_select()
+    monkeypatch.delenv("B12X_PCIE_KIMI_TOPK_SELECT", raising=False)
+    # The prepared set is keyed by (threads, selection); nothing compiled here.
+    assert kernels.is_kimi_topk16_prepared(256) is False
+    assert kernels.is_kimi_topk16_prepared(256, "scan") is False
+    with pytest.raises(ValueError, match="unknown Kimi top-16 selection"):
+        kernels._KimiTopK16Launch(256, "bitonic")
+    with pytest.raises(ValueError, match="at least four warps"):
+        kernels._KimiTopK16Launch(64, "register")
+    source = inspect.getsource(kernels._get_compiled_kimi_topk16)
+    spec = source.split("compile_spec=KernelCompileSpec.from_key(", 1)[1]
+    assert '"comm.pcie.dcp_a2a.kimi_topk16",\n            2,' in spec
+    assert 'labels=("threads", "select")' in spec
+
+
+def test_pair_wrapper_forwards_clipped_output_rows(monkeypatch) -> None:
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    launched = []
+    monkeypatch.setattr(
+        kernels,
+        "_get_compiled_all_gather_pair",
+        lambda *args: (lambda *launch_args: launched.append(launch_args)),
+    )
+    common = dict(
+        world_size=9,
+        rank=0,
+        threads=512,
+        local_first_ptr=16,
+        local_second_ptr=16,
+        output_first_ptr=16,
+        output_second_ptr=16,
+        staging_ptrs=tuple(range(16, 16 + 9 * 16, 16)),
+        signal_ptrs=tuple(range(16, 16 + 9 * 16, 16)),
+        batch=4,
+        first_row_bytes=800,
+        second_row_bytes=416,
+        device_slot_selection=True,
+        slot_delta_bytes=256,
+        push=True,
+    )
+    # Kimi-K3 TP9 decode: 400 bf16 latent columns and 104 fp32 router columns
+    # per rank, clipped to the logical 3584 (7168 B) and 896 (3584 B).
+    kernels.all_gather_pair(**common, output_first_row_bytes=7168, output_second_row_bytes=3584)
+    assert launched[-1][-7:] == (4, 50, 26, 1, 448, 224, 1)
+    kernels.all_gather_pair(**common)
+    assert launched[-1][-7:] == (4, 50, 26, 1, 0, 0, 1)
+    kernels.all_gather_pair(**common, blocks=4)
+    assert launched[-1][-7:] == (4, 50, 26, 1, 0, 0, 4)
+    with pytest.raises(ValueError, match="multiples of 16 bytes"):
+        kernels.all_gather_pair(**common, output_first_row_bytes=7160)
+    with pytest.raises(ValueError, match="exceeds the gathered width"):
+        kernels.all_gather_pair(**common, output_second_row_bytes=416 * 9 + 16)
+
+
+def test_pair_kernel_clips_output_rows_to_the_logical_width() -> None:
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    source = inspect.getsource(kernels._AllGatherPairLaunch.kernel)
+    read_phase = source.split("block_pair_barrier(", maxsplit=1)[1]
+    for prefix in ("first", "second"):
+        assert f"{prefix}_row_packs = Int32(self._world_size) * {prefix}_packs" in read_phase
+        assert f"if output_{prefix}_packs > Int32(0):" in read_phase
+        assert f"{prefix}_row_packs = output_{prefix}_packs" in read_phase
+        # Rows split across blocks (block b: rows b, b + gridDim.x, ...); the
+        # block's threads stride over its rows' clipped packs and place each
+        # pack at its row-major output offset.
+        assert f"while flat < block_rows * {prefix}_row_packs:" in read_phase
+        assert f"row_pack = flat - local_row * {prefix}_row_packs" in read_phase
+        assert f"linear = batch_index * {prefix}_row_packs + row_pack" in read_phase
+        assert f"source_rank = row_pack // {prefix}_packs" in read_phase
+    assert read_phase.count("batch_index = Int32(bidx) + local_row * Int32(gdim)") == 2
+    assert read_phase.count("block_rows = (batch - Int32(bidx) + Int32(gdim) - Int32(1)) // Int32(gdim)") == 2
+
+
+def test_pair_kernel_graph_epoch_counts_every_block() -> None:
+    """Under device slot selection each block arrives on the graph epoch and
+    the last of gridDim.x arrivals advances it; a per-launch count of one
+    (the single-block kernel) would advance the epoch once per block and
+    desynchronize the slot of the next replayed launch (caught by the
+    nine-GPU graph test on 2026-09-26)."""
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    source = inspect.getsource(kernels._AllGatherPairLaunch.kernel)
+    assert source.count("_a2a_graph_epoch_arrive(") == 1
+    call = source.rsplit("_a2a_graph_epoch_arrive(", maxsplit=1)[1]
+    call = call[: call.index("\n                )")]
+    assert "Uint32(gdim)," in call, call
+    assert "Uint32(1)" not in call, call
+
+
+def test_runtime_accepts_logical_width_pair_outputs() -> None:
+    from b12x.comm.pcie.pcie_dcp_a2a import _clipped_row_bytes
+
+    runtime = _make_runtime()
+    launches = []
+    # The fake runtime's launch copies full-width rows; record the call instead.
+    runtime._launch_all_gather_pair = lambda *args, **kwargs: launches.append((args, kwargs))
+    first = torch.zeros(2, 16, dtype=torch.bfloat16)
+    second = torch.zeros(2, 8, dtype=torch.float32)
+    out_first = torch.empty(2, 24, dtype=torch.bfloat16)   # 32 of 32 columns clipped to 24
+    out_second = torch.empty(2, 12, dtype=torch.float32)   # 16 of 16 columns clipped to 12
+    got_first, got_second = runtime.all_gather_pair(first, second, out_first, out_second)
+    assert got_first is out_first and got_second is out_second
+    assert len(launches) == 1 and launches[0][0][2] is out_first
+    assert _clipped_row_bytes(out_first, 32) == 48
+    assert _clipped_row_bytes(out_second, 16) == 48
+    assert _clipped_row_bytes(torch.empty(2, 32, dtype=torch.bfloat16), 32) == 0
+    with pytest.raises(ValueError, match="narrower 16-byte-aligned row"):
+        runtime.all_gather_pair(first, second, torch.empty(2, 20, dtype=torch.bfloat16), None)
+    with pytest.raises(ValueError, match="narrower 16-byte-aligned row"):
+        runtime.all_gather_pair(first, second, torch.empty(2, 40, dtype=torch.bfloat16), None)
+    runtime.close()
+
+
+@pytest.mark.parametrize("world_size,batch", [(9, 4)])
+def test_pair_push_staging_layout_clipped_rows(world_size: int, batch: int) -> None:
+    firsts, seconds, gathered_first, gathered_second = _emulate_pair_push_staging(
+        world_size, batch, 50, 26
+    )
+    # Clipping the reassembled rows to the logical widths keeps the leading
+    # columns of every rank in order and drops only the last rank's tail.
+    first_logical = 3584
+    second_logical = 896 * 2  # int16 pairs stand in for fp32 words
+    expected_first = torch.cat(firsts, dim=1)[:, :first_logical]
+    expected_second = torch.cat(seconds, dim=1)[:, :second_logical]
+    for rank in range(world_size):
+        assert torch.equal(gathered_first[rank][:, :first_logical], expected_first)
+        assert torch.equal(gathered_second[rank][:, :second_logical], expected_second)
+
+
+def test_pair_transport_override_env(monkeypatch) -> None:
+    from b12x.comm.pcie import pcie_dcp_a2a as module
+
+    monkeypatch.delenv("B12X_PCIE_DCP_A2A_PAIR_TRANSPORT", raising=False)
+    assert module.a2a_pair_transport("pull") == "pull"
+    assert module.a2a_pair_transport("push") == "push"
+    monkeypatch.setenv("B12X_PCIE_DCP_A2A_TRANSPORT", "push")
+    runtime = _make_runtime()
+    assert runtime.push_transport and runtime.pair_push_transport
+    monkeypatch.setenv("B12X_PCIE_DCP_A2A_PAIR_TRANSPORT", " Pull ")
+    assert module.a2a_pair_transport("push") == "pull"
+    assert runtime.push_transport and not runtime.pair_push_transport
+    monkeypatch.setenv("B12X_PCIE_DCP_A2A_PAIR_TRANSPORT", "copy_engine")
+    with pytest.raises(ValueError, match="B12X_PCIE_DCP_A2A_PAIR_TRANSPORT"):
+        module.a2a_pair_transport("push")
+    runtime.close()
+
+
+def test_pair_transport_override_reaches_pair_prepare(monkeypatch) -> None:
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    monkeypatch.setenv("B12X_PCIE_DCP_A2A_TRANSPORT", "push")
+    monkeypatch.setenv("B12X_PCIE_DCP_A2A_PAIR_TRANSPORT", "pull")
+    runtime = _make_runtime()
+    calls = []
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_dcp_a2a._is_current_stream_capturing",
+        lambda device: False,
+    )
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+    monkeypatch.setattr(
+        kernels, "_get_compiled_all_gather_pair", lambda *args: calls.append(args)
+    )
+    monkeypatch.setattr(
+        kernels, "_get_compiled_all_gather_heads", lambda *args: calls.append(args)
+    )
+    runtime.prepare_graph_all_gather_pair(threads=512)
+    runtime.prepare_graph_all_gather_heads(threads=256)
+    # The pair prepares with pull while the head gather keeps push.
+    assert calls == [(2, 0, 512, True, False, False), (2, 0, 256, True, True)]
+    runtime.close()
+
+
+
+def test_per_operation_launch_overrides_take_precedence(monkeypatch):
+    """``B12X_PCIE_DCP_{LSE,HEADS}_{THREADS,BLOCK_LIMIT}`` retune one
+    collective over the global ``B12X_PCIE_DCP_*`` geometry; the paired
+    gather keeps the global setting."""
+    monkeypatch.setenv("B12X_PCIE_DCP_THREADS", "512")
+    monkeypatch.setenv("B12X_PCIE_DCP_BLOCK_LIMIT", "8")
+    monkeypatch.setenv("B12X_PCIE_DCP_LSE_THREADS", "64")
+    monkeypatch.setenv("B12X_PCIE_DCP_LSE_BLOCK_LIMIT", "32")
+    monkeypatch.setenv("B12X_PCIE_DCP_HEADS_THREADS", "128")
+    runtime = _make_runtime()
+    partial_output = torch.zeros(2, 32, 64, dtype=torch.bfloat16)
+    partial_lse = torch.zeros(2, 32, dtype=torch.float32)
+
+    runtime.lse_reduce_scatter(partial_output, partial_lse, threads=256, block_limit=16)
+    # 2 rows x 16 heads per rank over 2 warps per block -> 16 blocks (limit 32).
+    assert runtime.run_calls[-1][2:4] == (64, 16)
+    runtime.all_gather_heads(partial_output[:, :16].contiguous(), threads=256)
+    # 2 x 32 gathered rows over 4 warps per block, global block limit 8.
+    assert runtime.run_calls[-1][2:4] == (128, 8)
+    runtime.all_gather_pair(
+        torch.zeros(2, 16, dtype=torch.bfloat16),
+        torch.zeros(2, 8, dtype=torch.float32),
+        threads=256,
+    )
+    assert runtime.run_calls[-1][2] == 512
+    runtime.close()

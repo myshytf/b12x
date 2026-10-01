@@ -1029,6 +1029,39 @@ def ldmatrix_m8n8x4_right_half_b16(
 
 
 @dsl_user_op
+def ldmatrix_m16n16x2_trans_b8(
+    smem_addr: Int32, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32, Uint32, Uint32]:
+    """Issue ``ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8`` (sm_120a).
+
+    Two 16x16 byte matrices; lanes 0-15 supply the 16-byte row addresses of
+    matrix 0 and lanes 16-31 those of matrix 1. Each returned register holds
+    four bytes of one *column*: lane ``i`` receives column ``i // 4`` (r0, r2)
+    and column ``i // 4 + 8`` (r1, r3) at rows ``4 * (i % 4) .. +3`` of matrix
+    0 (r0, r1) and matrix 1 (r2, r3). With rows = K (tokens) and columns = N
+    (dims) this is exactly the ``mma.m16n8k32`` B fragment: for dims
+    ``[d, d+8)`` b0 = r0 (K 0-15), b1 = r2 (K 16-31); for dims ``[d+8, d+16)``
+    b0 = r1, b1 = r3. Row addresses must be 16-byte aligned.
+    """
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+        "ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    r0 = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
+    r1 = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    r2 = llvm.extractvalue(T.i32(), result, [2], loc=loc, ip=ip)
+    r3 = llvm.extractvalue(T.i32(), result, [3], loc=loc, ip=ip)
+    return Uint32(r0), Uint32(r1), Uint32(r2), Uint32(r3)
+
+
+@dsl_user_op
 def ldmatrix_m8n8x4_trans_b16(
     smem_addr: Int32, *, loc=None, ip=None
 ) -> Tuple[Uint32, Uint32, Uint32, Uint32]:
@@ -1538,6 +1571,37 @@ def red_add_global_f32(addr: Int64, val: Float32, *, loc=None, ip=None):
         ],
         "red.global.add.f32 [$0], $1;",
         "l,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def red_add_global_v4_f32(
+    addr: Int64,
+    val0: Float32,
+    val1: Float32,
+    val2: Float32,
+    val3: Float32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Reduce-add four FP32 elements at a 16-byte-aligned address."""
+    llvm.inline_asm(
+        None,
+        [
+            Int64(addr).ir_value(loc=loc, ip=ip),
+            Float32(val0).ir_value(loc=loc, ip=ip),
+            Float32(val1).ir_value(loc=loc, ip=ip),
+            Float32(val2).ir_value(loc=loc, ip=ip),
+            Float32(val3).ir_value(loc=loc, ip=ip),
+        ],
+        "red.relaxed.gpu.global.v4.f32.add [$0], {$1, $2, $3, $4};",
+        "l,f,f,f,f",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -2070,6 +2134,24 @@ def ld_global_acquire_i32(addr: Int64, *, loc=None, ip=None) -> Int32:
             [Int64(addr).ir_value(loc=loc, ip=ip)],
             "ld.global.acquire.gpu.s32 $0, [$1];",
             "=r,l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def ld_globaltimer_lo_i32(*, loc=None, ip=None) -> Int32:
+    """Read the low 32 bits of the nanosecond ``%globaltimer`` register."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [],
+            "mov.u32 $0, %globaltimer_lo;",
+            "=r",
             has_side_effects=True,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -4153,75 +4235,66 @@ def nvfp4_scale_from_amax(
 
 @dsl_user_op
 def fp8_e4m3_to_f32(fp8_val: Uint32, *, loc=None, ip=None) -> Float32:
-    """Convert FP8 E4M3 to float32."""
+    """Decode the low E4M3 byte, including subnormals and signed zero.
+
+    The hardware conversion is exact for every E4M3 value (E4M3 is a subset
+    of FP16). The software expansion it replaces decoded exponent-field-0
+    bytes as normal numbers (2^-7 * (1 + m/8) instead of 2^-6 * m/8) and -0
+    as -2^-7, which corrupted the high/low residual split of the MLA
+    probability operands for values below 2^-6 of the quantization scale.
+    """
     return Float32(
         llvm.inline_asm(
             T.f32(),
             [Uint32(fp8_val).ir_value(loc=loc, ip=ip)],
             """
             {
-                .reg .pred p_zero, p_neg;
-                .reg .u32 sign_u, exp_u, mant_u;
-                .reg .s32 exp_s;
-                .reg .f32 exp_f, mant_f, fp8_float, fp8_neg;
-
-                setp.eq.u32 p_zero, $1, 0;
-                and.b32 sign_u, $1, 0x80;
-                and.b32 mant_u, $1, 7;
-                shr.b32 exp_u, $1, 3;
-                and.b32 exp_u, exp_u, 15;
-                sub.s32 exp_s, exp_u, 7;
-                cvt.rn.f32.s32 exp_f, exp_s;
-                ex2.approx.f32 exp_f, exp_f;
-                cvt.rn.f32.u32 mant_f, mant_u;
-                fma.rn.f32 mant_f, mant_f, 0f3E000000, 0f3F800000;
-                mul.f32 fp8_float, exp_f, mant_f;
-                neg.f32 fp8_neg, fp8_float;
-                setp.ne.u32 p_neg, sign_u, 0;
-                selp.f32 fp8_float, fp8_neg, fp8_float, p_neg;
-                selp.f32 $0, 0f00000000, fp8_float, p_zero;
+                .reg .b16 source, low, high;
+                .reg .b32 pair;
+                cvt.u16.u32 source, $1;
+                cvt.rn.f16x2.e4m3x2 pair, source;
+                mov.b32 {low, high}, pair;
+                cvt.f32.f16 $0, low;
             }
             """,
             "=f,r",
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
         )
     )
 
 
 @dsl_user_op
 def fp8_e4m3_to_f32_and_rcp(fp8_val: Uint32, *, loc=None, ip=None) -> Float32:
-    """Convert FP8 E4M3 to float32 AND compute reciprocal."""
+    """Return the decoded E4M3 reciprocal, or zero for either signed zero."""
     return Float32(
         llvm.inline_asm(
             T.f32(),
             [Uint32(fp8_val).ir_value(loc=loc, ip=ip)],
             """
             {
-                .reg .pred p_zero;
-                .reg .u32 exp_u, mant_u;
-                .reg .s32 exp_s;
-                .reg .f32 exp_f, mant_f, fp8_float, result;
-
-                setp.eq.u32 p_zero, $1, 0;
-                and.b32 mant_u, $1, 7;
-                shr.b32 exp_u, $1, 3;
-                and.b32 exp_u, exp_u, 15;
-                sub.s32 exp_s, exp_u, 7;
-                cvt.rn.f32.s32 exp_f, exp_s;
-                ex2.approx.f32 exp_f, exp_f;
-                cvt.rn.f32.u32 mant_f, mant_u;
-                fma.rn.f32 mant_f, mant_f, 0f3E000000, 0f3F800000;
-                mul.f32 fp8_float, exp_f, mant_f;
-                rcp.approx.ftz.f32 result, fp8_float;
-                selp.f32 $0, 0f00000000, result, p_zero;
+                .reg .pred zero;
+                .reg .b16 source, low, high;
+                .reg .b32 pair;
+                .reg .f32 value, reciprocal;
+                cvt.u16.u32 source, $1;
+                cvt.rn.f16x2.e4m3x2 pair, source;
+                mov.b32 {low, high}, pair;
+                cvt.f32.f16 value, low;
+                setp.eq.f32 zero, value, 0f00000000;
+                rcp.approx.ftz.f32 reciprocal, value;
+                selp.f32 $0, 0f00000000, reciprocal, zero;
             }
             """,
             "=f,r",
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
         )
     )
 
@@ -6255,23 +6328,19 @@ def packed_decode_trellis_mul1_e4m3_to_e4m3x8(
     return Uint32(lo), Uint32(hi)
 
 
-@dsl_user_op
-def packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
-    win_a,
-    win_b,
-    t12_lut_addr,
-    bits: int = 3,
-    t12_in_shared: bool = False,
-    *,
-    loc=None,
-    ip=None,
-):
-    """Decode eight SQG-XOR windows through the modal Cheb-T12 staircase.
+SQG_XOR_CHEB_T12_DECODE_CHAINS = ("legacy", "funnel")
 
-    The graph is a two-xorshift, one-IMAD bijection over the retained L16
-    history. Its product high bits choose the branch stratum and its low bits
-    choose the ordered phase. The 4 KiB T12 table maps ``rank >> 4`` directly
-    to the frozen profile-5 E4M3 staircase.
+
+def sqg_xor_cheb_t12_decode_asm(bits: int, t12_in_shared: bool) -> str:
+    """Return the legacy eight-window SQG-XOR-Cheb-T12 decode as PTX text.
+
+    Inputs: ``$2`` = ``win_a`` (windows 4-7), ``$3`` = ``win_b`` (windows
+    0-3), ``$4`` = table address (32-bit shared offset or 64-bit global).
+    Outputs: ``$0`` = bytes of windows 0-3, ``$1`` = bytes of windows 4-7.
+    Per window the chain is: 16-bit ``bfe``; history ``shr``; xorshift
+    ``shr``/``bfi``/``xor``; ``mad.lo``; ``brev``/``xor``/``shr`` for the
+    branch stratum; ``shr``/``and``/``shl``/``or`` for the table index;
+    address ``add``; byte load; ``shl``/``or`` packing.
     """
 
     bits = int(bits)
@@ -6360,7 +6429,7 @@ def packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
         if t12_in_shared
         else ".reg .b64 addr0,addr1;"
     )
-    asm = (
+    return (
         """
         {
             .reg .b32 out0,out1;
@@ -6378,6 +6447,155 @@ def packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
         """
         + "\n}"
     )
+
+
+def sqg_xor_cheb_t12_funnel_decode_asm(bits: int, t12_in_shared: bool) -> str:
+    """Return the funnel-shift SQG-XOR-Cheb-T12 decode as PTX text.
+
+    Inputs: ``$4`` = ``win_a`` (windows 4-7), ``$5`` = ``win_b`` (windows
+    0-3), ``$6`` = table address (32-bit shared offset or 64-bit global).
+    The four outputs ``$0``..``$3`` each hold one byte pair (window ``2k``
+    in bits 7:0, window ``2k+1`` in bits 15:8, upper half zero).
+
+    Every table index is the same value the legacy chain computes,
+    ``(stratum << (width - 4)) | ((product >> 4) & phase_mask)``; only its
+    evaluation differs:
+
+    * the history is cut with one ``bfe`` at ``shift + bits`` (the legacy
+      16-bit ``bfe`` followed by ``shr`` is one instruction longer);
+    * one ``brev`` per 32-bit source word replaces one per window: the
+      branch bits of the window at ``shift`` sit at bits 31-shift..30-shift
+      of the reversed word, so ``brev(src) << shift`` carries them at bits
+      31..30 exactly like ``brev(window)`` did, and only those bits survive
+      the ``shr`` that isolates the stratum;
+    * the index is assembled by one funnel shift instead of
+      ``shr``/``and``/``shl``/``or``: with ``L = product << (32 - width)``
+      the phase bits ``product[4, width)`` sit at the top of ``L`` and
+      ``shf.r.clamp.b32 idx, L, stratum, 36 - width`` lands them at bits
+      ``[0, width - 4)`` and the stratum at ``[width - 4, width)``;
+    * bytes are packed as 16-bit pairs (the consumer converts one pair per
+      ``cvt.rn.f16x2.e4m3x2``), which drops the 32-bit merge.
+    """
+
+    bits = int(bits)
+    t12_in_shared = bool(t12_in_shared)
+    if bits not in (2, 3, 4):
+        raise ValueError(
+            f"unsupported SQG-XOR-Cheb-T12 bitrate {bits}; expected 2, 3, or 4"
+        )
+    width = 16 - bits
+    funnel_shift = 36 - width
+    phase_shift = 32 - width
+    stratum_shift = 32 - bits
+    decode_blocks: list[str] = []
+    for pair in range(4):
+        indices = (2 * pair, 2 * pair + 1)
+        lines: list[str] = []
+        for slot, index in enumerate(indices):
+            source = "$5" if index < 4 else "$4"
+            reversed_source = "rb" if index < 4 else "ra"
+            shift = (3 - (index & 3)) * bits
+            lines.append(
+                f"""
+                    bfe.u32 p{slot}, {source}, {shift + bits}, {width};
+                    shr.u32 t{slot}, p{slot}, 11;
+                    bfi.b32 q{slot}, p{slot}, p{slot}, 11, {width - 11};
+                    xor.b32 q{slot}, q{slot}, t{slot};
+                    mad.lo.u32 q{slot}, q{slot}, 0x3fa7d929, 0xc928fd8e;
+                """
+            )
+            if shift:
+                lines.append(
+                    f"""
+                    shl.b32 x{slot}, {reversed_source}, {shift};
+                    xor.b32 x{slot}, x{slot}, q{slot};
+                    """
+                )
+            else:
+                lines.append(
+                    f"""
+                    xor.b32 x{slot}, {reversed_source}, q{slot};
+                    """
+                )
+            lines.append(
+                f"""
+                    shr.u32 x{slot}, x{slot}, {stratum_shift};
+                    shl.b32 l{slot}, q{slot}, {phase_shift};
+                    shf.r.clamp.b32 i{slot}, l{slot}, x{slot}, {funnel_shift};
+                """
+            )
+            if t12_in_shared:
+                lines.append(
+                    f"""
+                    add.u32 addr{slot}, i{slot}, $6;
+                    ld.shared.u8 e{slot}, [addr{slot}];
+                    """
+                )
+            else:
+                lines.append(
+                    f"""
+                    cvt.u64.u32 addr{slot}, i{slot};
+                    add.u64 addr{slot}, addr{slot}, $6;
+                    ld.global.u8 e{slot}, [addr{slot}];
+                    """
+                )
+        lines.append(
+            f"""
+                    shl.b32 e1, e1, 8;
+                    or.b32 out{pair}, e0, e1;
+            """
+        )
+        decode_blocks.append("\n".join(lines))
+    address_reg = (
+        ".reg .b32 addr0,addr1;"
+        if t12_in_shared
+        else ".reg .b64 addr0,addr1;"
+    )
+    return (
+        """
+        {
+            .reg .b32 out0,out1,out2,out3;
+            .reg .b32 ra,rb;
+            .reg .b32 p0,p1,t0,t1,q0,q1,x0,x1,l0,l1,i0,i1,e0,e1;
+        """
+        + address_reg
+        + """
+            brev.b32 ra, $4;
+            brev.b32 rb, $5;
+        """
+        + "\n".join(decode_blocks)
+        + """
+            mov.b32 $0, out0;
+            mov.b32 $1, out1;
+            mov.b32 $2, out2;
+            mov.b32 $3, out3;
+        """
+        + "\n}"
+    )
+
+
+@dsl_user_op
+def packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
+    win_a,
+    win_b,
+    t12_lut_addr,
+    bits: int = 3,
+    t12_in_shared: bool = False,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Decode eight SQG-XOR windows through the modal Cheb-T12 staircase.
+
+    The graph is a two-xorshift, one-IMAD bijection over the retained L16
+    history. Its product high bits choose the branch stratum and its low bits
+    choose the ordered phase. The 4 KiB T12 table maps ``rank >> 4`` directly
+    to the frozen profile-5 E4M3 staircase.
+    """
+
+    bits = int(bits)
+    t12_in_shared = bool(t12_in_shared)
+    asm = sqg_xor_cheb_t12_decode_asm(bits, t12_in_shared)
     address_value = (
         Int32(t12_lut_addr).ir_value(loc=loc, ip=ip)
         if t12_in_shared
@@ -6401,6 +6619,112 @@ def packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
     lo = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
     hi = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
     return Uint32(lo), Uint32(hi)
+
+
+@dsl_user_op
+def packed_decode_sqg_xor_cheb_t12_to_e4m3x2x4(
+    win_a,
+    win_b,
+    t12_lut_addr,
+    bits: int = 3,
+    t12_in_shared: bool = False,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Decode eight SQG-XOR windows into four E4M3 byte pairs.
+
+    Funnel-shift form of :func:`packed_decode_sqg_xor_cheb_t12_to_e4m3x8`
+    (see :func:`sqg_xor_cheb_t12_funnel_decode_asm`): every table index and
+    every byte are identical, the returned words hold the same bytes as the
+    low and high halves of the legacy ``lo``/``hi`` words, one pair per
+    word. Feed each pair to :func:`fp8x2_e4m3_pair_to_half2` or
+    :func:`fp8x2_e4m3_pair_to_bfloat2_native_sm120`.
+    """
+
+    bits = int(bits)
+    t12_in_shared = bool(t12_in_shared)
+    asm = sqg_xor_cheb_t12_funnel_decode_asm(bits, t12_in_shared)
+    address_value = (
+        Int32(t12_lut_addr).ir_value(loc=loc, ip=ip)
+        if t12_in_shared
+        else Int64(t12_lut_addr).ir_value(loc=loc, ip=ip)
+    )
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [
+            Uint32(win_a).ir_value(loc=loc, ip=ip),
+            Uint32(win_b).ir_value(loc=loc, ip=ip),
+            address_value,
+        ],
+        asm,
+        "=r,=r,=r,=r,r,r," + ("r" if t12_in_shared else "l"),
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    pairs = tuple(
+        Uint32(llvm.extractvalue(T.i32(), result, [index], loc=loc, ip=ip))
+        for index in range(4)
+    )
+    return pairs[0], pairs[1], pairs[2], pairs[3]
+
+
+@dsl_user_op
+def fp8x2_e4m3_pair_to_half2(pair: Uint32, *, loc=None, ip=None) -> Uint32:
+    """Widen one E4M3 byte pair (bits 15:0 of ``pair``) exactly to f16x2.
+
+    Same conversion as the low half of :func:`fp8x4_e4m3_to_half2x2`.
+    """
+    result = llvm.inline_asm(
+        T.i32(),
+        [Uint32(pair).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b16 e01, e23;
+            mov.b32 {e01, e23}, $1;
+            cvt.rn.f16x2.e4m3x2 $0, e01;
+        }
+        """,
+        "=r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Uint32(result)
+
+
+@dsl_user_op
+def fp8x2_e4m3_pair_to_bfloat2_native_sm120(
+    pair: Uint32, *, loc=None, ip=None
+) -> Uint32:
+    """Widen one E4M3 byte pair (bits 15:0 of ``pair``) to bf16x2 on SM120a.
+
+    Same conversion as the low half of
+    :func:`fp8x4_e4m3_to_bfloat2x2_native_sm120`.
+    """
+    result = llvm.inline_asm(
+        T.i32(),
+        [Uint32(pair).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b16 e01, e23;
+            mov.b32 {e01, e23}, $1;
+            cvt.rn.bf16x2.e4m3x2 $0, e01;
+        }
+        """,
+        "=r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Uint32(result)
 
 
 @dsl_user_op
@@ -7138,6 +7462,90 @@ def packed_decode_trellis_sqg_state_smem_to_e4m3x8(
 
 
 @dsl_user_op
+def packed_decode_trellis_sqg_direct_lut_smem_to_e4m3x8(
+    win_a,
+    win_b,
+    direct_lut_smem_addr,
+    bits: int = 3,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Decode eight L16 windows through a direct E4M3 table in shared memory.
+
+    Shared-memory form of ``packed_decode_trellis_sqg_direct_lut_to_e4m3x8``:
+    the caller stages the 64 KiB rate slice of the direct table
+    (``byte(state) = table[state]``, the frozen XOR-Cheb rank map composed
+    with the modal T12 staircase, so lookups are bit-identical to the T12
+    decode) at a 32-bit shared byte offset. Per weight: one ``bfe``, one
+    ``add``, one ``ld.shared.u8`` and the pack, versus the twelve-instruction
+    bijection the T12 path evaluates before its lookup.
+    """
+    bits = int(bits)
+    if bits not in (2, 3, 4):
+        raise ValueError(
+            f"unsupported SQG-normal trellis bitrate {bits}; expected 2, 3, or 4"
+        )
+    extract_lines: list[str] = []
+    load_lines: list[str] = []
+    for index in range(8):
+        source = "$3" if index < 4 else "$2"
+        shift = (3 - (index & 3)) * bits
+        if shift:
+            extract_lines.append(f"bfe.u32 w{index}, {source}, {shift}, 16;")
+        else:
+            extract_lines.append(f"and.b32 w{index}, {source}, 0xffff;")
+        load_lines.append(
+            f"""
+                add.u32 w{index}, w{index}, $4;
+                ld.shared.u8 w{index}, [w{index}];
+            """
+        )
+    # A lookup yields a zero-extended byte. Pack independent loads through
+    # two levels of byte permutation, retaining the exact lane byte order.
+    pack_lines = [
+        "prmt.b32 w0, w0, w1, 0x4040;",
+        "prmt.b32 w2, w2, w3, 0x4040;",
+        "prmt.b32 out0, w0, w2, 0x5410;",
+        "prmt.b32 w4, w4, w5, 0x4040;",
+        "prmt.b32 w6, w6, w7, 0x4040;",
+        "prmt.b32 out1, w4, w6, 0x5410;",
+    ]
+    asm = (
+        """
+        {
+            .reg .b32 out0,out1;
+            .reg .b32 w0,w1,w2,w3,w4,w5,w6,w7;
+    """
+        + "\n".join(extract_lines)
+        + "\n".join(load_lines)
+        + "\n".join(pack_lines)
+        + """
+            mov.b32 $0, out0;
+            mov.b32 $1, out1;
+        }"""
+    )
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [
+            Uint32(win_a).ir_value(loc=loc, ip=ip),
+            Uint32(win_b).ir_value(loc=loc, ip=ip),
+            Int32(direct_lut_smem_addr).ir_value(loc=loc, ip=ip),
+        ],
+        asm,
+        "=r,=r,r,r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    lo = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
+    hi = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    return Uint32(lo), Uint32(hi)
+
+
+@dsl_user_op
 def packed_decode_trellis_sqg_direct_lut_to_e4m3x8(
     win_a,
     win_b,
@@ -7164,15 +7572,12 @@ def packed_decode_trellis_sqg_direct_lut_to_e4m3x8(
     table_offset = ((bits - 2) << 16) if rate_indexed else 0
     extract_lines: list[str] = []
     load_lines: list[str] = []
-    pack_lines: list[str] = []
     for index in range(8):
         source = "$3" if index < 4 else "$2"
         shift = (3 - (index & 3)) * bits
         # Accumulate into declared scratch registers, never directly into
         # the "=r" outputs: without early-clobber the outputs may alias the
         # window inputs that later iterations still read.
-        target = "out0" if index < 4 else "out1"
-        byte_shift = 8 * (index & 3)
         if shift:
             extract_lines.append(
                 f"bfe.u32 w{index}, {source}, {shift}, 16;"
@@ -7186,19 +7591,22 @@ def packed_decode_trellis_sqg_direct_lut_to_e4m3x8(
                 ld.global.u8 w{index}, [addr{index}];
             """
         )
-        if byte_shift:
-            pack_lines.append(
-                f"shl.b32 w{index}, w{index}, {byte_shift};"
-            )
-        pack_lines.append(f"or.b32 {target}, {target}, w{index};")
+    # A lookup yields a zero-extended byte. Pack independent loads through
+    # two levels of byte permutation, retaining the exact lane byte order.
+    pack_lines = [
+        "prmt.b32 w0, w0, w1, 0x4040;",
+        "prmt.b32 w2, w2, w3, 0x4040;",
+        "prmt.b32 out0, w0, w2, 0x5410;",
+        "prmt.b32 w4, w4, w5, 0x4040;",
+        "prmt.b32 w6, w6, w7, 0x4040;",
+        "prmt.b32 out1, w4, w6, 0x5410;",
+    ]
     asm = (
         """
         {
             .reg .b32 out0,out1;
             .reg .b32 w0,w1,w2,w3,w4,w5,w6,w7;
             .reg .b64 addr0,addr1,addr2,addr3,addr4,addr5,addr6,addr7;
-            mov.b32 out0, 0;
-            mov.b32 out1, 0;
     """
         + "\n".join(extract_lines)
         + "\n".join(load_lines)

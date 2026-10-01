@@ -38,11 +38,12 @@ The canonical numeric recipes are:
 | native W4A8-MX | MXFP8 E4M3 / E8M0 K/32 | E8M0 K/32 | E8M0 K/32 |
 | W4A16 | BF16 / none | E4M3 K/16 or E8M0 K/32 | source-preserving |
 
-## QSRT coupled transforms
+## Coupled trellis transforms
 
-QSRT stores a fixed-rate trellis payload for each expert matrix. Its coupled
-transform profile applies the same exact activation-boundary coordinate change
-at K2, K3, and K4:
+Trellis-coded expert weights arrive in the BTX container
+(``docs/btx-checkpoint-format.md``), which stores a fixed-rate trellis
+payload for each expert matrix. Its coupled transform declaration applies
+the same exact activation-boundary coordinate change at K2, K3, and K4:
 
 ```text
 expert input
@@ -67,8 +68,8 @@ ordinary projection rows followed by two preactivation rows and one
 post-activation row. The local hidden width must be divisible by 512 and the
 local intermediate width by 128.
 
-QSRT encoders use this transform at K2, K3, and K4. A stored profile declares
-the transform explicitly. Ordinary per-matrix transforms remain valid only for
+The BTX manifest declares the transform explicitly (``hadamard.coupled``
+with its block widths). Ordinary per-matrix transforms remain valid only for
 artifacts whose metadata specifies them; the runtime does not infer transform
 type from the trellis bit rate.
 

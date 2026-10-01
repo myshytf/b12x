@@ -2,15 +2,28 @@
 """Benchmark the production W4A16 MoE route packer.
 
 The default corpus covers the mapped decode geometries used by Kimi K3 and
-GLM-5.2 hybrid checkpoints.  Both eager launches and CUDA graph replay are
-timed with caller-owned workspaces, matching the serving contract.
+GLM-5.2 hybrid checkpoints and the Kimi K3 TP9 prefill chunk (4,608 tokens,
+top-16 over 896 experts, route blocks 48 and 64) under uniform routing, plus
+one Zipf-weighted prefill chunk whose largest expert segments exceed the
+stable packer's widest register sort and take its workspace-scan path.  Each
+record reports ``segment_bands``, the histogram of live segment sizes over
+those launch bands, so a report says which packing kernels it exercised.
+Both eager launches and
+CUDA graph replay are timed with caller-owned workspaces, matching the
+serving contract.  The packer honours ``B12X_W4A16_STABLE_ROUTE_PACK`` (the
+served setting is 1) and ``B12X_W4A16_STABLE_ROUTE_PACK_SCAN`` (1 selects the
+sequential per-expert scan kernel instead of the atomic scatter + segment
+sort); with the stable flag the packed layout is a pure function of the
+routing, so ``packed_sha256`` of two runs must match.
 """
 
 from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import hashlib
 import json
+import os
 import pathlib
 import statistics
 import subprocess
@@ -29,6 +42,9 @@ from b12x.moe._shared.kernels.w4a16.host import (
 from b12x.moe._shared.kernels.w4a16.kernel import (
     pack_topk_routes_by_expert,
 )
+from b12x.moe._shared.kernels.w4a16.route_pack import (
+    _STABLE_SEGMENT_SORT_WIDTHS as STABLE_SEGMENT_SORT_WIDTHS,
+)
 
 
 @dataclass(frozen=True)
@@ -39,6 +55,14 @@ class RoutePackCase:
     num_experts: int
     local_experts: int
     block_size: int
+    # "uniform" draws each token's experts with equal probability; "zipf"
+    # weights expert ``i`` by ``(i + 1) ** -ZIPF_EXPONENT``, which spreads the
+    # per-expert segment sizes over every register sort width and the
+    # workspace-scan fallback of the stable packer.
+    routing: str = "uniform"
+
+
+ZIPF_EXPONENT = 1.2
 
 
 CASES = {
@@ -57,6 +81,31 @@ CASES = {
         num_experts=256,
         local_experts=192,
         block_size=8,
+    ),
+    "k3-prefill-b48": RoutePackCase(
+        name="k3-tp9-prefill-chunk-block48",
+        tokens=4608,
+        topk=16,
+        num_experts=896,
+        local_experts=896,
+        block_size=48,
+    ),
+    "k3-prefill-b64": RoutePackCase(
+        name="k3-tp9-prefill-chunk-block64",
+        tokens=4608,
+        topk=16,
+        num_experts=896,
+        local_experts=896,
+        block_size=64,
+    ),
+    "k3-prefill-b48-zipf": RoutePackCase(
+        name="k3-tp9-prefill-chunk-block48-zipf",
+        tokens=4608,
+        topk=16,
+        num_experts=896,
+        local_experts=896,
+        block_size=48,
+        routing="zipf",
     ),
 }
 
@@ -107,12 +156,38 @@ def _make_routes(
     seed: int,
 ) -> torch.Tensor:
     generator = torch.Generator(device="cpu").manual_seed(seed)
-    routes = torch.randperm(case.num_experts, generator=generator)[
-        : case.tokens * case.topk
-    ]
-    return routes.reshape(case.tokens, case.topk).to(
-        dtype=torch.int32,
-        device=device,
+    if case.routing == "zipf":
+        weights = torch.arange(1, case.num_experts + 1, dtype=torch.float32).pow(
+            -ZIPF_EXPONENT
+        )
+    elif case.routing == "uniform":
+        weights = torch.ones(case.num_experts)
+    else:
+        raise ValueError(f"unknown routing {case.routing!r}")
+    if case.tokens * case.topk <= case.num_experts and case.routing == "uniform":
+        routes = torch.randperm(case.num_experts, generator=generator)[
+            : case.tokens * case.topk
+        ].reshape(case.tokens, case.topk)
+    else:
+        # Prefill: every token routes to topk distinct experts. Under uniform
+        # weights the served router's marginal at 4,608 tokens is close to
+        # uniform and every expert segment stays below a few hundred routes;
+        # the Zipf weights concentrate traffic so that the largest segments
+        # exceed the widest register sort and take the packer's workspace-scan
+        # path, which uniform routing never reaches.
+        routes = torch.multinomial(
+            weights.unsqueeze(0).expand(case.tokens, case.num_experts),
+            case.topk,
+            replacement=False,
+            generator=generator,
+        )
+    return routes.to(dtype=torch.int32, device=device)
+
+
+def _stable_layout_requested(case: RoutePackCase) -> bool:
+    flag = os.environ.get("B12X_W4A16_STABLE_ROUTE_PACK", "")
+    return flag.strip().lower() not in {"", "0", "false", "no", "off"} and (
+        case.tokens * case.topk >= 4096
     )
 
 
@@ -153,12 +228,33 @@ def _workspace(
     }
 
 
+def _segment_bands(counts: torch.Tensor) -> dict[str, int]:
+    """Live expert segments per launch band of the stable packer.
+
+    The stable path orders each expert's segment with one launch per register
+    sort width and one workspace-scan launch above the widest width, so a
+    routing whose segments all land in the narrowest band leaves the other
+    kernels unmeasured. Reporting the histogram makes a record say which
+    bands it covered.
+    """
+    live = counts[counts > 0]
+    bands: dict[str, int] = {}
+    lower = 0
+    for width, _ in STABLE_SEGMENT_SORT_WIDTHS:
+        bands[f"sort_{width}"] = int(((live > lower) & (live <= width)).sum())
+        lower = width
+    bands["scan"] = int((live > lower).sum())
+    bands["max_segment"] = int(live.max()) if live.numel() else 0
+    return bands
+
+
 def _validate(
     case: RoutePackCase,
     routes: torch.Tensor,
     expert_map: torch.Tensor,
     workspace: dict[str, torch.Tensor],
-) -> None:
+) -> torch.Tensor:
+    """Check the packed layout and return the live route count per expert."""
     raw_ids = routes.cpu().reshape(-1).to(torch.int64)
     host_map = expert_map.cpu().to(torch.int64)
     mapped_ids = host_map[raw_ids]
@@ -206,6 +302,34 @@ def _validate(
             raise AssertionError(
                 f"{case.name}: block {block} contains another expert"
             )
+    if _stable_layout_requested(case):
+        # Stable packing: inside every expert segment the live routes ascend
+        # and the padding slots hold the live route count.
+        cursor = 0
+        for expert, live in enumerate(counts.tolist()):
+            padded_rows = int(padded[expert])
+            segment = packed[cursor : cursor + padded_rows]
+            live_routes = segment[:live]
+            if not torch.all(live_routes[1:] > live_routes[:-1]):
+                raise AssertionError(
+                    f"{case.name}: expert {expert} segment is not ascending"
+                )
+            if not torch.all(segment[live:] == raw_ids.numel()):
+                raise AssertionError(
+                    f"{case.name}: expert {expert} padding is not the sentinel"
+                )
+            cursor += padded_rows
+    return counts
+
+
+def _packed_digest(case: RoutePackCase, workspace: dict[str, torch.Tensor]) -> str:
+    count = int(workspace["packed_route_count"].cpu().item())
+    packed = workspace["packed_route_indices"][:count].cpu().contiguous()
+    blocks = workspace["block_expert_ids"][: count // case.block_size].cpu().contiguous()
+    digest = hashlib.sha256()
+    digest.update(packed.numpy().tobytes())
+    digest.update(blocks.numpy().tobytes())
+    return digest.hexdigest()[:16]
 
 
 def _eager_samples(
@@ -268,9 +392,12 @@ def _run_case(
     eager = _eager_samples(run, warmup=warmup, iterations=iterations)
     graph = capture_cuda_graph(run, warmup=warmup)
     graph_samples = bench_cuda_graph(graph, replays=iterations)["replay_us"]
-    _validate(case, routes, expert_map, workspace)
+    counts = _validate(case, routes, expert_map, workspace)
     return {
         "case": case.__dict__,
+        "stable_layout": _stable_layout_requested(case),
+        "segment_bands": _segment_bands(counts),
+        "packed_sha256": _packed_digest(case, workspace),
         "eager": _summary(eager),
         "graph": _summary(graph_samples),
         "raw_eager_us": eager,
@@ -282,8 +409,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--case",
+        nargs="+",
         choices=(*CASES, "all"),
-        default="all",
+        default=["all"],
+        help="one or more cases to run in a single report; 'all' runs every case",
     )
     parser.add_argument("--warmup", type=int, default=25)
     parser.add_argument("--iterations", type=int, default=200)
@@ -293,7 +422,8 @@ def main() -> None:
 
     device = require_sm120()
     props = torch.cuda.get_device_properties(device)
-    selected = CASES.values() if args.case == "all" else (CASES[args.case],)
+    names = list(CASES) if "all" in args.case else list(dict.fromkeys(args.case))
+    selected = [CASES[name] for name in names]
     report = {
         "commit": _git_revision(),
         "device": props.name,
@@ -314,11 +444,13 @@ def main() -> None:
         case = result["case"]
         eager = result["eager"]
         graph = result["graph"]
+        bands = result["segment_bands"]
         print(
             f"{case['name']}: eager={eager['median_us']:.3f} us "
             f"(p10={eager['p10_us']:.3f}, p90={eager['p90_us']:.3f}) | "
             f"graph={graph['median_us']:.3f} us "
-            f"(p10={graph['p10_us']:.3f}, p90={graph['p90_us']:.3f})"
+            f"(p10={graph['p10_us']:.3f}, p90={graph['p90_us']:.3f}) | "
+            f"segments {bands}"
         )
         if not args.raw:
             result.pop("raw_eager_us")

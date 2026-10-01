@@ -1,0 +1,1217 @@
+{
+  "status": "implemented; qualified; serving",
+  "source": {
+    "tree": "/home/g0san/worktrees/b12x-static-peers-20260914",
+    "head": "b3758c052174fcf3cc41d34ce24020a04ec8a766",
+    "files": {
+      "b12x/comm/pcie/_twoshot_bf16_cute.py": "8c6aea4dbc15374c7d16cbcc2fed8b7af5cb73559413a8779c59fa923db36cda",
+      "b12x/comm/pcie/pcie_twoshot_bf16.py": "ef51a4bf3ace106c7700a852063fc1dbf516d1d7edfc356e5b246254a28057aa",
+      "benchmarks/benchmark_kimi_static_peers.py": "e7f6175316da949afe1553753cb43eafcff6d6f265f7d8b12fd57d553cdc74d0"
+    }
+  },
+  "runs": [
+    {
+      "run": "matrix.json",
+      "status": "qualified-component",
+      "devices": [
+        {
+          "rank": 0,
+          "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+          "uuid": "0ba4eaa6-ff53-e6d0-0994-b1f9af035f9d",
+          "sm_count": 188
+        },
+        {
+          "rank": 1,
+          "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+          "uuid": "5b41251d-2b5a-3c34-5f92-b4fef6ddf723",
+          "sm_count": 188
+        },
+        {
+          "rank": 2,
+          "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+          "uuid": "951ec008-eeac-e6cd-1fcd-8e5636df9dc3",
+          "sm_count": 188
+        },
+        {
+          "rank": 3,
+          "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+          "uuid": "acc5c7ea-929e-d962-951d-08846cdb4a6d",
+          "sm_count": 188
+        },
+        {
+          "rank": 4,
+          "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+          "uuid": "28828840-7cc9-ffe0-787a-99b704f6ff51",
+          "sm_count": 188
+        },
+        {
+          "rank": 5,
+          "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+          "uuid": "92f7a0e8-3a39-9a02-0605-131d9d0cde5b",
+          "sm_count": 188
+        },
+        {
+          "rank": 6,
+          "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+          "uuid": "4f865fb9-7715-3e6e-a83b-d458b83afced",
+          "sm_count": 188
+        },
+        {
+          "rank": 7,
+          "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+          "uuid": "325fb3f1-d688-04e8-d2e8-63df268a87cc",
+          "sm_count": 188
+        },
+        {
+          "rank": 8,
+          "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+          "uuid": "9361804b-020b-3f67-9026-fca5d0264d5f",
+          "sm_count": 188
+        }
+      ],
+      "cases": 11,
+      "exact": true,
+      "m4": [
+        {
+          "shape": [
+            4,
+            3584
+          ],
+          "median_max_rank_us": {
+            "push": 11.573499999940395,
+            "push_static": 11.253000237047672
+          },
+          "candidate_over_reference_latency": 0.9723074469352941
+        },
+        {
+          "shape": [
+            4,
+            7168
+          ],
+          "median_max_rank_us": {
+            "push": 16.692999750375748,
+            "push_static": 16.565000638365746
+          },
+          "candidate_over_reference_latency": 0.9923321683385803
+        }
+      ]
+    },
+    {
+      "run": "repeat/matrix.json",
+      "status": "qualified-component",
+      "devices": [
+        {
+          "rank": 0,
+          "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+          "uuid": "0ba4eaa6-ff53-e6d0-0994-b1f9af035f9d",
+          "sm_count": 188
+        },
+        {
+          "rank": 1,
+          "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+          "uuid": "5b41251d-2b5a-3c34-5f92-b4fef6ddf723",
+          "sm_count": 188
+        },
+        {
+          "rank": 2,
+          "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+          "uuid": "951ec008-eeac-e6cd-1fcd-8e5636df9dc3",
+          "sm_count": 188
+        },
+        {
+          "rank": 3,
+          "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+          "uuid": "acc5c7ea-929e-d962-951d-08846cdb4a6d",
+          "sm_count": 188
+        },
+        {
+          "rank": 4,
+          "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+          "uuid": "28828840-7cc9-ffe0-787a-99b704f6ff51",
+          "sm_count": 188
+        },
+        {
+          "rank": 5,
+          "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+          "uuid": "92f7a0e8-3a39-9a02-0605-131d9d0cde5b",
+          "sm_count": 188
+        },
+        {
+          "rank": 6,
+          "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+          "uuid": "4f865fb9-7715-3e6e-a83b-d458b83afced",
+          "sm_count": 188
+        },
+        {
+          "rank": 7,
+          "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+          "uuid": "325fb3f1-d688-04e8-d2e8-63df268a87cc",
+          "sm_count": 188
+        },
+        {
+          "rank": 8,
+          "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+          "uuid": "9361804b-020b-3f67-9026-fca5d0264d5f",
+          "sm_count": 188
+        }
+      ],
+      "cases": 2,
+      "exact": true,
+      "m4": [
+        {
+          "shape": [
+            4,
+            3584
+          ],
+          "median_max_rank_us": {
+            "push": 11.634999886155128,
+            "push_static": 11.284999549388885
+          },
+          "candidate_over_reference_latency": 0.9699183205680372
+        },
+        {
+          "shape": [
+            4,
+            7168
+          ],
+          "median_max_rank_us": {
+            "push": 16.72299951314926,
+            "push_static": 16.628999263048172
+          },
+          "candidate_over_reference_latency": 0.9943789838642776
+        }
+      ]
+    },
+    {
+      "run": "policy/matrix.json",
+      "status": "qualified-component",
+      "devices": [
+        {
+          "rank": 0,
+          "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+          "uuid": "0ba4eaa6-ff53-e6d0-0994-b1f9af035f9d",
+          "sm_count": 188
+        },
+        {
+          "rank": 1,
+          "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+          "uuid": "5b41251d-2b5a-3c34-5f92-b4fef6ddf723",
+          "sm_count": 188
+        },
+        {
+          "rank": 2,
+          "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+          "uuid": "951ec008-eeac-e6cd-1fcd-8e5636df9dc3",
+          "sm_count": 188
+        },
+        {
+          "rank": 3,
+          "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+          "uuid": "acc5c7ea-929e-d962-951d-08846cdb4a6d",
+          "sm_count": 188
+        },
+        {
+          "rank": 4,
+          "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+          "uuid": "28828840-7cc9-ffe0-787a-99b704f6ff51",
+          "sm_count": 188
+        },
+        {
+          "rank": 5,
+          "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+          "uuid": "92f7a0e8-3a39-9a02-0605-131d9d0cde5b",
+          "sm_count": 188
+        },
+        {
+          "rank": 6,
+          "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+          "uuid": "4f865fb9-7715-3e6e-a83b-d458b83afced",
+          "sm_count": 188
+        },
+        {
+          "rank": 7,
+          "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+          "uuid": "325fb3f1-d688-04e8-d2e8-63df268a87cc",
+          "sm_count": 188
+        },
+        {
+          "rank": 8,
+          "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+          "uuid": "9361804b-020b-3f67-9026-fca5d0264d5f",
+          "sm_count": 188
+        }
+      ],
+      "cases": 12,
+      "exact": true,
+      "m4": [
+        {
+          "shape": [
+            4,
+            3584
+          ],
+          "median_max_rank_us": {
+            "push": 11.572999879717827,
+            "push_static": 11.315000243484974
+          },
+          "candidate_over_reference_latency": 0.977706762385351
+        },
+        {
+          "shape": [
+            4,
+            7168
+          ],
+          "median_max_rank_us": {
+            "push": 16.692999750375748,
+            "push_static": 16.595500521361828
+          },
+          "candidate_over_reference_latency": 0.9941592745179473
+        }
+      ]
+    }
+  ],
+  "resources": {
+    "artifacts": "gpu-r1/resources",
+    "objects": 54,
+    "all_stack_local_zero": true,
+    "register_deltas": [
+      {
+        "configuration": [
+          9,
+          0,
+          true,
+          1,
+          512,
+          8
+        ],
+        "reference": {
+          "REG": 118,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "candidate": {
+          "REG": 124,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "register_delta": 6
+      },
+      {
+        "configuration": [
+          9,
+          3,
+          true,
+          1,
+          512,
+          8
+        ],
+        "reference": {
+          "REG": 118,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "candidate": {
+          "REG": 110,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "register_delta": -8
+      },
+      {
+        "configuration": [
+          9,
+          1,
+          false,
+          0,
+          512,
+          8
+        ],
+        "reference": {
+          "REG": 102,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "candidate": {
+          "REG": 103,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "register_delta": 1
+      },
+      {
+        "configuration": [
+          9,
+          2,
+          true,
+          0,
+          512,
+          8
+        ],
+        "reference": {
+          "REG": 118,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "candidate": {
+          "REG": 126,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "register_delta": 8
+      },
+      {
+        "configuration": [
+          9,
+          7,
+          true,
+          1,
+          512,
+          8
+        ],
+        "reference": {
+          "REG": 118,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "candidate": {
+          "REG": 126,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "register_delta": 8
+      },
+      {
+        "configuration": [
+          9,
+          2,
+          true,
+          1,
+          512,
+          8
+        ],
+        "reference": {
+          "REG": 118,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "candidate": {
+          "REG": 126,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "register_delta": 8
+      },
+      {
+        "configuration": [
+          9,
+          5,
+          true,
+          1,
+          512,
+          8
+        ],
+        "reference": {
+          "REG": 118,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "candidate": {
+          "REG": 106,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "register_delta": -12
+      },
+      {
+        "configuration": [
+          9,
+          8,
+          false,
+          0,
+          512,
+          8
+        ],
+        "reference": {
+          "REG": 102,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "candidate": {
+          "REG": 95,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "register_delta": -7
+      },
+      {
+        "configuration": [
+          9,
+          0,
+          true,
+          0,
+          512,
+          8
+        ],
+        "reference": {
+          "REG": 118,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "candidate": {
+          "REG": 124,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "register_delta": 6
+      },
+      {
+        "configuration": [
+          9,
+          7,
+          true,
+          0,
+          512,
+          8
+        ],
+        "reference": {
+          "REG": 118,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "candidate": {
+          "REG": 126,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "register_delta": 8
+      },
+      {
+        "configuration": [
+          9,
+          5,
+          false,
+          0,
+          512,
+          8
+        ],
+        "reference": {
+          "REG": 102,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "candidate": {
+          "REG": 110,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "register_delta": 8
+      },
+      {
+        "configuration": [
+          9,
+          6,
+          true,
+          0,
+          512,
+          8
+        ],
+        "reference": {
+          "REG": 118,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "candidate": {
+          "REG": 112,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "register_delta": -6
+      },
+      {
+        "configuration": [
+          9,
+          6,
+          false,
+          0,
+          512,
+          8
+        ],
+        "reference": {
+          "REG": 102,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "candidate": {
+          "REG": 110,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "register_delta": 8
+      },
+      {
+        "configuration": [
+          9,
+          8,
+          true,
+          0,
+          512,
+          8
+        ],
+        "reference": {
+          "REG": 118,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "candidate": {
+          "REG": 96,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "register_delta": -22
+      },
+      {
+        "configuration": [
+          9,
+          4,
+          true,
+          1,
+          512,
+          8
+        ],
+        "reference": {
+          "REG": 118,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "candidate": {
+          "REG": 124,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "register_delta": 6
+      },
+      {
+        "configuration": [
+          9,
+          2,
+          false,
+          0,
+          512,
+          8
+        ],
+        "reference": {
+          "REG": 102,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "candidate": {
+          "REG": 99,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "register_delta": -3
+      },
+      {
+        "configuration": [
+          9,
+          4,
+          false,
+          0,
+          512,
+          8
+        ],
+        "reference": {
+          "REG": 102,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "candidate": {
+          "REG": 98,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "register_delta": -4
+      },
+      {
+        "configuration": [
+          9,
+          6,
+          true,
+          1,
+          512,
+          8
+        ],
+        "reference": {
+          "REG": 118,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "candidate": {
+          "REG": 112,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "register_delta": -6
+      },
+      {
+        "configuration": [
+          9,
+          1,
+          true,
+          1,
+          512,
+          8
+        ],
+        "reference": {
+          "REG": 118,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "candidate": {
+          "REG": 107,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "register_delta": -11
+      },
+      {
+        "configuration": [
+          9,
+          7,
+          false,
+          0,
+          512,
+          8
+        ],
+        "reference": {
+          "REG": 102,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "candidate": {
+          "REG": 122,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "register_delta": 20
+      },
+      {
+        "configuration": [
+          9,
+          1,
+          true,
+          0,
+          512,
+          8
+        ],
+        "reference": {
+          "REG": 118,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "candidate": {
+          "REG": 107,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "register_delta": -11
+      },
+      {
+        "configuration": [
+          9,
+          4,
+          true,
+          0,
+          512,
+          8
+        ],
+        "reference": {
+          "REG": 118,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "candidate": {
+          "REG": 124,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "register_delta": 6
+      },
+      {
+        "configuration": [
+          9,
+          3,
+          false,
+          0,
+          512,
+          8
+        ],
+        "reference": {
+          "REG": 102,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "candidate": {
+          "REG": 112,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "register_delta": 10
+      },
+      {
+        "configuration": [
+          9,
+          0,
+          false,
+          0,
+          512,
+          8
+        ],
+        "reference": {
+          "REG": 102,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "candidate": {
+          "REG": 106,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "register_delta": 4
+      },
+      {
+        "configuration": [
+          9,
+          8,
+          true,
+          1,
+          512,
+          8
+        ],
+        "reference": {
+          "REG": 118,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "candidate": {
+          "REG": 96,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "register_delta": -22
+      },
+      {
+        "configuration": [
+          9,
+          3,
+          true,
+          0,
+          512,
+          8
+        ],
+        "reference": {
+          "REG": 118,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "candidate": {
+          "REG": 110,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "register_delta": -8
+      },
+      {
+        "configuration": [
+          9,
+          5,
+          true,
+          0,
+          512,
+          8
+        ],
+        "reference": {
+          "REG": 118,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "candidate": {
+          "REG": 106,
+          "STACK": 0,
+          "SHARED": 0,
+          "LOCAL": 0
+        },
+        "register_delta": -12
+      }
+    ]
+  },
+  "limitations": [
+    "Throughput is qualified for the two controlled workloads on this TP9/DCP9 hardware; no claim is made for every prompt or concurrency level.",
+    "The configured 1048576-token maximum was retained, not rebenchmarked by this decode experiment.",
+    "Positive register deltas on some ranks are recorded; all inspected kernels have zero stack/local memory.",
+    "Profiler timings are diagnostic and excluded from throughput calculations."
+  ],
+  "actual_model_selection": {
+    "8192": {
+      "trace": "comm-static-peers/model-r1/trace-8192/dp0_pp0_tp0_dcp0_ep0_rank0.1789392917145359346.pt.trace.json.gz",
+      "status": "qualified actual kernel selection",
+      "graph_id": 1430,
+      "complete_steps": 4,
+      "records": [
+        {
+          "correlation": 1797,
+          "all_reduce_count": 278,
+          "registers_per_thread": 124,
+          "median_all_reduce_us": 15.072,
+          "all_reduce_sum_us": 4920.415,
+          "target_span_us": 29808.9345703125
+        },
+        {
+          "correlation": 4508,
+          "all_reduce_count": 278,
+          "registers_per_thread": 124,
+          "median_all_reduce_us": 15.024,
+          "all_reduce_sum_us": 4916.367,
+          "target_span_us": 29787.4638671875
+        },
+        {
+          "correlation": 7318,
+          "all_reduce_count": 278,
+          "registers_per_thread": 124,
+          "median_all_reduce_us": 15.04,
+          "all_reduce_sum_us": 4930.31,
+          "target_span_us": 29840.4228515625
+        },
+        {
+          "correlation": 10132,
+          "all_reduce_count": 278,
+          "registers_per_thread": 124,
+          "median_all_reduce_us": 15.008,
+          "all_reduce_sum_us": 4925.7300000000005,
+          "target_span_us": 29772.58203125
+        }
+      ],
+      "median_target_span_us": 29798.19921875,
+      "limitation": "Profiler timings are diagnostic; kernel sums overlap and are not throughput evidence."
+    },
+    "65536": {
+      "trace": "comm-static-peers/model-r1/trace-65536/dp0_pp0_tp0_dcp0_ep0_rank0.1789392955904538808.pt.trace.json.gz",
+      "status": "qualified actual kernel selection",
+      "graph_id": 1430,
+      "complete_steps": 4,
+      "records": [
+        {
+          "correlation": 4526603,
+          "all_reduce_count": 278,
+          "registers_per_thread": 124,
+          "median_all_reduce_us": 15.088,
+          "all_reduce_sum_us": 4931.617,
+          "target_span_us": 30884.443359375
+        },
+        {
+          "correlation": 4529314,
+          "all_reduce_count": 278,
+          "registers_per_thread": 124,
+          "median_all_reduce_us": 15.104,
+          "all_reduce_sum_us": 4928.519,
+          "target_span_us": 30848.443359375
+        },
+        {
+          "correlation": 4532124,
+          "all_reduce_count": 278,
+          "registers_per_thread": 124,
+          "median_all_reduce_us": 15.104,
+          "all_reduce_sum_us": 4920.389,
+          "target_span_us": 30905.7861328125
+        },
+        {
+          "correlation": 4534938,
+          "all_reduce_count": 278,
+          "registers_per_thread": 124,
+          "median_all_reduce_us": 15.0405,
+          "all_reduce_sum_us": 4926.598,
+          "target_span_us": 30845.8837890625
+        }
+      ],
+      "median_target_span_us": 30866.443359375,
+      "limitation": "Profiler timings are diagnostic; kernel sums overlap and are not throughput evidence."
+    }
+  },
+  "model": {
+    "comparison": [
+      {
+        "length": 8192,
+        "reference_tok_s": 119.93838658029861,
+        "candidate_tok_s": 120.22587121735847,
+        "candidate_over_reference": 1.0023969360040323
+      },
+      {
+        "length": 65536,
+        "reference_tok_s": 90.96005986880874,
+        "candidate_tok_s": 91.10350481148373,
+        "candidate_over_reference": 1.001577010205159
+      }
+    ],
+    "gates": [
+      {
+        "phase": "A-before-0",
+        "length": 8192,
+        "token_ids_equal": true,
+        "token_logprobs_equal": true,
+        "top_logprobs_equal": true,
+        "draft_steps_equal": true,
+        "accepted_draft_tokens_equal": true
+      },
+      {
+        "phase": "A-before-0",
+        "length": 65536,
+        "token_ids_equal": true,
+        "token_logprobs_equal": true,
+        "top_logprobs_equal": true,
+        "draft_steps_equal": true,
+        "accepted_draft_tokens_equal": true
+      },
+      {
+        "phase": "A-before-1",
+        "length": 8192,
+        "token_ids_equal": true,
+        "token_logprobs_equal": true,
+        "top_logprobs_equal": true,
+        "draft_steps_equal": true,
+        "accepted_draft_tokens_equal": true
+      },
+      {
+        "phase": "A-before-1",
+        "length": 65536,
+        "token_ids_equal": true,
+        "token_logprobs_equal": true,
+        "top_logprobs_equal": true,
+        "draft_steps_equal": true,
+        "accepted_draft_tokens_equal": true
+      },
+      {
+        "phase": "B-first-0",
+        "length": 8192,
+        "token_ids_equal": true,
+        "token_logprobs_equal": true,
+        "top_logprobs_equal": true,
+        "draft_steps_equal": true,
+        "accepted_draft_tokens_equal": true
+      },
+      {
+        "phase": "B-first-0",
+        "length": 65536,
+        "token_ids_equal": true,
+        "token_logprobs_equal": true,
+        "top_logprobs_equal": true,
+        "draft_steps_equal": true,
+        "accepted_draft_tokens_equal": true
+      },
+      {
+        "phase": "B-first-1",
+        "length": 8192,
+        "token_ids_equal": true,
+        "token_logprobs_equal": true,
+        "top_logprobs_equal": true,
+        "draft_steps_equal": true,
+        "accepted_draft_tokens_equal": true
+      },
+      {
+        "phase": "B-first-1",
+        "length": 65536,
+        "token_ids_equal": true,
+        "token_logprobs_equal": true,
+        "top_logprobs_equal": true,
+        "draft_steps_equal": true,
+        "accepted_draft_tokens_equal": true
+      },
+      {
+        "phase": "B-second-0",
+        "length": 8192,
+        "token_ids_equal": true,
+        "token_logprobs_equal": true,
+        "top_logprobs_equal": true,
+        "draft_steps_equal": true,
+        "accepted_draft_tokens_equal": true
+      },
+      {
+        "phase": "B-second-0",
+        "length": 65536,
+        "token_ids_equal": true,
+        "token_logprobs_equal": true,
+        "top_logprobs_equal": true,
+        "draft_steps_equal": true,
+        "accepted_draft_tokens_equal": true
+      },
+      {
+        "phase": "B-second-1",
+        "length": 8192,
+        "token_ids_equal": true,
+        "token_logprobs_equal": true,
+        "top_logprobs_equal": true,
+        "draft_steps_equal": true,
+        "accepted_draft_tokens_equal": true
+      },
+      {
+        "phase": "B-second-1",
+        "length": 65536,
+        "token_ids_equal": true,
+        "token_logprobs_equal": true,
+        "top_logprobs_equal": true,
+        "draft_steps_equal": true,
+        "accepted_draft_tokens_equal": true
+      },
+      {
+        "phase": "A-after-0",
+        "length": 8192,
+        "token_ids_equal": true,
+        "token_logprobs_equal": true,
+        "top_logprobs_equal": true,
+        "draft_steps_equal": true,
+        "accepted_draft_tokens_equal": true
+      },
+      {
+        "phase": "A-after-0",
+        "length": 65536,
+        "token_ids_equal": true,
+        "token_logprobs_equal": true,
+        "top_logprobs_equal": true,
+        "draft_steps_equal": true,
+        "accepted_draft_tokens_equal": true
+      },
+      {
+        "phase": "A-after-1",
+        "length": 8192,
+        "token_ids_equal": true,
+        "token_logprobs_equal": true,
+        "top_logprobs_equal": true,
+        "draft_steps_equal": true,
+        "accepted_draft_tokens_equal": true
+      },
+      {
+        "phase": "A-after-1",
+        "length": 65536,
+        "token_ids_equal": true,
+        "token_logprobs_equal": true,
+        "top_logprobs_equal": true,
+        "draft_steps_equal": true,
+        "accepted_draft_tokens_equal": true
+      }
+    ],
+    "samples_per_arm_per_workload": 4,
+    "ordering": "A-before twice, B-first twice, B-second twice, A-after twice; each repetition contains both workloads",
+    "image": "sha256:0ffca9b0e12bbca3e55f43a64351d8d25af336db4d11b27ef3887de4ac9116ed",
+    "reference_namespace": "iso-k3-stable-routes-20260914",
+    "candidate_measurement_namespace": "iso-k3-static-peers-20260914",
+    "workload_source": "research/decode-optimization-20260914/workload.py",
+    "temperature": 0,
+    "seed": 20260912,
+    "input_lengths": [
+      8192,
+      65536
+    ],
+    "output_lengths": [
+      1024,
+      512
+    ]
+  },
+  "review_source": {
+    "review_tree": "/home/g0san/worktrees/b12x-static-peers-pr-20260914",
+    "head": "1faae29c170f57cc5e68aed65a018ad1c72656d3",
+    "files": {
+      "b12x/comm/pcie/_twoshot_bf16_cute.py": "8c6aea4dbc15374c7d16cbcc2fed8b7af5cb73559413a8779c59fa923db36cda",
+      "b12x/comm/pcie/pcie_twoshot_bf16.py": "ef51a4bf3ace106c7700a852063fc1dbf516d1d7edfc356e5b246254a28057aa",
+      "benchmarks/benchmark_kimi_static_peers.py": "e7f6175316da949afe1553753cb43eafcff6d6f265f7d8b12fd57d553cdc74d0",
+      "benchmarks/inspect_static_peer_objects.py": "a42690677ca994a0b7b047656adabdc8abf3d6f2d58a961b8fc76e6ad64fff39"
+    },
+    "exact_research_sources": true
+  },
+  "activation": {
+    "status": "qualified; serving",
+    "package": "/home/g0san/kimi-k3-production/candidates/k3-static-peers-20260914",
+    "verified_utc": "2026-09-14T13:58:10.183441+00:00",
+    "startup_exactness": [
+      {
+        "length": 8192,
+        "token_ids_equal": true,
+        "token_logprobs_equal": true,
+        "top_logprobs_equal": true,
+        "draft_steps_equal": true,
+        "accepted_draft_tokens_equal": true
+      },
+      {
+        "length": 65536,
+        "token_ids_equal": true,
+        "token_logprobs_equal": true,
+        "top_logprobs_equal": true,
+        "draft_steps_equal": true,
+        "accepted_draft_tokens_equal": true
+      }
+    ],
+    "namespace": "iso-k3-stable-routes-20260914",
+    "cross_source_cache_restore": {
+      "external_cache_hits": 13824.0,
+      "tokens_equal": true,
+      "logprobs_equal": true
+    },
+    "cache_restore": true,
+    "four_active": true,
+    "maximum_patch_vision": true,
+    "authenticated_gateway": true,
+    "source_hashes_match": true,
+    "known_corrected_failure": "The first gateway probe preceded listener readiness and got ConnectionRefusedError. Authenticated retry passed without another model restart; activate.py now waits for the listener."
+  },
+  "review_pr": "https://github.com/myshytf/b12x/pull/10"
+}

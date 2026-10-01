@@ -62,6 +62,19 @@ def test_w4a16_small_m_host_barrier_reset_kill_switch(
     assert not _small_m_direct_host_barrier_reset_enabled()
 
 
+def test_w4a16_fc2_runtime_m_does_not_use_fixed_route_staging() -> None:
+    kernel = MoEMicroKernelW4A16SmallMDirect(
+        activation="silu",
+        fast_math=False,
+        share_input_across_experts=False,
+        share_expert_scales=True,
+        single_token=False,
+        scale_format="e8m0_k32",
+        compile_time_phase=2,
+    )
+    assert not kernel.stage_inactive_routes
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("host_barrier_reset", [False, True])
 def test_w4a16_small_m_direct_barrier_modes_eager_and_graph(
@@ -146,6 +159,7 @@ def test_w4a16_small_m_direct_barrier_modes_eager_and_graph(
         topk_weights=topk_weights,
         topk_ids=topk_ids,
         quant_mode="w4a16",
+        output=torch.empty_like(x),
     )
     expected = _reference_w4a16(
         x,
@@ -328,8 +342,10 @@ def test_trellis_w4a16_capture_prewarm_uses_exact_runtime_key(
         n=2048,
         activation="silu",
         trellis_bits=3,
+        trellis_codebook="mcg",
+        trellis_pair_kinds=None,
         trellis_tile_config=None,
-        qsrt_storage_format=None,
+        coupled_hadamard=False,
     )
     fused_calls: list[dict[str, object]] = []
     resolved_fused = object()
@@ -367,8 +383,8 @@ def test_trellis_w4a16_capture_prewarm_uses_exact_runtime_key(
         swiglu_alpha=1.0,
         swiglu_beta=1.0,
         scale_format="e4m3_k32",
-        weight_layout="trellis3_t256",
-        w13_layout="trellis3_t256_proj",
+        weight_layout="trellis_t256",
+        w13_layout="trellis_t256_proj",
         collect_activation_amax=False,
     )
 
@@ -384,7 +400,7 @@ def test_trellis_w4a16_capture_prewarm_uses_exact_runtime_key(
         for direct_m in range(1, _W4A16_SMALL_M_DIRECT_MAX_M + 1)
     )
     assert (
-        workspace.planned_fused_moe_launches[("trellis3_t256", "e4m3_k32", 3072, False)]
+        workspace.planned_fused_moe_launches[("trellis_t256", "e4m3_k32", 3072, False)]
         is resolved_fused
     )
 
@@ -737,6 +753,7 @@ def test_w4a16_fp4_e8m0_k32_kernel_matches_raw_e8m0_oracle(
             block_expert_ids=buffers.block_expert_ids,
             packed_route_count=buffers.packed_route_count,
             expert_offsets=buffers.expert_offsets,
+            expert_counts=buffers.expert_counts,
             swiglu_limit=10.0 if activation == "silu" else None,
         )
 
@@ -1082,6 +1099,163 @@ def test_w4a16_e8m0_native_micro_matches_raw_e8m0_oracle(
         assert bool(torch.isfinite(buffers.output).all().item())
         assert torch.equal(buffers.output, eager)
         _assert_matches_oracle(buffers.output, expected, activation=activation)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    ("m", "route_ids_dtype"),
+    [
+        (1, torch.int32),
+        (2, torch.int32),
+        (4, torch.int32),
+        (8, torch.int32),
+        (1, torch.int64),
+    ],
+)
+def test_w4a16_e8m0_native_micro_ignores_inactive_routes_during_graph_replay(
+    m: int,
+    route_ids_dtype: torch.dtype,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Native small-M execution must not address weights for inactive routes."""
+    import b12x.moe._shared.kernels.w4a16.kernel as w4a16_kernel
+
+    monkeypatch.setenv("B12X_W4A16_SMALL_M_DIRECT", "1")
+    direct_launches = 0
+    real_direct_launch = w4a16_kernel._w4a16_small_m_direct_launch_flat
+
+    def spy_direct_launch(*args, **kwargs) -> None:
+        nonlocal direct_launches
+        direct_launches += 1
+        real_direct_launch(*args, **kwargs)
+
+    monkeypatch.setattr(
+        w4a16_kernel,
+        "_w4a16_small_m_direct_launch_flat",
+        spy_direct_launch,
+    )
+    experts, hidden_size, intermediate_size = 4, 128, 192
+    topk, activation = 2, "situ"
+    rows = 2 * intermediate_size
+    torch.manual_seed(20260817 + m)
+    w13 = torch.randint(
+        0,
+        256,
+        (experts, rows, hidden_size // 2),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    w2 = torch.randint(
+        0,
+        256,
+        (experts, hidden_size, intermediate_size // 2),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    w13_scale = _pattern_e8m0((experts, rows, hidden_size // 32))
+    w2_scale = _pattern_e8m0((experts, hidden_size, intermediate_size // 32), offset=1)
+    global_scale = torch.ones(experts, dtype=torch.float32, device="cuda")
+    prepared = prepare_w4a16_e8m0_native_weights(
+        w13,
+        w13_scale,
+        global_scale,
+        w2,
+        w2_scale,
+        global_scale,
+        activation=activation,
+        params_dtype=torch.bfloat16,
+        w13_layout="w31",
+    )
+    buffers = make_w4a16_buffers(
+        prepared,
+        m=m,
+        topk=topk,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+    )
+    fc2_n_chunks = ((intermediate_size // 2) + 127) // 128
+    intermediate_cache2 = torch.zeros(
+        2 * m * fc2_n_chunks * 128 * topk,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    inputs = torch.randn(m, hidden_size, dtype=torch.bfloat16, device="cuda")
+    topk_ids = torch.randint(
+        0, experts, (m, topk), dtype=route_ids_dtype, device="cuda"
+    )
+    topk_weights = torch.rand(m, topk, dtype=torch.float32, device="cuda")
+
+    def launch() -> torch.Tensor:
+        return run_w4a16_moe(
+            inputs,
+            prepared,
+            topk_weights,
+            topk_ids,
+            activation=activation,
+            intermediate_cache13=buffers.intermediate_cache13,
+            intermediate_cache2=intermediate_cache2,
+            output=buffers.output,
+            fc1_c_tmp=buffers.fc1_c_tmp,
+            fc2_c_tmp=buffers.fc2_c_tmp,
+            packed_route_indices=buffers.packed_route_indices,
+            block_expert_ids=buffers.block_expert_ids,
+            packed_route_count=buffers.packed_route_count,
+            expert_offsets=buffers.expert_offsets,
+        )
+
+    valid_eager = launch().clone()
+    torch.cuda.synchronize()
+    assert direct_launches == 1
+    assert bool(torch.isfinite(valid_eager).all().item())
+    assert bool((valid_eager.abs().sum(dim=1) > 0).all().item())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = launch()
+    assert direct_launches == 2
+
+    inactive_ids = topk_ids.clone()
+    invalid_upper = 1 << 32 if route_ids_dtype == torch.int64 else experts
+    inactive_ids[-1] = torch.tensor(
+        [-1, invalid_upper], dtype=route_ids_dtype, device="cuda"
+    )
+    if m > 1:
+        inactive_ids[0, 0] = -1
+    topk_ids.copy_(inactive_ids)
+    original_weights = topk_weights.clone()
+    active = (inactive_ids >= 0) & (inactive_ids < experts)
+    reference_ids = torch.where(active, inactive_ids, torch.zeros_like(inactive_ids))
+    reference_weights = torch.where(
+        active, topk_weights, torch.zeros_like(topk_weights)
+    )
+    expected = moe_reference_w4a16_fp4_e8m0_k32(
+        inputs,
+        w13,
+        w13_scale,
+        global_scale,
+        w2,
+        w2_scale,
+        global_scale,
+        reference_ids,
+        reference_weights,
+        experts,
+        hidden_size,
+        intermediate_size,
+        activation=activation,
+        w13_layout="w31",
+    )
+
+    eager = launch().clone()
+    torch.cuda.synchronize()
+    _assert_matches_oracle(eager, expected, activation=activation)
+    torch.testing.assert_close(eager[-1], torch.zeros_like(eager[-1]), rtol=0, atol=0)
+
+    captured.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert bool(torch.isfinite(captured).all().item())
+    torch.testing.assert_close(captured, eager, rtol=0, atol=0)
+    torch.testing.assert_close(topk_ids, inactive_ids, rtol=0, atol=0)
+    torch.testing.assert_close(topk_weights, original_weights, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -1993,6 +2167,152 @@ def test_w4a16_tc_decode_preplanned_launch_matches_oracle(m: int) -> None:
     )
     torch.cuda.synchronize()
     _assert_matches_oracle(actual, expected, activation=activation)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_w4a16_prefill_fused_sum_is_graph_safe_and_matches_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Large-M route reduction uses fixed caller-owned scratch across replay.
+
+    Relaxed FP32 atomics may change the final BF16 rounding bit when CTA order
+    changes. Every replay must remain finite, nonzero, and close to the same
+    FP32 oracle without allocating or changing scratch addresses.
+    """
+    monkeypatch.setenv("B12X_W4A16_PREFILL_FUSED_SUM", "1")
+    torch.manual_seed(20260819)
+    m = 32
+    experts, hidden_size, intermediate_size = 8, 128, 128
+    topk, activation = 2, "silu"
+    weights = _make_weights(
+        experts=experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation=activation,
+    )
+    x = (torch.randn(m, hidden_size, device="cuda") * 0.25).to(torch.bfloat16)
+    topk_ids = torch.randint(
+        0, experts, (m, topk), device="cuda", dtype=torch.int32
+    )
+    topk_weights = torch.softmax(torch.randn(m, topk, device="cuda"), dim=-1)
+    prepared = prepare_w4a16_weights(
+        *weights,
+        activation=activation,
+        params_dtype=x.dtype,
+    )
+    buffers = make_w4a16_buffers(
+        prepared,
+        m=m,
+        topk=topk,
+        dtype=x.dtype,
+        device=x.device,
+    )
+    assert buffers.prefill_sum_accum is not None
+    assert buffers.prefill_sum_accum.dtype == torch.float32
+    assert buffers.prefill_sum_accum.numel() == m * hidden_size
+
+    props = torch.cuda.get_device_properties(x.device)
+    block_size_m = select_route_block_size_m(m, topk, experts)
+    _, _, max_m_blocks = route_pack_capacity(
+        m * topk,
+        block_size_m,
+        experts,
+        topk=topk,
+    )
+    fused_launch = compile_w4a16_fused_moe(
+        size_m=m,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=experts,
+        top_k=topk,
+        activation=activation,
+        apply_router_weight_on_input=False,
+        zero_fc2_output=False,
+        moe_block_size=block_size_m,
+        max_m_blocks=max_m_blocks,
+        element_dtype="bf16",
+        sms=int(props.multi_processor_count),
+        max_shared_mem=int(
+            getattr(props, "shared_memory_per_block_optin", _DEFAULT_MAX_SHARED_MEM)
+        ),
+        weight_layout="packed",
+        scale_format="e4m3_k16",
+        w13_layout="packed",
+        prefill_fused_sum_fp32=True,
+    )
+    assert fused_launch.prefill_fused_sum_fp32
+    assert not fused_launch.tc_decode_fused_sum
+
+    def run() -> torch.Tensor:
+        return run_w4a16_moe(
+            x,
+            prepared,
+            topk_weights,
+            topk_ids,
+            activation=activation,
+            fast_math=True,
+            intermediate_cache13=buffers.intermediate_cache13,
+            intermediate_cache2=buffers.intermediate_cache2,
+            output=buffers.output,
+            prefill_sum_accum=buffers.prefill_sum_accum,
+            fc1_c_tmp=buffers.fc1_c_tmp,
+            fc2_c_tmp=buffers.fc2_c_tmp,
+            packed_route_indices=buffers.packed_route_indices,
+            block_expert_ids=buffers.block_expert_ids,
+            packed_route_count=buffers.packed_route_count,
+            expert_offsets=buffers.expert_offsets,
+            expert_counts=buffers.expert_counts,
+            fused_launch=fused_launch,
+        )
+
+    expected = _reference_w4a16(
+        x,
+        *weights,
+        topk_ids,
+        topk_weights,
+        activation=activation,
+    )
+    eager = run().clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run()
+    pointer_contract = (
+        buffers.intermediate_cache13.data_ptr(),
+        buffers.intermediate_cache2.data_ptr(),
+        buffers.prefill_sum_accum.data_ptr(),
+        buffers.output.data_ptr(),
+    )
+    buffers.prefill_sum_accum.fill_(float("nan"))
+    allocated_before_replay = torch.cuda.memory_allocated()
+    graph.replay()
+    torch.cuda.synchronize()
+    allocated_after_replay = torch.cuda.memory_allocated()
+    first_replay = captured.clone()
+    graph.replay()
+    torch.cuda.synchronize()
+    second_replay = captured.clone()
+
+    assert pointer_contract == (
+        buffers.intermediate_cache13.data_ptr(),
+        buffers.intermediate_cache2.data_ptr(),
+        buffers.prefill_sum_accum.data_ptr(),
+        buffers.output.data_ptr(),
+    )
+    assert allocated_after_replay == allocated_before_replay
+    for actual in (eager, first_replay, second_replay):
+        assert bool(torch.isfinite(actual).all().item())
+        assert bool(torch.count_nonzero(actual).item())
+        _assert_matches_oracle(actual, expected, activation=activation)
+    repeat_metrics = compare_to_reference(first_replay, second_replay)
+    assert repeat_metrics.cos >= 0.999999, repeat_metrics
+    torch.testing.assert_close(
+        second_replay,
+        buffers.prefill_sum_accum[: m * hidden_size]
+        .view(m, hidden_size)
+        .to(second_replay.dtype),
+        rtol=0,
+        atol=0,
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -3019,6 +3339,7 @@ def test_w4a16_moe_swiglu_limit_matches_oracle_under_cuda_graph() -> None:
         block_expert_ids=buffers.block_expert_ids,
         packed_route_count=buffers.packed_route_count,
         expert_offsets=buffers.expert_offsets,
+        expert_counts=buffers.expert_counts,
         swiglu_limit=swiglu_limit,
     )
     torch.cuda.synchronize()
@@ -3043,6 +3364,7 @@ def test_w4a16_moe_swiglu_limit_matches_oracle_under_cuda_graph() -> None:
             block_expert_ids=buffers.block_expert_ids,
             packed_route_count=buffers.packed_route_count,
             expert_offsets=buffers.expert_offsets,
+            expert_counts=buffers.expert_counts,
             swiglu_limit=swiglu_limit,
         )
     graph.replay()
@@ -3130,6 +3452,7 @@ def test_w4a16_preplanned_capacity_launch_accepts_smaller_live_m() -> None:
             block_expert_ids=buffers.block_expert_ids,
             packed_route_count=buffers.packed_route_count,
             expert_offsets=buffers.expert_offsets,
+            expert_counts=buffers.expert_counts,
             fused_launch=fused_launch,
             topk_sum_launch=topk_sum_launch,
         )
@@ -3250,6 +3573,78 @@ def test_w4a16_fc2_only_consumes_contiguous_bf16_and_native_mxfp4() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("intermediate_size", [256, 512])
+@pytest.mark.parametrize("route_ids_dtype", [torch.int32, torch.int64])
+def test_w4a16_fc2_only_zeroes_invalid_routes_at_runtime_m3(
+    intermediate_size: int,
+    route_ids_dtype: torch.dtype,
+) -> None:
+    experts, hidden_size, routes = 2, 128, 3
+    w2 = torch.empty(
+        (experts, hidden_size, intermediate_size // 2),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    w2[0].fill_(0x11)
+    w2[1].fill_(0x22)
+    scales = torch.full(
+        (experts, hidden_size, intermediate_size // 32),
+        127,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    intermediate = torch.ones(
+        (routes, intermediate_size), dtype=torch.bfloat16, device="cuda"
+    )
+    invalid_upper = 1 << 32 if route_ids_dtype == torch.int64 else experts
+    route_ids = torch.tensor(
+        [0, -1, invalid_upper], dtype=route_ids_dtype, device="cuda"
+    )
+    route_weights = torch.tensor([0.25, 0.5, 1.0], dtype=torch.float32, device="cuda")
+    original_ids = route_ids.clone()
+    original_weights = route_weights.clone()
+
+    prepared = prepare_w4a16_fc2_e8m0(w2, scales)
+    actual = run_w4a16_fc2_e8m0(
+        intermediate,
+        prepared,
+        route_ids,
+        route_weights,
+    )
+    expected_values = torch.tensor(
+        [intermediate_size / 8.0, 0.0, 0.0],
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    expected = expected_values[:, None].expand_as(actual)
+
+    assert bool(torch.isfinite(actual).all().item())
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(route_ids, original_ids, rtol=0, atol=0)
+    torch.testing.assert_close(route_weights, original_weights, rtol=0, atol=0)
+
+    graph_output = torch.empty_like(actual)
+    prewarm_w4a16_fc2_e8m0(prepared, route_ids_dtype=route_ids_dtype)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run_w4a16_fc2_e8m0(
+            intermediate,
+            prepared,
+            route_ids,
+            route_weights,
+            output=graph_output,
+        )
+    captured.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert captured is graph_output
+    assert bool(torch.isfinite(captured).all().item())
+    torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+    torch.testing.assert_close(route_ids, original_ids, rtol=0, atol=0)
+    torch.testing.assert_close(route_weights, original_weights, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_w4a16_fc2_only_is_cuda_graph_safe_with_preallocated_output() -> None:
     experts, hidden_size, intermediate_size, routes = 5, 128, 256, 7
     w2 = torch.empty(
@@ -3268,15 +3663,11 @@ def test_w4a16_fc2_only_is_cuda_graph_safe_with_preallocated_output() -> None:
     intermediate = torch.ones(
         (routes, intermediate_size), dtype=torch.bfloat16, device="cuda"
     )
-    route_ids = torch.tensor(
-        [0, 1, 2, 3, 4, 0, 2], dtype=torch.int32, device="cuda"
-    )
+    route_ids = torch.tensor([0, 1, 0, 1, 0, 1, 0], dtype=torch.int32, device="cuda")
     route_weights = torch.linspace(
         0.125, 0.875, routes, dtype=torch.float32, device="cuda"
     )
-    output = torch.empty(
-        (routes, hidden_size), dtype=torch.bfloat16, device="cuda"
-    )
+    output = torch.empty((routes, hidden_size), dtype=torch.bfloat16, device="cuda")
 
     prepared = prepare_w4a16_fc2_e8m0(w2, scales)
     prewarm_w4a16_fc2_e8m0(prepared, route_ids_dtype=torch.int32)
@@ -3294,14 +3685,46 @@ def test_w4a16_fc2_only_is_cuda_graph_safe_with_preallocated_output() -> None:
     graph.replay()
     torch.cuda.synchronize()
 
-    expected = torch.empty_like(output)
+    valid_values = (
+        256.0
+        * route_weights
+        * torch.where(
+            route_ids == 0,
+            torch.tensor(0.5, device="cuda"),
+            torch.tensor(1.0, device="cuda"),
+        )
+    )
+    valid_expected = valid_values.to(torch.bfloat16)[:, None].expand_as(output)
+    torch.testing.assert_close(captured, valid_expected, rtol=0, atol=0)
+
+    invalid_ids = torch.tensor(
+        [0, -1, 1, experts, 0, -9, 1], dtype=torch.int32, device="cuda"
+    )
+    route_ids.copy_(invalid_ids)
+    original_weights = route_weights.clone()
+    invalid_values = torch.tensor(
+        [16.0, 0.0, 96.0, 0.0, 80.0, 0.0, 224.0],
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    invalid_expected = invalid_values[:, None].expand_as(output)
+
+    eager = torch.empty_like(output)
     run_w4a16_fc2_e8m0(
         intermediate,
         prepared,
         route_ids,
         route_weights,
-        output=expected,
+        output=eager,
     )
     torch.cuda.synchronize()
+    torch.testing.assert_close(eager, invalid_expected, rtol=0, atol=0)
+
+    captured.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
     assert captured is output
-    torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+    assert bool(torch.isfinite(captured).all().item())
+    torch.testing.assert_close(captured, invalid_expected, rtol=0, atol=0)
+    torch.testing.assert_close(route_ids, invalid_ids, rtol=0, atol=0)
+    torch.testing.assert_close(route_weights, original_weights, rtol=0, atol=0)

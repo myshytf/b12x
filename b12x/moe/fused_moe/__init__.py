@@ -46,6 +46,8 @@ META = OpMeta(
     group="moe",
     api_style="planned",
     entry_points=(
+        "ActivationSpec", "MoEGeometry", "TrellisConfig", "TrellisExtent",
+        "TrellisSource", "TrellisStaging", "ScaleFactors", "TrellisWeights",
         "Caps",
         "Plan",
         "ExecutionPlan",
@@ -75,6 +77,7 @@ META = OpMeta(
     ),
     dtypes=("bf16", "fp16"),
     recipes=(
+        "w4a16/b12x_trellis",
         "nvfp4",
         "mxfp4",
         "w4a8_mx",

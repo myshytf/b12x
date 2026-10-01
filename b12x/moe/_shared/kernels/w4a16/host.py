@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import os
+
 import torch
 
+from b12x._lib.env import env_flag
 from b12x.moe._shared.kernels.activations import (
     SUPPORTED_MOE_ACTIVATIONS,
     is_gated_moe_activation,
@@ -13,9 +16,92 @@ from b12x.moe._shared.kernels.activations import (
 )
 
 
+# Route block sizes the W4A16 kernels accept. The ceiling is a property of the
+# large-M schedule, not a tuning choice: it keeps one fp32 accumulator set per
+# 16 routed rows live in registers for the whole K loop and addresses exactly
+# four of them, so 64 rows is the largest block it can compute. Widening this
+# tuple without widening that schedule is rejected by
+# ``W4A16GemmKernel.__init__`` (see ``_W4A16_MAX_LARGE_M_ACC_SETS``).
 _W4A16_ALLOWED_ROUTED_SIZES = (8, 16, 32, 48, 64)
 _ROUTED_SIZE_TARGET_FILL = 0.9
 _SUPPORTED_ACTIVATIONS = SUPPORTED_MOE_ACTIVATIONS
+
+
+def prefill_fused_sum_enabled() -> bool:
+    """Enable direct FP32 route reduction for large-M W4A16 launches.
+
+    The FC2 epilogue uses relaxed FP32 global reductions. Disable this path
+    when bitwise-identical route accumulation order is required.
+    """
+    return env_flag("W4A16_PREFILL_FUSED_SUM")
+
+
+_TOPK_SUM_OUTPUT_DTYPES = {
+    "fp32": torch.float32,
+    "bf16": torch.bfloat16,
+    "fp16": torch.float16,
+}
+
+
+def w4a16_topk_sum_rotation_output_dtype() -> str:
+    """Output element of the full-rotation W4A16 top-k route sum.
+
+    ``B12X_W4A16_TOPK_SUM_OUTPUT`` selects ``fp32`` (default: the kernel stores
+    the fp32 route sum and the caller rounds it to the model dtype in a
+    separate cast), ``bf16`` or ``fp16`` (the kernel rounds the same fp32 value
+    once, to nearest even, in its store, so the bytes equal the separate
+    cast's and the cast launch disappears). The setting is read when the
+    kernel is compiled (prewarm included), when the output scratch is
+    allocated and when a launch checks its output tensor, so one process uses
+    one variant. The plain (non-rotation) sum always stores the element dtype.
+    """
+    raw = os.environ.get("B12X_W4A16_TOPK_SUM_OUTPUT", "fp32").strip().lower()
+    if raw not in _TOPK_SUM_OUTPUT_DTYPES:
+        raise ValueError(
+            "B12X_W4A16_TOPK_SUM_OUTPUT must be fp32, bf16 or fp16, "
+            f"got {raw!r}"
+        )
+    return raw
+
+
+def w4a16_topk_sum_rotation_output_torch_dtype() -> torch.dtype:
+    """Torch dtype of the full-rotation top-k sum output (see the setting)."""
+    return _TOPK_SUM_OUTPUT_DTYPES[w4a16_topk_sum_rotation_output_dtype()]
+
+
+def prefill_fused_sum_eligible(
+    *,
+    dtype: torch.dtype | str,
+    m: int,
+    full_rotation: bool,
+    weight_layout: str,
+    collect_activation_amax: bool,
+    enabled: bool | None = None,
+) -> bool:
+    """Return whether one W4A16 launch may use direct route reduction.
+
+    Args:
+        dtype: Activation element dtype as a PyTorch dtype or kernel dtype name.
+        m: Logical token rows represented by the launch.
+        full_rotation: Whether the launch uses full-rotation Trellis weights.
+        weight_layout: Prepared W4A16 weight layout.
+        collect_activation_amax: Whether the launch records activation maxima.
+        enabled: Frozen feature selection. ``None`` reads the process setting.
+
+    Returns:
+        ``True`` when planning and execution may use the FP32 accumulator.
+    """
+    if enabled is None:
+        enabled = prefill_fused_sum_enabled()
+    element_dtype = str(dtype).removeprefix("torch.")
+    return bool(
+        enabled
+        and element_dtype in {"bfloat16", "bf16"}
+        and int(m) > 8
+        and not full_rotation
+        and weight_layout in {"packed", "modelopt"}
+        and not collect_activation_amax
+    )
 
 
 @dataclass(frozen=True)
@@ -32,6 +118,7 @@ class W4A16PackedBuffers:
     intermediate_cache13: torch.Tensor
     intermediate_cache2: torch.Tensor
     output: torch.Tensor
+    prefill_sum_accum: torch.Tensor | None = None
     fc1_c_tmp: torch.Tensor | None = None
     fc2_c_tmp: torch.Tensor | None = None
     packed_route_indices: torch.Tensor | None = None
@@ -55,6 +142,7 @@ class W4A16BufferPlan:
     intermediate_cache2_elements: int
     block_size_m: int
     rotation_a_elements: int = 0
+    prefill_sum_accum_elements: int = 0
 
 
 def validate_activation(activation: str) -> bool:
@@ -190,6 +278,32 @@ def route_pack_token_capacity(tokens: int, topk: int) -> int:
     return 1 << (max(int(tokens), 1) - 1).bit_length()
 
 
+def route_pack_warmup_token_counts(capacity: int) -> tuple[int, ...]:
+    """Return live row counts covering capacity and scalar specializations.
+
+    Triton specializes the runtime ``live_numel`` scalar on alignment as well
+    as the constexpr route-capacity bucket. For a power-of-two bucket, the
+    bucket maximum and its first live member cover both alignment classes
+    reached by the GLM top-k route counts (for example 8 and 5 rows in the
+    8-row bucket). Warming only bucket maxima leaves the less-aligned variant
+    to compile on the first odd-sized request.
+    """
+    capacity = int(capacity)
+    if capacity < 1:
+        raise ValueError(f"route-pack warmup capacity must be positive, got {capacity}")
+    counts: list[int] = []
+    bucket = 1
+    while True:
+        first_in_bucket = 1 if bucket == 1 else bucket // 2 + 1
+        if first_in_bucket > capacity:
+            break
+        for count in (first_in_bucket, min(bucket, capacity)):
+            if not counts or counts[-1] != count:
+                counts.append(count)
+        bucket *= 2
+    return tuple(counts)
+
+
 def route_pack_capacity(
     numel: int,
     block_size: int,
@@ -248,8 +362,12 @@ def plan_w4a16_buffers(
     topk: int,
     route_num_experts: int | None = None,
     sms: int,
+    dtype: torch.dtype | None = None,
     full_rotation: bool = False,
     block_size_m: int | None = None,
+    weight_layout: str | None = None,
+    collect_activation_amax: bool = False,
+    prefill_fused_sum: bool | None = None,
 ) -> W4A16BufferPlan:
     routed_rows = int(m) * int(topk)
     route_num_experts = (
@@ -280,6 +398,19 @@ def plan_w4a16_buffers(
     if int(m) <= 8 and bool(prepared.is_gated):
         gemm_route_slots = max(gemm_route_slots, routed_rows * block_size_m)
     scratch_sms = int(sms)
+    weight_layout = str(
+        weight_layout
+        if weight_layout is not None
+        else getattr(prepared, "weight_layout", "packed")
+    )
+    use_prefill_fused_sum = prefill_fused_sum_eligible(
+        dtype=dtype if dtype is not None else "",
+        m=m,
+        full_rotation=full_rotation,
+        weight_layout=weight_layout,
+        collect_activation_amax=collect_activation_amax,
+        enabled=prefill_fused_sum,
+    )
     return W4A16BufferPlan(
         routed_rows=routed_rows,
         fc1_cols=fc1_cols,
@@ -297,10 +428,19 @@ def plan_w4a16_buffers(
             moe_block_size=block_size_m,
             sms=scratch_sms,
         ),
-        intermediate_cache13_elements=routed_rows * max(fc1_cols, hidden_size),
+        intermediate_cache13_elements=(
+            routed_rows * fc1_cols
+            if use_prefill_fused_sum
+            else routed_rows * max(fc1_cols, hidden_size)
+        ),
         intermediate_cache2_elements=routed_rows * intermediate_size,
         block_size_m=block_size_m,
         rotation_a_elements=(routed_rows * hidden_size if full_rotation else 0),
+        prefill_sum_accum_elements=(
+            int(m) * hidden_size
+            if use_prefill_fused_sum
+            else 0
+        ),
     )
 
 
@@ -327,6 +467,7 @@ def make_w4a16_packed_buffers(
         topk=topk,
         route_num_experts=route_num_experts,
         sms=sms,
+        dtype=dtype,
         full_rotation=full_rotation,
         block_size_m=block_size_m,
     )
@@ -373,8 +514,19 @@ def make_w4a16_packed_buffers(
         ),
         output=torch.empty(
             (m, prepared.hidden_size),
-            dtype=torch.float32 if full_rotation else dtype,
+            dtype=w4a16_topk_sum_rotation_output_torch_dtype()
+            if full_rotation
+            else dtype,
             device=device,
+        ),
+        prefill_sum_accum=(
+            torch.empty(
+                (plan.prefill_sum_accum_elements,),
+                dtype=torch.float32,
+                device=device,
+            )
+            if plan.prefill_sum_accum_elements
+            else None
         ),
         fc1_c_tmp=fc1_c_tmp,
         fc2_c_tmp=fc2_c_tmp,
@@ -409,6 +561,7 @@ __all__ = [
     "route_pack_numel_capacity",
     "route_pack_capacity",
     "route_pack_token_capacity",
+    "route_pack_warmup_token_counts",
     "select_route_block_size_m",
     "unswizzle_block_scale",
     "unswizzle_expert_scales",

@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from collections import OrderedDict
 from contextlib import suppress
 from functools import lru_cache
 from statistics import median
@@ -24,6 +25,13 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from ._cuda_ipc import CudaRTLibrary
+from .pcie_dma_reference import (
+    final_handshake_slot,
+    granule_elems_for,
+    lossless_access_plan,
+    scratch_step_widths,
+    validate_access_plan,
+)
 from .pcie_oneshot import PCIeOneshotAllReduce, _normalize_device
 
 logger = logging.getLogger(__name__)
@@ -33,12 +41,37 @@ SUPPORTED_DTYPES = {
     torch.float16: 1,
     torch.float32: 2,
 }
-SUPPORTED_WORLD_SIZES = (2, 4, 6, 8, 10)
+SUPPORTED_WORLD_SIZES = (2, 4, 6, 8, 9, 10)
 FLAG_STRIDE = 128
 FLAG_SLOTS = 256
 MAX_PIECES = 8
 SCRATCH_ALIGN = 256
 FP8_QUANT_BLOCK = 128
+# Flag-slot ranges per collective. Every slot's monotonic counter is owned by
+# exactly one op kind, so an all-reduce, a paired all-gather and a column
+# reduce-scatter can be mixed in any order without agreeing on a piece count.
+# The all-reduce ring (and the compressed all-to-all) publishes one slot per
+# (step, piece) plus a done slot: at most 2 * (world - 1) * MAX_PIECES + 1
+# slots, 145 at the largest supported world size. The paired all-gather uses
+# one slot per step plus done (world slots); the column reduce-scatter one
+# slot per (step, piece) with at most two pieces, plus done.
+AR_SLOT_BASE = 0
+AR_SLOT_COUNT = 2 * (max(SUPPORTED_WORLD_SIZES) - 1) * MAX_PIECES + 1
+AG_PAIR_SLOT_BASE = 152
+AG_PAIR_SLOT_COUNT = max(SUPPORTED_WORLD_SIZES)
+RS_SLOT_BASE = 168
+RS_MAX_PIECES = 2
+RS_SLOT_COUNT = (max(SUPPORTED_WORLD_SIZES) - 1) * RS_MAX_PIECES + 1
+assert AR_SLOT_BASE + AR_SLOT_COUNT <= AG_PAIR_SLOT_BASE
+assert AG_PAIR_SLOT_BASE + AG_PAIR_SLOT_COUNT <= RS_SLOT_BASE
+assert RS_SLOT_BASE + RS_SLOT_COUNT <= FLAG_SLOTS
+# Replay entries used within this many ring operations of the newest one are
+# never evicted: a borrowed static output is consumed by its caller before
+# the caller's next op on the same entry, which in the Kimi-K3 layer is at
+# most three ring ops later (attention all-reduce -> gather pair ->
+# reduce-scatter -> MoE all-reduce).
+REPLAY_EVICTION_GUARD_OPS = 3
+RS_WIRE_MODES = ("fp32", "bf16")
 
 
 def _fp8_mode() -> str:
@@ -136,8 +169,170 @@ def _load_kernels():
     return DmaKernels(CudaRTLibrary())
 
 
+def _ring_granule_rows() -> int:
+    """Opt-in row-count-invariant chunk mapping of the lossless ring.
+
+    The served mapping reduces flat chunk ``c`` (``numel / world`` contiguous
+    elements) in the rank order ``c, c + 1, ..., c - 1``, so an element's
+    reduction order depends on its row block ``row // (rows / world)`` and a
+    tensor reduced as row slices does not reproduce the bits of the tensor
+    reduced whole. With ``B12X_PCIE_RING_GRANULE_ROWS=g`` (``g > 0``) a 2-D
+    ``[rows, width]`` input is reduced in granules of ``g`` rows: granule
+    ``b`` belongs to chunk ``b mod world``, so the order depends only on
+    ``row mod (world * g)`` and every row slice whose length is a multiple of
+    ``world * g`` rows reduces bit-identically to the whole. The wire bytes
+    and the number of roundings are unchanged; only the summation order of
+    the reduced tensors changes. Inputs that are not 2-D, whose row count is
+    not a multiple of ``world * g``, that would need more than ``MAX_PIECES``
+    granules per chunk, or that use a compressed wire keep the served
+    mapping. 0 (default): served mapping everywhere.
+    """
+    return max(0, int(os.getenv("B12X_PCIE_RING_GRANULE_ROWS", "0")))
+
+
+def _ring_fp32_hops() -> int:
+    """Opt-in fp32 partial sums on the trailing reduce-scatter hops.
+
+    The served ring stores every reduce-scatter add as bf16, so a nine-rank
+    sum is rounded eight times. With ``B12X_PCIE_RING_FP32_HOPS=p``
+    (``1 <= p <= world - 2``) the last ``p`` reduce-scatter hops carry the
+    running sum as fp32 and the adds feeding them keep fp32: an element is
+    rounded ``world - 1 - p`` times, once at ``p = world - 2`` (fp32
+    accumulation in ring order, the precision class of the two-shot
+    all-reduce). The first hop always sends the caller's bf16 input, so
+    ``p = world - 2`` is the full fp32 wire. Link bytes grow by
+    ``p / (2 * (world - 1))`` of the served all-reduce bytes (``p / 16`` at
+    nine ranks: +6.25 % per hop, +43.75 % for the full fp32 wire) and the
+    scratch slab grows by ``p`` shard capacities. bf16 inputs only; the
+    served bf16 schedule is used for other dtypes and for compressed wires.
+    0 (default): served bf16 hops.
+    """
+    return max(0, int(os.getenv("B12X_PCIE_RING_FP32_HOPS", "0")))
+
+
+def _ring_check_bounds() -> bool:
+    """Check every buffer range of the lossless ring against the slab
+    capacities before the call issues a kernel.
+
+    A range that leaves its buffer faults on the device, where the report is
+    an asynchronous ``unspecified launch failure`` on some later
+    synchronization with no indication of which step, piece or rank produced
+    it. The check is a few hundred integer comparisons per call on the host,
+    which is why it is opt-in rather than always on; enable it when a ring
+    configuration is being brought up or bisected.
+    """
+    return os.getenv("B12X_PCIE_RING_CHECK_BOUNDS", "0") == "1"
+
+
+
+
+def _graph_replay_mode() -> bool:
+    """Opt-in CUDA-graph replay of eager ring all-reduces.
+
+    An eager call issues ~250 CUDA API calls from Python (per-piece copies,
+    flag kernels, adds and the cross-stream events), which costs more host
+    time than the transfer takes on the wire for prefill-size tensors. With
+    replay enabled, every shape at or above ``_graph_replay_min_bytes()``
+    is captured once into a CUDA graph over static buffers and later calls
+    copy in, replay, and copy out. The kernels and their order are unchanged,
+    so the result is bit-identical to the eager path. A caller that writes
+    the static input itself (``all_reduce_input``) and consumes the static
+    output directly (``borrow_output``) skips both copies. The static buffers
+    for every cache entry are reserved when the ring is constructed
+    (max_entries x 2 x max_bytes), so serving never allocates and never
+    falls back for lack of device memory.
+    """
+    return os.getenv("B12X_PCIE_DMA_GRAPH_REPLAY", "0") == "1"
+
+
+def _graph_replay_min_bytes() -> int:
+    return int(os.getenv("B12X_PCIE_DMA_GRAPH_REPLAY_MIN_BYTES", str(8 << 20)))
+
+
+def _graph_replay_max_entries() -> int:
+    """Upper bound on cached shapes; the least recently used one is dropped
+    first. Each entry holds two static buffers of the tensor size."""
+    return max(1, int(os.getenv("B12X_PCIE_DMA_GRAPH_REPLAY_MAX_ENTRIES", "4")))
+
+
+class _ReplayEntry:
+    """A captured ring graph with its static buffers.
+
+    ``inputs``/``outputs`` are the static views a caller may write into
+    (``inputs``, via the ``*_input`` accessors) or read directly after the op
+    (``outputs``, when borrowing). The lossless all-reduce entry is in place:
+    its single static buffer is both input and output, so a producer that
+    writes it and a consumer that reads it need no staging copy at all.
+    ``scratch`` holds op-private static storage (the running partial sums of
+    the reduce-scatter). ``last_use`` is the ring-op sequence number of the
+    last issue; entries used within ``REPLAY_EVICTION_GUARD_OPS`` of the
+    newest op are not evicted.
+    """
+
+    __slots__ = (
+        "key",
+        "inputs",
+        "outputs",
+        "scratch",
+        "graph",
+        "slot",
+        "last_use",
+    )
+
+    def __init__(
+        self,
+        key: tuple,
+        inputs: tuple[torch.Tensor, ...],
+        outputs: tuple[torch.Tensor, ...],
+        graph,
+        slot: int,
+        scratch: tuple[torch.Tensor, ...] = (),
+    ) -> None:
+        self.key = key
+        self.inputs = inputs
+        self.outputs = outputs
+        self.scratch = scratch
+        self.graph = graph
+        self.slot = slot
+        self.last_use = 0
+
+    # Source-compatible aliases for the single-tensor all-reduce entry.
+    @property
+    def inp(self) -> torch.Tensor:
+        return self.inputs[0]
+
+    @property
+    def out(self) -> torch.Tensor:
+        return self.outputs[0]
+
+
 def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
+
+
+def _same_storage(a: torch.Tensor, b: torch.Tensor) -> bool:
+    return (
+        a.data_ptr() == b.data_ptr()
+        and a.numel() == b.numel()
+        and a.dtype == b.dtype
+    )
+
+
+def _byte_ranges_overlap(a: torch.Tensor, b: torch.Tensor) -> bool:
+    a_start = a.data_ptr()
+    a_end = a_start + a.numel() * a.element_size()
+    b_start = b.data_ptr()
+    b_end = b_start + b.numel() * b.element_size()
+    return a_start < b_end and b_start < a_end
+
+
+def _rs_wire_mode(value: str | None) -> str:
+    mode = (value or "fp32").strip().lower()
+    if mode not in RS_WIRE_MODES:
+        raise ValueError(
+            f"reduce-scatter wire must be one of {RS_WIRE_MODES}, got {value!r}"
+        )
+    return mode
 
 
 class PCIeDmaAllReduce:
@@ -156,10 +351,21 @@ class PCIeDmaAllReduce:
         max_bytes: int,
         ext_module=None,
         fp8: Optional[str] = None,
+        granule_rows: Optional[int] = None,
+        fp32_hops: Optional[int] = None,
     ) -> None:
         # Kept only as a source-compatible keyword for callers that used to
         # inject the removed C++ extension.  Device work is always CuTe DSL.
         del ext_module
+        # Explicit arguments win over the environment (same contract as fp8).
+        self._granule_rows = (
+            max(0, int(granule_rows))
+            if granule_rows is not None
+            else _ring_granule_rows()
+        )
+        requested_hops = (
+            max(0, int(fp32_hops)) if fp32_hops is not None else _ring_fp32_hops()
+        )
         self.group = exchange_group
         self.rank = dist.get_rank(group=exchange_group)
         self.world_size = dist.get_world_size(group=exchange_group)
@@ -172,6 +378,16 @@ class PCIeDmaAllReduce:
         if self.device.type != "cuda":
             raise ValueError("PCIe ring allreduce requires a CUDA device")
         self.max_bytes = int(max_bytes)
+        self._wire_input = None
+        self._wire_output = None
+        if self.world_size == 9:
+            # Eight-element shards keep vector accesses aligned for every
+            # supported dtype. Wire tails do not change the model tensors.
+            wire_bytes = _align_up(self.max_bytes, self.world_size * 8 * 4)
+            self._wire_input = torch.empty(
+                wire_bytes, dtype=torch.uint8, device=self.device
+            )
+            self._wire_output = torch.empty_like(self._wire_input)
         self._kernels = _load_kernels()
         self._ipc = CudaRTLibrary()
         self._ipc.cudaSetDevice(self.device.index or 0)
@@ -180,14 +396,31 @@ class PCIeDmaAllReduce:
         self.shard_capacity = _align_up(
             (self.max_bytes + self.world_size - 1) // self.world_size, SCRATCH_ALIGN
         )
-        steps = 2 * (self.world_size - 1)
+        # The lossless ring with fp32 hops addresses its receive areas through
+        # ``_scratch_offsets`` (an fp32 running sum needs two shard
+        # capacities). Every other op addresses scratch through
+        # ``_scratch_ptr`` as ``2 * (world - 1)`` areas of one capacity, which
+        # the layout always covers; ops on one channel never overlap, so the
+        # two views of the same slab never coexist.
+        self._fp32_hops = min(requested_hops, self.world_size - 2)
+        self._scratch_offsets, scratch_bytes = self._scratch_layout(
+            self.shard_capacity, self.world_size, self._fp32_hops
+        )
         flags_bytes = FLAG_SLOTS * FLAG_STRIDE
-        slab_bytes = flags_bytes + steps * self.shard_capacity
+        slab_bytes = flags_bytes + scratch_bytes
         self._slab = PCIeOneshotAllReduce._allocate_shared_buffer(
             exchange_group, slab_bytes, zero_fill=True, ipc=self._ipc
         )
         self._flags_base = list(self._slab.peer_ptrs)
         self._scratch_base = [ptr + flags_bytes for ptr in self._slab.peer_ptrs]
+        # Local (not IPC) fp32 running sums of the first fp32-kept add: that
+        # add receives a bf16 piece and cannot widen it in place, so its
+        # result lives here until the next hop's copy has sent it.
+        self._fp32_stage = (
+            torch.empty(2 * self.shard_capacity, dtype=torch.uint8, device=self.device)
+            if self._fp32_hops
+            else None
+        )
         # Device-resident monotonic counters: one per flag slot for the
         # publisher role and one for the waiter role.
         self._send_counters = torch.zeros(
@@ -203,6 +436,9 @@ class PCIeDmaAllReduce:
         # behind it.
         self._ag_copy_stream = torch.cuda.Stream(device=self.device)
         self._ag_flag_stream = torch.cuda.Stream(device=self.device)
+        self._pipeline_all_gather = (
+            os.getenv("B12X_PCIE_DMA_PIPELINED_GATHER", "0") == "1"
+        )
         # Persistent cross-stream events: captured graphs keep references to
         # recorded events, so per-call temporaries must not be destroyed.
         self._piece_events = [torch.cuda.Event() for _ in range(MAX_PIECES)]
@@ -229,6 +465,46 @@ class PCIeDmaAllReduce:
             )
             self._fp8_stage_stride = stride
         self.min_bytes = 0
+        self._graph_replay = _graph_replay_mode()
+        self._graph_replay_min_bytes = _graph_replay_min_bytes()
+        self._graph_replay_max_entries = _graph_replay_max_entries()
+        # Replay key ``(op, numel, dtype)`` -> captured graph with its static
+        # buffers (insertion order doubles as the LRU order); a shape is
+        # captured on its second eager-eligible call so one-off sizes
+        # (prefill tail chunks) stay eager instead of churning captures. The
+        # op tag keeps an all-reduce, a paired all-gather and a column
+        # reduce-scatter of equal element counts on separate entries.
+        self._replay_entries: "OrderedDict[tuple, _ReplayEntry]" = OrderedDict()
+        self._replay_seen: dict[tuple, int] = {}
+        self._replay_capture_stream: torch.cuda.Stream | None = None
+        # Ring-op sequence number: every issued op (eager or replayed)
+        # increments it; entries record it as their last use.
+        self._op_seq = 0
+        self._rs_prepared_wires: set[str] = set()
+        # The lossless ring reads each input chunk before the step that
+        # overwrites the same chunk of the output (the reduce adds are
+        # elementwise on one chunk; the first send of the owner chunk
+        # completes, through the flag chain around the ring, before the
+        # all-gather step that receives that chunk), so its replay entry can
+        # use one buffer as both static input and output. The compressed
+        # wire modes keep separate buffers.
+        self._replay_in_place = not self._fp8
+        # Static storage for every cached shape is reserved here, once, so a
+        # capture during serving never allocates device memory (and can never
+        # fail for lack of it): one slot of 2 x max_bytes per cache entry,
+        # carved into views per op (an in-place all-reduce uses one buffer of
+        # the tensor size; a paired all-gather or a reduce-scatter carves its
+        # inputs, outputs and partial sums out of the same slot).
+        self._replay_slot_bytes = 2 * _align_up(self.max_bytes, SCRATCH_ALIGN)
+        self._replay_arena: torch.Tensor | None = None
+        self._replay_free_slots: list[int] = []
+        if self._graph_replay:
+            self._replay_arena = torch.empty(
+                self._graph_replay_max_entries * self._replay_slot_bytes,
+                dtype=torch.uint8,
+                device=self.device,
+            )
+            self._replay_free_slots = list(range(self._graph_replay_max_entries))
         wire_modes = {
             "i8": "int8-ag",
             "i8_ring": "int8-ring",
@@ -240,10 +516,20 @@ class PCIeDmaAllReduce:
         self.wire_mode = wire_modes.get(
             self._fp8, f"fp8-{self._fp8}" if self._fp8 else "bf16"
         )
-        logger.debug("[PCIe DMA allreduce] wire mode: %s", self.wire_mode)
+        logger.debug(
+            "[PCIe DMA allreduce] wire mode: %s, granule rows: %d, fp32 hops: %d",
+            self.wire_mode,
+            self._granule_rows,
+            self._fp32_hops,
+        )
         prepare = getattr(self._kernels, "prepare", None)
         if prepare is not None:
             prepare(world_size=self.world_size, wire_mode=self._fp8)
+            if self._fp32_hops:
+                # The fp32 hops use the mixed-precision adds of the fp32-wire
+                # column reduce-scatter; compile them before any capture.
+                self._kernels.prepare_reduce_scatter(wire="fp32")
+                self._rs_prepared_wires.add("fp32")
         if logger.isEnabledFor(logging.DEBUG):
             self._log_peer_copy_bandwidth()
 
@@ -313,6 +599,51 @@ class PCIeDmaAllReduce:
         return self._scratch_base[rank] + step * self.shard_capacity
 
     @staticmethod
+    def _scratch_layout(
+        shard_capacity: int, world: int, fp32_hops: int
+    ) -> tuple[tuple[int, ...], int]:
+        """Byte offset of every step's scratch area and the total scratch
+        bytes. Every area holds one shard capacity, except the areas of the
+        ``fp32_hops`` trailing reduce-scatter steps, which receive fp32
+        running sums and hold two. With ``fp32_hops == 0`` this is the
+        served layout ``step * shard_capacity``."""
+        offsets = []
+        total = 0
+        for width in scratch_step_widths(world, fp32_hops):
+            offsets.append(total)
+            total += width * shard_capacity
+        return tuple(offsets), total
+
+    def _granule_elems(self, inp: torch.Tensor) -> int:
+        """Elements per granule of the row-count-invariant mapping for
+        ``inp``, or 0 when ``inp`` reduces with the served mapping (see
+        ``_ring_granule_rows``). Every rank sees the same shape, so every
+        rank takes the same branch."""
+        if self._fp8:
+            return 0
+        return granule_elems_for(
+            tuple(inp.shape), self.world_size, self._granule_rows, MAX_PIECES
+        )
+
+    def _replay_key(self, inp: torch.Tensor) -> tuple[int, torch.dtype, int]:
+        """Replay cache key: the flat size, the dtype and the granule size.
+
+        The granule size (0 for the served mapping) is part of the key
+        because two tensors of equal size but different widths reduce with
+        different granule mappings ([4608, 3584] and [2304, 7168] are both
+        16,515,072 elements); the served mapping is width-independent, so
+        with granules off the key reduces to the served (numel, dtype).
+        """
+        return (inp.numel(), inp.dtype, self._granule_elems(inp))
+
+    def _fp32_hops_for(self, inp: torch.Tensor) -> int:
+        """fp32 reduce-scatter hops applied to ``inp`` (bf16, lossless wire
+        only; 0 otherwise)."""
+        if self._fp8 or inp.dtype != torch.bfloat16:
+            return 0
+        return self._fp32_hops
+
+    @staticmethod
     def _pick_pieces(shard_elems: int, shard_bytes: int) -> int:
         override = int(os.getenv("B12X_PCIE_DMA_PIECES", "0"))
         # pieces=2 measured best at every size (deeper chunking pays an
@@ -329,7 +660,8 @@ class PCIeDmaAllReduce:
         if inp.dtype not in SUPPORTED_DTYPES:
             return False
         numel = inp.numel()
-        if numel <= 0 or numel % (self.world_size * 8) != 0:
+        alignment = 8 if self.world_size == 9 else self.world_size * 8
+        if numel <= 0 or numel % alignment != 0:
             return False
         size_bytes = numel * inp.element_size()
         if size_bytes < self.min_bytes:
@@ -337,10 +669,239 @@ class PCIeDmaAllReduce:
         return inp.is_contiguous() and size_bytes <= self.max_bytes
 
     def all_reduce(
-        self, inp: torch.Tensor, *, out: Optional[torch.Tensor] = None
+        self,
+        inp: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+        borrow_output: bool = False,
     ) -> torch.Tensor:
+        """Ring all-reduce of ``inp``.
+
+        ``borrow_output=True`` lets a replayed call return the entry's static
+        output instead of copying it into fresh storage. The returned tensor
+        then aliases ring-owned memory that the next all-reduce with the same
+        ``(numel, dtype)`` overwrites, so the caller must consume it before
+        issuing that op (and must not pass ``out``). When ``inp`` is the
+        entry's static input (see ``all_reduce_input``; for the lossless
+        in-place entry that is also the buffer a previous borrow returned),
+        the input staging copy is skipped as well. The result is bit-identical
+        either way because the captured kernels and their order do not
+        change. Eager calls (unreplayed shapes) keep out-of-place semantics
+        regardless of ``borrow_output``.
+        """
+        if borrow_output and out is not None:
+            raise ValueError("borrow_output cannot be combined with out=")
         with torch.cuda.device(self.device):
+            if self._graph_replay and self._graph_replay_eligible(inp):
+                return self._all_reduce_replayed(inp, out, borrow_output)
+            self._op_seq += 1
             return self._all_reduce_on_device(inp, out=out)
+
+    def _graph_replay_eligible(self, inp: torch.Tensor) -> bool:
+        # Inside an enclosing capture the eager sequence is recorded into
+        # that graph as before; a graph cannot be replayed while capturing.
+        if torch.cuda.is_current_stream_capturing():
+            return False
+        if inp.numel() * inp.element_size() < self._graph_replay_min_bytes:
+            return False
+        return self.should_allreduce(inp)
+
+    def _all_reduce_key(self, inp: torch.Tensor) -> tuple:
+        return ("ar", *self._replay_key(inp))
+
+    def _replay_entry_for(
+        self, key: tuple, capture
+    ) -> _ReplayEntry | None:
+        """Return the replay entry for ``key``, capturing it on the second
+        request. ``capture`` builds the entry once a slot is available;
+        ``None`` means the caller must run eagerly this time."""
+        entry = self._replay_entries.get(key)
+        if entry is not None:
+            self._replay_entries.move_to_end(key)
+            return entry
+        seen = self._replay_seen.get(key, 0) + 1
+        if len(self._replay_seen) > 1024:
+            self._replay_seen.clear()
+        self._replay_seen[key] = seen
+        if seen < 2:
+            return None
+        if not self._reserve_replay_slot():
+            return None
+        entry = capture()
+        self._replay_entries[key] = entry
+        logger.debug(
+            "[PCIe DMA ring] captured replay graph for key=%s (%d cached)",
+            key,
+            len(self._replay_entries),
+        )
+        return entry
+
+    def _reserve_replay_slot(self) -> bool:
+        """Free one arena slot for a new entry, evicting the least recently
+        used entry that no caller can still be reading. Returns False when
+        every entry is inside the eviction guard window."""
+        while (
+            not self._replay_free_slots
+            and len(self._replay_entries) >= self._graph_replay_max_entries
+        ):
+            victim_key = None
+            for key, entry in self._replay_entries.items():
+                if self._op_seq - entry.last_use > REPLAY_EVICTION_GUARD_OPS:
+                    victim_key = key
+                    break
+            if victim_key is None:
+                return False
+            evicted = self._replay_entries.pop(victim_key)
+            self._replay_free_slots.append(evicted.slot)
+            del evicted
+        assert self._replay_arena is not None
+        return bool(self._replay_free_slots)
+
+    def _slot_views(
+        self, slot: int, specs: list[tuple[tuple[int, ...], torch.dtype]]
+    ) -> list[torch.Tensor]:
+        """Carve consecutive static views out of one arena slot."""
+        assert self._replay_arena is not None
+        base = slot * self._replay_slot_bytes
+        limit = base + self._replay_slot_bytes
+        views = []
+        for shape, dtype in specs:
+            numel = 1
+            for dim in shape:
+                numel *= int(dim)
+            nbytes = numel * torch.empty((), dtype=dtype).element_size()
+            if base + nbytes > limit:
+                raise ValueError(
+                    "replay arena slot cannot hold the requested static buffers"
+                )
+            views.append(self._replay_arena[base : base + nbytes].view(dtype).view(shape))
+            base = _align_up(base + nbytes, SCRATCH_ALIGN)
+        return views
+
+    def _capture_graph(self, run) -> "torch.cuda.CUDAGraph":
+        """Record ``run()`` into a CUDA graph on a joined side stream.
+
+        Nothing executes during capture, and the device-side flag counters
+        advance only when the graph runs, exactly as the eager kernels
+        would. torch.cuda.graph() would also synchronize the device, run gc
+        and empty the caching allocator; the ring allocates nothing inside
+        the capture, so a bare capture suffices.
+        """
+        main = torch.cuda.current_stream(self.device)
+        side = self._replay_capture_stream
+        if side is None:
+            side = self._replay_capture_stream = torch.cuda.Stream(device=self.device)
+        side.wait_stream(main)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(side):
+            graph.capture_begin(capture_error_mode="thread_local")
+            try:
+                run()
+            finally:
+                graph.capture_end()
+        main.wait_stream(side)
+        return graph
+
+    def _all_reduce_replayed(
+        self,
+        inp: torch.Tensor,
+        out: Optional[torch.Tensor],
+        borrow_output: bool = False,
+    ) -> torch.Tensor:
+        key = self._all_reduce_key(inp)
+        entry = self._replay_entry_for(key, lambda: self._capture_replay_entry(inp))
+        self._op_seq += 1
+        if entry is None:
+            return self._all_reduce_on_device(inp, out=out)
+        entry.last_use = self._op_seq
+        # Entries are keyed by element count: the ring treats its input as a
+        # flat buffer, so tensors of different shapes but equal size share a
+        # graph. Copy through flat views so a [768, 7168] call can reuse the
+        # [1536, 3584] entry (and vice versa). A producer that wrote into the
+        # static input (``all_reduce_input``, or a borrowed output of the
+        # in-place entry) skips this copy.
+        if not _same_storage(entry.inp, inp):
+            if _byte_ranges_overlap(entry.inp, inp):
+                raise ValueError(
+                    "all-reduce input partially overlaps the ring's static "
+                    "buffer; pass the whole borrowed tensor or a copy"
+                )
+            entry.inp.view(-1).copy_(inp.view(-1))
+        entry.graph.replay()
+        if borrow_output:
+            return entry.out.view(inp.shape)
+        if out is None:
+            out = torch.empty_like(inp)
+        out.view(-1).copy_(entry.out.view(-1))
+        return out
+
+    def _capture_replay_entry(self, inp: torch.Tensor) -> _ReplayEntry:
+        """Capture the eager ring sequence for ``inp``'s shape over static
+        buffers. Every rank captures the same shape sequence, so the cache
+        contents stay symmetric across the group."""
+        slot = self._replay_free_slots.pop()
+        spec = (tuple(inp.shape), inp.dtype)
+        if self._replay_in_place:
+            (static_in,) = self._slot_views(slot, [spec])
+            static_out = static_in
+        else:
+            static_in, static_out = self._slot_views(slot, [spec, spec])
+        graph = self._capture_graph(
+            lambda: self._all_reduce_on_device(static_in, out=static_out)
+        )
+        return _ReplayEntry(
+            self._all_reduce_key(inp), (static_in,), (static_out,), graph, slot
+        )
+
+    def all_reduce_input(
+        self, shape: tuple[int, ...], dtype: torch.dtype
+    ) -> torch.Tensor | None:
+        """Return the static input of the replay entry for ``shape``/``dtype``
+        so its producer can write the all-reduce input in place.
+
+        ``None`` means the shape is not replayed (replay disabled, below the
+        replay threshold, ineligible, first sighting, or no evictable slot);
+        the caller then supplies its own buffer as before. Requesting the
+        buffer counts as a sighting, so a shape is captured on the second
+        request just as a plain all-reduce would be. The buffer is valid
+        until the entry is evicted, which cannot happen while the caller's
+        all-reduce of it is within ``REPLAY_EVICTION_GUARD_OPS`` ring ops.
+        For the in-place entry this is the same buffer ``borrow_output``
+        returns, so a caller chain producer -> all-reduce -> consumer ->
+        producer stays inside one buffer.
+        """
+        if not self._graph_replay or torch.cuda.is_current_stream_capturing():
+            return None
+        probe = torch.empty(shape, dtype=dtype, device="meta")
+        if probe.numel() * probe.element_size() < self._graph_replay_min_bytes:
+            return None
+        if self._closed or dtype not in SUPPORTED_DTYPES:
+            return None
+        numel = probe.numel()
+        alignment = 8 if self.world_size == 9 else self.world_size * 8
+        if numel <= 0 or numel % alignment != 0:
+            return None
+        if numel * probe.element_size() > self.max_bytes:
+            return None
+        with torch.cuda.device(self.device):
+            entry = self._replay_entry_for(
+                self._all_reduce_key(probe),
+                lambda: self._capture_replay_entry(probe),
+            )
+        if entry is None:
+            return None
+        return entry.inp.view(shape)
+
+    def is_ring_storage(self, tensor: torch.Tensor) -> bool:
+        """Whether ``tensor`` lives inside the replay arena (a static input,
+        static output or scratch view handed out by this ring)."""
+        arena = self._replay_arena
+        if arena is None or tensor.device != self.device:
+            return False
+        start = arena.data_ptr()
+        end = start + arena.numel()
+        ptr = tensor.data_ptr()
+        return start <= ptr < end
 
     def _all_reduce_on_device(
         self, inp: torch.Tensor, *, out: Optional[torch.Tensor] = None
@@ -362,6 +923,30 @@ class PCIeDmaAllReduce:
         ):
             raise ValueError(
                 "output must match input shape/dtype/device and be contiguous"
+            )
+        if self.world_size == 9 and inp.numel() % (self.world_size * 8):
+            numel = inp.numel()
+            wire_numel = _align_up(numel, self.world_size * 8)
+            wire_bytes = wire_numel * inp.element_size()
+            assert self._wire_input is not None and self._wire_output is not None
+            wire_in = self._wire_input[:wire_bytes].view(inp.dtype)
+            wire_out = self._wire_output[:wire_bytes].view(inp.dtype)
+            wire_in[:numel].copy_(inp.view(-1))
+            wire_in[numel:].zero_()
+            self._all_reduce_aligned(wire_in, wire_out)
+            out.view(-1).copy_(wire_out[:numel])
+            return out
+        return self._all_reduce_aligned(inp, out)
+
+    def _all_reduce_aligned(
+        self, inp: torch.Tensor, out: torch.Tensor
+    ) -> torch.Tensor:
+        """Reduce equal, eight-element-aligned shards into the supplied output."""
+        granule_elems = self._granule_elems(inp)
+        fp32_hops = self._fp32_hops_for(inp)
+        if granule_elems or fp32_hops:
+            return self._all_reduce_lossless(
+                inp, out, granule_elems=granule_elems, fp32_hops=fp32_hops
             )
         kernels = self._kernels
         world = self.world_size
@@ -396,6 +981,7 @@ class PCIeDmaAllReduce:
             "mx",
             "mx_ring",
         )
+        pipeline_gather = self._pipeline_all_gather and not compressed_ag
         if wire_codec == "i8":
             quantize = kernels.dma_quant_i8
             dequantize_store = kernels.dma_dequant_store_i8
@@ -525,6 +1111,8 @@ class PCIeDmaAllReduce:
                     send_src = (
                         in_piece_ptr(send_chunk, p)
                         if k == 0
+                        else scratch_piece(rank, k - 1, p)
+                        if pipeline_gather and k > world - 1
                         else piece_ptr(send_chunk, p)
                     )
                     send_bytes = piece_bytes
@@ -594,13 +1182,25 @@ class PCIeDmaAllReduce:
                         payload + piece_elems,
                         piece_elems,
                     )
+                elif pipeline_gather:
+                    # A received all-gather payload is immutable until the
+                    # final neighbor handshake. Forward it directly while a
+                    # separate CE stream materializes the caller's output.
+                    add_done[p].record(main)
+                    with torch.cuda.stream(self._ag_copy_stream):
+                        self._ag_copy_stream.wait_event(add_done[p])
+                        kernels.dma_copy(
+                            piece_ptr(recv_chunk, p),
+                            scratch_piece(rank, k, p),
+                            piece_bytes,
+                        )
                 else:
                     kernels.dma_copy(
                         piece_ptr(recv_chunk, p),
                         scratch_piece(rank, k, p),
                         piece_bytes,
                     )
-                if reduce_phase or not compressed_step:
+                if reduce_phase or (not compressed_step and not pipeline_gather):
                     add_done[p].record(main)
 
         # Neighbor handshake so the next call (or graph replay) cannot
@@ -608,6 +1208,8 @@ class PCIeDmaAllReduce:
         # must also drain the copy and flag streams before the op is done.
         main.wait_stream(copy_stream)
         main.wait_stream(flag_stream)
+        if pipeline_gather:
+            main.wait_stream(self._ag_copy_stream)
         done = steps * pieces
         kernels.dma_set_flag(
             self._flag_ptr(prv, done), self._counter_ptr(self._send_counters, done)
@@ -616,6 +1218,712 @@ class PCIeDmaAllReduce:
             self._flag_ptr(rank, done), self._counter_ptr(self._wait_counters, done)
         )
         return out
+
+    def _all_reduce_lossless(
+        self,
+        inp: torch.Tensor,
+        out: torch.Tensor,
+        *,
+        granule_elems: int = 0,
+        fp32_hops: int = 0,
+    ) -> torch.Tensor:
+        """Lossless ring all-reduce with a selectable chunk-to-element mapping
+        and fp32 running sums on the trailing reduce-scatter hops.
+
+        The step table comes from ``ring_schedule`` and every buffer range
+        from ``lossless_access_plan``, which the CPU proofs execute and check
+        as well, so what the tests reason about is what this loop issues; with
+        ``B12X_PCIE_RING_CHECK_BOUNDS=1`` the plan is additionally checked
+        against the slab capacities before a single kernel is issued. The kernel
+        sequence per (step, piece) is the one ``_all_reduce_aligned`` issues
+        on its lossless path: one CE copy on the copy stream, one flag on the
+        flag stream, one wait plus one add (reduce-scatter) or placement copy
+        (all-gather) on the main stream, and one neighbour handshake at the
+        end. Two things can differ from the served schedule:
+
+        * Mapping. ``granule_elems == 0``: the served contiguous mapping,
+          chunk ``c`` is elements ``[c * shard, (c + 1) * shard)`` cut into
+          ``_pick_pieces`` pieces. ``granule_elems > 0``: a piece is one
+          granule and granule ``b`` of the flat buffer belongs to chunk
+          ``b % world``, which fixes the number of pieces at
+          ``shard_elems / granule_elems``.
+        * Precision. With ``fp32_hops = p > 0`` the payloads of the last
+          ``p`` reduce-scatter steps are fp32 running sums (twice the bytes,
+          twice the receive area) and the adds that produce them keep fp32,
+          so an element is rounded to bf16 ``world - 1 - p`` times instead of
+          ``world - 1``. The final add always rounds once into ``out``.
+
+        Scratch, flag slots and events are the ones ``_all_reduce_aligned``
+        uses; the two schedules never run concurrently on one channel.
+        """
+        kernels = self._kernels
+        world = self.world_size
+        rank = self.rank
+        nxt = (rank + 1) % world
+        prv = (rank - 1) % world
+        dtype_code = SUPPORTED_DTYPES[inp.dtype]
+        elem = inp.element_size()
+        shard_elems = inp.numel() // world
+        shard_bytes = shard_elems * elem
+        if fp32_hops:
+            if inp.dtype != torch.bfloat16:
+                raise ValueError("fp32 reduce-scatter hops need bf16 inputs")
+            if not 0 < fp32_hops <= world - 2:
+                raise ValueError(
+                    f"fp32 hops must lie in [1, {world - 2}], got {fp32_hops}"
+                )
+            if fp32_hops > self._fp32_hops or self._fp32_stage is None:
+                raise ValueError(
+                    f"channel was built for {self._fp32_hops} fp32 hops, "
+                    f"{fp32_hops} requested"
+                )
+        if granule_elems:
+            if shard_elems % granule_elems:
+                raise ValueError(
+                    f"granule of {granule_elems} elements does not tile the "
+                    f"{shard_elems}-element shard"
+                )
+            pieces = shard_elems // granule_elems
+            if not 1 <= pieces <= MAX_PIECES:
+                raise ValueError(
+                    f"{pieces} granules per chunk exceed MAX_PIECES={MAX_PIECES}"
+                )
+        else:
+            pieces = self._pick_pieces(shard_elems, shard_bytes)
+
+        main = torch.cuda.current_stream(self.device)
+        copy_stream = self._copy_stream
+        flag_stream = self._flag_stream
+        add_done = self._piece_events
+        copied = self._copied_events
+        stage_base = self._fp32_stage.data_ptr() if fp32_hops else 0
+        # Every range the loop addresses, in issue order, as offsets into one
+        # of four bases. The plan is the object the CPU proofs check, so the
+        # loop cannot drift from what they reason about.
+        plan = lossless_access_plan(
+            world=world,
+            rank=rank,
+            shard_elems=shard_elems,
+            pieces=pieces,
+            granule=bool(granule_elems),
+            fp32_hops=fp32_hops,
+            elem_size=elem,
+            scratch_offsets=self._scratch_offsets,
+        )
+        if _ring_check_bounds():
+            validate_access_plan(
+                plan,
+                tensor_bytes=inp.numel() * elem,
+                scratch_offsets=self._scratch_offsets,
+                scratch_widths=scratch_step_widths(world, fp32_hops),
+                shard_capacity=self.shard_capacity,
+                stage_bytes=2 * self.shard_capacity if fp32_hops else 0,
+                flag_slots=FLAG_SLOTS,
+            )
+        bases = {
+            ("input", "self"): inp.data_ptr(),
+            ("out", "self"): out.data_ptr(),
+            ("stage", "self"): stage_base,
+            ("scratch", "self"): self._scratch_base[rank],
+            ("scratch", "next"): self._scratch_base[nxt],
+        }
+        self._input_ready.record(main)
+        copy_stream.wait_event(self._input_ready)
+        flag_stream.wait_event(self._input_ready)
+
+        def address(access) -> int:
+            return bases[(access.region, access.owner)] + access.offset
+
+        for op in plan:
+            p = op.piece
+            slot = op.slot
+            with torch.cuda.stream(copy_stream):
+                if op.step > 0:
+                    copy_stream.wait_event(add_done[p])
+                kernels.dma_copy(
+                    address(op.copy_dst), address(op.copy_src), op.copy_src.nbytes
+                )
+                copied[slot].record(copy_stream)
+            with torch.cuda.stream(flag_stream):
+                flag_stream.wait_event(copied[slot])
+                kernels.dma_set_flag(
+                    self._flag_ptr(nxt, slot),
+                    self._counter_ptr(self._send_counters, slot),
+                )
+            kernels.dma_wait_flag(
+                self._flag_ptr(rank, slot),
+                self._counter_ptr(self._wait_counters, slot),
+            )
+            if op.op == "add":
+                kernels.dma_add(
+                    address(op.main_dst),
+                    address(op.main_local),
+                    address(op.main_recv),
+                    op.elems,
+                    dtype_code,
+                )
+            elif op.op == "add_mixed":
+                kernels.dma_add_mixed(
+                    address(op.main_dst),
+                    address(op.main_local),
+                    address(op.main_recv),
+                    op.elems,
+                    op.add_mode,
+                )
+            else:
+                kernels.dma_copy(
+                    address(op.main_dst), address(op.main_recv), op.main_dst.nbytes
+                )
+            add_done[p].record(main)
+
+        main.wait_stream(copy_stream)
+        main.wait_stream(flag_stream)
+        done = final_handshake_slot(world, pieces, fp32_hops)
+        kernels.dma_set_flag(
+            self._flag_ptr(prv, done), self._counter_ptr(self._send_counters, done)
+        )
+        kernels.dma_wait_flag(
+            self._flag_ptr(rank, done), self._counter_ptr(self._wait_counters, done)
+        )
+        return out
+
+
+    # ------------------------------------------------------------------
+    # Paired all-gather (copy-engine ring, rank-major outputs)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _pair_layout(
+        first: torch.Tensor, second: torch.Tensor
+    ) -> tuple[int, int, int]:
+        """Return (first_bytes, second_offset, payload_bytes) of one rank's
+        block in the per-step scratch area: the second tensor's block follows
+        the first at the next 256-byte boundary."""
+        first_bytes = first.numel() * first.element_size()
+        second_offset = _align_up(first_bytes, SCRATCH_ALIGN)
+        return (
+            first_bytes,
+            second_offset,
+            second_offset + second.numel() * second.element_size(),
+        )
+
+    def should_all_gather_pair(self, first: torch.Tensor, second: torch.Tensor) -> bool:
+        """Whether ``all_gather_pair`` accepts these rank-local blocks."""
+        if self._closed or self.world_size < 2:
+            return False
+        for tensor in (first, second):
+            if (
+                tensor.device != self.device
+                or tensor.dtype not in SUPPORTED_DTYPES
+                or tensor.ndim != 2
+                or tensor.numel() <= 0
+                or not tensor.is_contiguous()
+            ):
+                return False
+        if first.shape[0] != second.shape[0]:
+            return False
+        return self._pair_layout(first, second)[2] <= self.shard_capacity
+
+    @staticmethod
+    def _all_gather_pair_key(first: torch.Tensor, second: torch.Tensor) -> tuple:
+        return (
+            "ag_pair",
+            (first.numel(), second.numel()),
+            (first.dtype, second.dtype),
+            (first.shape[0], first.shape[1], second.shape[1]),
+        )
+
+    def all_gather_pair(
+        self, first: torch.Tensor, second: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather two rank-local ``[rows, c]`` blocks in one ring pass.
+
+        Returns rank-major ``[world, rows, c_first]`` and
+        ``[world, rows, c_second]`` tensors whose block ``r`` is rank ``r``'s
+        input, byte for byte (an all-gather only copies). Both blocks travel
+        the ring together: one flag per step gates one copy-engine transfer of
+        the combined payload, so the SM only runs the single-thread flag
+        kernels. Issued on a side stream, the gather overlaps whatever the
+        caller keeps on its main stream; the caller orders the consumer after
+        the side stream with an event. The op shares the channel's scratch
+        and streams with the all-reduce and reduce-scatter, so it must be
+        ordered against them like any other op on this channel.
+
+        Replayed calls return the entry's static outputs; they stay valid until
+        the next ``all_gather_pair`` with the same key, and a producer that
+        wrote into ``all_gather_pair_inputs`` skips the input staging copies.
+        Eager calls allocate their outputs on the current stream.
+        """
+        if not self.should_all_gather_pair(first, second):
+            raise ValueError(
+                "inputs do not satisfy paired all-gather requirements "
+                f"(shapes={tuple(first.shape)}, {tuple(second.shape)}, "
+                f"dtypes={first.dtype}, {second.dtype})"
+            )
+        with torch.cuda.device(self.device):
+            key = self._all_gather_pair_key(first, second)
+            entry = None
+            if self._graph_replay and not torch.cuda.is_current_stream_capturing():
+                entry = self._replay_entry_for(
+                    key, lambda: self._capture_all_gather_pair(first, second)
+                )
+            self._op_seq += 1
+            if entry is None:
+                out_first = first.new_empty((self.world_size, *first.shape))
+                out_second = second.new_empty((self.world_size, *second.shape))
+                self._all_gather_pair_on_device(first, second, out_first, out_second)
+                return out_first, out_second
+            entry.last_use = self._op_seq
+            static_first, static_second = entry.inputs
+            if not _same_storage(static_first, first):
+                static_first.copy_(first)
+            if not _same_storage(static_second, second):
+                static_second.copy_(second)
+            entry.graph.replay()
+            return entry.outputs[0], entry.outputs[1]
+
+    def all_gather_pair_inputs(
+        self,
+        first_shape: tuple[int, int],
+        first_dtype: torch.dtype,
+        second_shape: tuple[int, int],
+        second_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Static inputs of the paired all-gather replay entry for these
+        shapes, for producers that write the blocks in place (``None`` when
+        the shapes are not replayed; same sighting rule as
+        ``all_reduce_input``)."""
+        if not self._graph_replay or torch.cuda.is_current_stream_capturing():
+            return None
+        first = torch.empty(first_shape, dtype=first_dtype, device="meta")
+        second = torch.empty(second_shape, dtype=second_dtype, device="meta")
+        if self._closed or self.world_size < 2:
+            return None
+        for tensor in (first, second):
+            if tensor.dtype not in SUPPORTED_DTYPES or tensor.ndim != 2:
+                return None
+        if first.shape[0] != second.shape[0]:
+            return None
+        if self._pair_layout(first, second)[2] > self.shard_capacity:
+            return None
+        with torch.cuda.device(self.device):
+            entry = self._replay_entry_for(
+                self._all_gather_pair_key(first, second),
+                lambda: self._capture_all_gather_pair(first, second),
+            )
+        if entry is None:
+            return None
+        return entry.inputs[0], entry.inputs[1]
+
+    def _capture_all_gather_pair(
+        self, first: torch.Tensor, second: torch.Tensor
+    ) -> _ReplayEntry:
+        slot = self._replay_free_slots.pop()
+        world = self.world_size
+        static_first, static_second, out_first, out_second = self._slot_views(
+            slot,
+            [
+                (tuple(first.shape), first.dtype),
+                (tuple(second.shape), second.dtype),
+                ((world, *first.shape), first.dtype),
+                ((world, *second.shape), second.dtype),
+            ],
+        )
+        graph = self._capture_graph(
+            lambda: self._all_gather_pair_on_device(
+                static_first, static_second, out_first, out_second
+            )
+        )
+        return _ReplayEntry(
+            self._all_gather_pair_key(first, second),
+            (static_first, static_second),
+            (out_first, out_second),
+            graph,
+            slot,
+        )
+
+    def _all_gather_pair_on_device(
+        self,
+        first: torch.Tensor,
+        second: torch.Tensor,
+        out_first: torch.Tensor,
+        out_second: torch.Tensor,
+    ) -> None:
+        kernels = self._kernels
+        world = self.world_size
+        rank = self.rank
+        nxt = (rank + 1) % world
+        prv = (rank - 1) % world
+        first_bytes, second_offset, payload_bytes = self._pair_layout(first, second)
+        second_bytes = second.numel() * second.element_size()
+        steps = world - 1
+
+        main = torch.cuda.current_stream(self.device)
+        copy_stream = self._copy_stream
+        flag_stream = self._flag_stream
+        # Persistent events: the first half of ``copied`` gates each step's
+        # flag on its transfer, the second half marks the receipt of each
+        # step on the main stream (the next step's forwarding copy reads that
+        # scratch area).
+        copied = self._copied_events
+        received = self._copied_events[len(self._copied_events) // 2 :]
+
+        def out_block(tensor: torch.Tensor, block: int) -> int:
+            return tensor.data_ptr() + block * tensor.stride(0) * tensor.element_size()
+
+        def slot(step: int) -> int:
+            return AG_PAIR_SLOT_BASE + step
+
+        self._input_ready.record(main)
+        copy_stream.wait_event(self._input_ready)
+        flag_stream.wait_event(self._input_ready)
+        materialize_stream = self._ag_copy_stream if self._pipeline_all_gather else main
+        materialize_stream.wait_event(self._input_ready)
+        # Own block: the caller's inputs become output block ``rank``.
+        with torch.cuda.stream(materialize_stream):
+            kernels.dma_copy(out_block(out_first, rank), first.data_ptr(), first_bytes)
+            kernels.dma_copy(out_block(out_second, rank), second.data_ptr(), second_bytes)
+
+        for k in range(steps):
+            # Step k forwards block (rank - k) % world: the own block at
+            # k == 0, afterwards the block received at step k - 1, still in
+            # scratch area k - 1 as one contiguous [first | second] payload.
+            recv_block = (rank - k - 1) % world
+            dst = self._scratch_ptr(nxt, k)
+            with torch.cuda.stream(copy_stream):
+                if k == 0:
+                    kernels.dma_copy(dst, first.data_ptr(), first_bytes)
+                    kernels.dma_copy(dst + second_offset, second.data_ptr(), second_bytes)
+                else:
+                    copy_stream.wait_event(received[k - 1])
+                    kernels.dma_copy(dst, self._scratch_ptr(rank, k - 1), payload_bytes)
+                copied[k].record(copy_stream)
+            with torch.cuda.stream(flag_stream):
+                flag_stream.wait_event(copied[k])
+                kernels.dma_set_flag(
+                    self._flag_ptr(nxt, slot(k)),
+                    self._counter_ptr(self._send_counters, slot(k)),
+                )
+            kernels.dma_wait_flag(
+                self._flag_ptr(rank, slot(k)),
+                self._counter_ptr(self._wait_counters, slot(k)),
+            )
+            received[k].record(main)
+            src = self._scratch_ptr(rank, k)
+            with torch.cuda.stream(materialize_stream):
+                materialize_stream.wait_event(received[k])
+                kernels.dma_copy(out_block(out_first, recv_block), src, first_bytes)
+                kernels.dma_copy(
+                    out_block(out_second, recv_block), src + second_offset, second_bytes
+                )
+
+        main.wait_stream(copy_stream)
+        main.wait_stream(flag_stream)
+        if self._pipeline_all_gather:
+            main.wait_stream(materialize_stream)
+        done = slot(steps)
+        kernels.dma_set_flag(
+            self._flag_ptr(prv, done), self._counter_ptr(self._send_counters, done)
+        )
+        kernels.dma_wait_flag(
+            self._flag_ptr(rank, done), self._counter_ptr(self._wait_counters, done)
+        )
+
+    # ------------------------------------------------------------------
+    # Column reduce-scatter (fp32 or bf16 wire)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _rs_cols(width: int, world: int, cols: int | None = None) -> int:
+        """Column-block width: the caller's ``cols`` (the consumer's shard
+        width, at least ``ceil(K / world)``), or ``ceil(K / world)``."""
+        minimum = (width + world - 1) // world
+        return minimum if cols is None else int(cols)
+
+    def should_reduce_scatter_columns(
+        self, inp: torch.Tensor, *, cols: int | None = None
+    ) -> bool:
+        """Whether ``reduce_scatter_columns`` accepts ``inp`` (``[rows, K]``
+        bf16, contiguous, on this device) with block width ``cols`` (default
+        ``ceil(K / world)``; a caller's width must cover ``K`` with ``world``
+        blocks). The block's element count must be a multiple of eight and
+        its fp32 pieces must fit the scratch areas."""
+        if self._closed or self.world_size < 2:
+            return False
+        if (
+            inp.device != self.device
+            or inp.dtype != torch.bfloat16
+            or inp.ndim != 2
+            or inp.numel() <= 0
+            or not inp.is_contiguous()
+        ):
+            return False
+        rows, width = inp.shape
+        cols = self._rs_cols(width, self.world_size, cols)
+        if cols < 1 or cols * self.world_size < width:
+            return False
+        shard_elems = rows * cols
+        if shard_elems % 8:
+            return False
+        pieces = self._pick_pieces(shard_elems, shard_elems * 2)
+        piece_elems = shard_elems // pieces
+        # Every piece travels as fp32 on the wide-wire hops and owns one
+        # scratch area per step; the area must hold the fp32 piece and the
+        # slab's 2 * (world - 1) areas must cover (world - 1) * pieces steps.
+        if piece_elems * 4 > self.shard_capacity:
+            return False
+        return pieces <= RS_MAX_PIECES
+
+    @staticmethod
+    def _reduce_scatter_key(inp: torch.Tensor, wire: str, cols: int) -> tuple:
+        return ("rs_" + wire, inp.numel(), inp.dtype, tuple(inp.shape), int(cols))
+
+    @staticmethod
+    def _rs_partial_dtype(wire: str) -> torch.dtype:
+        return torch.float32 if wire == "fp32" else torch.bfloat16
+
+    def reduce_scatter_columns(
+        self, inp: torch.Tensor, *, wire: str = "fp32", cols: int | None = None
+    ) -> torch.Tensor:
+        """Reduce ``inp`` (``[rows, K]`` bf16) across ranks and return this
+        rank's column block ``[rows, cols]``: columns
+        ``[rank * cols, (rank + 1) * cols)`` of the sum, zero beyond ``K``.
+        ``cols`` defaults to ``ceil(K / world)``; a row-parallel consumer
+        whose input shards are wider (an eight-aligned shard width) passes
+        its own so the block is exactly its input shard.
+
+        ``wire="fp32"``: the first hop carries the bf16 source, later hops an
+        fp32 running sum; every add accumulates in fp32 and only the final
+        hop rounds to bf16 (one rounding, the two-shot precision class).
+        ``wire="bf16"``: every hop carries bf16 and every add rounds to bf16
+        (the precision class of the ring all-reduce, in column-block order).
+        Summation order for block ``c``: ``(((x[c+1] + x[c+2]) + ...) + x[c])``
+        with rank indices modulo world.
+
+        Replayed calls return the entry's static output, valid until the next
+        ``reduce_scatter_columns`` with the same key.
+        """
+        wire = _rs_wire_mode(wire)
+        if not self.should_reduce_scatter_columns(inp, cols=cols):
+            raise ValueError(
+                "input does not satisfy column reduce-scatter requirements "
+                f"(shape={tuple(inp.shape)}, dtype={inp.dtype}, cols={cols})"
+            )
+        with torch.cuda.device(self.device):
+            self.prepare_reduce_scatter(wire)
+            rows, width = inp.shape
+            cols = self._rs_cols(width, self.world_size, cols)
+            key = self._reduce_scatter_key(inp, wire, cols)
+            entry = None
+            if self._graph_replay and not torch.cuda.is_current_stream_capturing():
+                entry = self._replay_entry_for(
+                    key, lambda: self._capture_reduce_scatter(inp, wire, cols)
+                )
+            self._op_seq += 1
+            if entry is None:
+                blocks = inp.new_empty((self.world_size, rows, cols))
+                out = inp.new_empty((rows, cols))
+                partials = tuple(
+                    inp.new_empty((rows, cols), dtype=self._rs_partial_dtype(wire))
+                    for _ in range(2)
+                )
+                self._pack_column_blocks(inp, blocks)
+                self._reduce_scatter_on_device(blocks, out, partials, wire)
+                return out
+            entry.last_use = self._op_seq
+            self._pack_column_blocks(inp, entry.inputs[0])
+            entry.graph.replay()
+            return entry.outputs[0]
+
+    def prepare_reduce_scatter(self, wire: str = "fp32") -> None:
+        """Compile and warm the mixed-precision add kernels of ``wire`` before
+        any graph capture can need them."""
+        wire = _rs_wire_mode(wire)
+        if wire in self._rs_prepared_wires:
+            return
+        prepare = getattr(self._kernels, "prepare_reduce_scatter", None)
+        if prepare is not None:
+            prepare(wire=wire)
+        self._rs_prepared_wires.add(wire)
+
+    def _pack_column_blocks(self, inp: torch.Tensor, blocks: torch.Tensor) -> None:
+        """Relayout ``inp[rows, K]`` into ``blocks[world, rows, cols]``: block
+        ``b`` holds columns ``[b*cols, (b+1)*cols)``, and the last block's
+        columns past ``K`` are zero (they contribute nothing to the sum, so
+        the consumer's padded weight rows see zeros)."""
+        world, rows, cols = blocks.shape
+        width = inp.shape[1]
+        full = width // cols
+        if full:
+            blocks[:full].copy_(
+                inp[:, : full * cols].view(rows, full, cols).permute(1, 0, 2)
+            )
+        rest = width - full * cols
+        if rest:
+            blocks[full, :, :rest].copy_(inp[:, full * cols :])
+            blocks[full, :, rest:].zero_()
+
+    def _capture_reduce_scatter(
+        self, inp: torch.Tensor, wire: str, cols: int
+    ) -> _ReplayEntry:
+        slot = self._replay_free_slots.pop()
+        world = self.world_size
+        rows, _ = inp.shape
+        partial_dtype = self._rs_partial_dtype(wire)
+        specs = [
+            ((world, rows, cols), inp.dtype),
+            ((rows, cols), inp.dtype),
+            ((rows, cols), partial_dtype),
+            ((rows, cols), partial_dtype),
+        ]
+        views = self._slot_views(slot, specs)
+        blocks, out = views[0], views[1]
+        partials = tuple(views[2:])
+        graph = self._capture_graph(
+            lambda: self._reduce_scatter_on_device(blocks, out, partials, wire)
+        )
+        return _ReplayEntry(
+            self._reduce_scatter_key(inp, wire, cols),
+            (blocks,),
+            (out,),
+            graph,
+            slot,
+            scratch=partials,
+        )
+
+    def _reduce_scatter_on_device(
+        self,
+        blocks: torch.Tensor,
+        out: torch.Tensor,
+        partials: tuple[torch.Tensor, ...],
+        wire: str,
+    ) -> None:
+        """Ring reduce-scatter over ``blocks[world, rows, cols]`` into
+        ``out[rows, cols]`` (this rank's block).
+
+        Step ``k`` sends block ``(rank - k - 1) % world`` and receives block
+        ``(rank - k - 2) % world`` from the predecessor; after ``world - 1``
+        steps rank ``r`` holds the full sum of block ``r``. The payload of
+        step 0 is the sender's bf16 block; the payload of step ``k >= 1`` is
+        the running sum produced at step ``k - 1``, held in ``partials``
+        (two buffers alternating by step parity: fp32 for the fp32 wire, bf16
+        for the bf16 wire). Every add reads the local bf16 block and the
+        received payload; with the fp32 wire it accumulates in fp32 and only
+        the final step rounds to bf16 into ``out``.
+        """
+        kernels = self._kernels
+        world = self.world_size
+        rank = self.rank
+        nxt = (rank + 1) % world
+        prv = (rank - 1) % world
+        elem = blocks.element_size()
+        shard_elems = out.numel()
+        shard_bytes = shard_elems * elem
+        pieces = self._pick_pieces(shard_elems, shard_bytes)
+        piece_elems = shard_elems // pieces
+        piece_bytes = piece_elems * elem
+        steps = world - 1
+        fp32_wire = wire == "fp32"
+        if len(partials) != 2 or any(
+            partial.dtype != self._rs_partial_dtype(wire) for partial in partials
+        ):
+            raise ValueError(
+                f"{wire} wire reduce-scatter needs two "
+                f"{self._rs_partial_dtype(wire)} partial buffers"
+            )
+        partial_bytes = piece_elems * partials[0].element_size()
+
+        main = torch.cuda.current_stream(self.device)
+        copy_stream = self._copy_stream
+        flag_stream = self._flag_stream
+        copied = self._copied_events
+        add_done = self._piece_events
+        in_base = blocks.data_ptr()
+        out_base = out.data_ptr()
+
+        def in_piece(block: int, piece: int) -> int:
+            return in_base + block * shard_bytes + piece * piece_bytes
+
+        def partial_piece(step: int, piece: int) -> int:
+            return partials[step % 2].data_ptr() + piece * partial_bytes
+
+        def scratch_piece(owner: int, step: int, piece: int) -> int:
+            # One scratch area per (step, piece): an fp32 piece can exceed
+            # half an area, so pieces do not share one.
+            return self._scratch_ptr(owner, step * pieces + piece)
+
+        def slot(step: int, piece: int) -> int:
+            return RS_SLOT_BASE + step * pieces + piece
+
+        self._input_ready.record(main)
+        copy_stream.wait_event(self._input_ready)
+        flag_stream.wait_event(self._input_ready)
+
+        for k in range(steps):
+            send_block = (rank - k - 1) % world
+            recv_block = (rank - k - 2) % world
+            last = k == steps - 1
+            for p in range(pieces):
+                if k == 0:
+                    send_src = in_piece(send_block, p)
+                    send_bytes = piece_bytes
+                else:
+                    send_src = partial_piece(k - 1, p)
+                    send_bytes = partial_bytes
+                with torch.cuda.stream(copy_stream):
+                    if k > 0:
+                        copy_stream.wait_event(add_done[p])
+                    kernels.dma_copy(scratch_piece(nxt, k, p), send_src, send_bytes)
+                    copied[slot(k, p) - RS_SLOT_BASE].record(copy_stream)
+                with torch.cuda.stream(flag_stream):
+                    flag_stream.wait_event(copied[slot(k, p) - RS_SLOT_BASE])
+                    kernels.dma_set_flag(
+                        self._flag_ptr(nxt, slot(k, p)),
+                        self._counter_ptr(self._send_counters, slot(k, p)),
+                    )
+                kernels.dma_wait_flag(
+                    self._flag_ptr(rank, slot(k, p)),
+                    self._counter_ptr(self._wait_counters, slot(k, p)),
+                )
+                recv = scratch_piece(rank, k, p)
+                own = in_piece(recv_block, p)
+                dst = out_base + p * piece_bytes if last else partial_piece(k, p)
+                if k >= 2 and not last:
+                    # Step k's add writes the partial buffer of parity k % 2,
+                    # which is the payload the copy engine is still reading for
+                    # step k - 1: two buffers alternate, so a send has exactly
+                    # one step of slack and nothing else in the schedule holds
+                    # the main stream behind the copy engine (the flag waits
+                    # only bind this rank to its predecessor's copies, and
+                    # add_done runs the other way). Without this edge a rank
+                    # whose outgoing hop is slower than the incoming chain
+                    # overwrites a payload in flight, and the block that
+                    # payload carries reaches its owner corrupted.
+                    main.wait_event(copied[slot(k - 1, p) - RS_SLOT_BASE])
+                if not fp32_wire or (k == 0 and last):
+                    # bf16 payload in, bf16 out: the plain ring add (fp32 sum
+                    # rounded once to bf16), which for a single-step ring is
+                    # also the exact fp32-wire result.
+                    kernels.dma_add(
+                        dst, own, recv, piece_elems, SUPPORTED_DTYPES[blocks.dtype]
+                    )
+                elif k == 0:
+                    kernels.dma_add_mixed(dst, own, recv, piece_elems, "bf16_bf16_f32")
+                elif last:
+                    kernels.dma_add_mixed(dst, own, recv, piece_elems, "bf16_f32_bf16")
+                else:
+                    kernels.dma_add_mixed(dst, own, recv, piece_elems, "bf16_f32_f32")
+                add_done[p].record(main)
+
+        main.wait_stream(copy_stream)
+        main.wait_stream(flag_stream)
+        done = RS_SLOT_BASE + steps * pieces
+        kernels.dma_set_flag(
+            self._flag_ptr(prv, done), self._counter_ptr(self._send_counters, done)
+        )
+        kernels.dma_wait_flag(
+            self._flag_ptr(rank, done), self._counter_ptr(self._wait_counters, done)
+        )
 
     def _pick_a2a_chunks(self, shard_elems: int) -> int:
         override = int(os.getenv("B12X_PCIE_DMA_A2A_CHUNKS", "0"))
@@ -806,6 +2114,8 @@ class PCIeDmaAllReduce:
         if self._closed:
             return
         self._closed = True
+        self._replay_entries.clear()
+        self._replay_arena = None
         # Drain the main and four auxiliary streams before any rank unmaps a
         # peer allocation.  Every importer must unmap before its owner frees
         # the exported slab.

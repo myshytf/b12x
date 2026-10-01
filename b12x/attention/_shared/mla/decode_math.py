@@ -71,8 +71,11 @@ from b12x._lib.intrinsics import (
     ld_shared_f32,
     ld_shared_u8_offset,
     ld_shared_u32,
+    ld_global_nc_v4_u32,
     ldmatrix_m8n8x2_b16,
     ldmatrix_m8n8x4_b16,
+    ldmatrix_m16n16x2_trans_b8,
+    st_shared_v4_u32,
     mma_m16n8k16_f32_bf16,
     mma_m16n8k32_f32_e4m3,
     mxfp8_mma_m16n8k32_f32_e4m3,
@@ -481,6 +484,83 @@ def s0_quantize_q_to_smem(
             (fp8_bits & Uint32(0xFF)).to(cutlass.Uint8),
         )
         idx += Int32(num_threads)
+    cute.arch.barrier(**bar_kw)
+
+
+@cute.jit
+def s0_load_packed_q_to_smem(
+    q_token: cute.Tensor,  # (NUM_HEADS, 656) u8 view for this token (packed query)
+    q_fp8_base_addr: Int32,  # u32 smem addr of q_fp8 (HPB x Q_NOPE_STRIDE)
+    q_sc_view: cute.Tensor,  # smem fp32 view (HPB*NUM_SCALES,) -- pow2 scales
+    q_rope_base_addr: Int32,  # u32 smem addr of q_rope (HPB x q_rope_stride bf16)
+    head_base: Int32,  # first head index of this CTA (h_start)
+    valid_hpb: Int32,  # number of valid heads (<= HPB)
+    tid: Int32,  # flat thread id in [0, MATH_THREADS)
+    *,
+    d_nope: cutlass.Constexpr,  # 512
+    d_rope: cutlass.Constexpr,  # 64
+    num_scales: cutlass.Constexpr,  # 4
+    hpb: cutlass.Constexpr,  # 16
+    q_nope_stride: cutlass.Constexpr,  # 528
+    q_rope_stride: cutlass.Constexpr,  # 64 (+ optional bank-layout pad)
+    num_threads: cutlass.Constexpr,  # 256
+    barrier_id: cutlass.Constexpr,
+):
+    """S0 (packed query): copy a pre-quantized query record into the Q stages.
+
+    The record per head is ``[512 B E4M3 nope][16 B: NUM_SCALES fp32 pow2
+    scales][128 B bf16 rope]``, produced by the host with the same algorithm
+    as :func:`s0_quantize_q_to_smem` (per-tile absmax, ``max(amax, 1e-4) /
+    FP8_MAX`` rounded up to a power of two, ``q * (1 / scale)`` clamped and
+    converted with ``cvt.rn.satfinite.e4m3``). The stages therefore hold the
+    same bytes S0 would have written, so the attention result is bit-identical
+    to the bf16-query path. Each thread copies 16-byte chunks; invalid tail
+    heads are zero-filled.
+    """
+    bar_kw = dict(barrier_id=barrier_id, number_of_threads=num_threads)
+    nope_chunks = d_nope // 16
+    scale_chunks = (num_scales * 4) // 16
+    rope_chunks = (d_rope * 2) // 16
+    chunks_per_head = nope_chunks + scale_chunks + rope_chunks
+    q_sc_addr = shared_ptr_to_u32(q_sc_view.iterator)
+    i = tid
+    while i < Int32(hpb * chunks_per_head):
+        h = i // Int32(chunks_per_head)
+        c = i - h * Int32(chunks_per_head)
+        v0 = Uint32(0)
+        v1 = Uint32(0)
+        v2 = Uint32(0)
+        v3 = Uint32(0)
+        if h < valid_hpb:
+            src = get_ptr_as_int64(
+                q_token, cute.crd2idx((head_base + h, c * Int32(16)), q_token.layout)
+            )
+            v0, v1, v2, v3 = ld_global_nc_v4_u32(src)
+        if c < Int32(nope_chunks):
+            st_shared_v4_u32(
+                q_fp8_base_addr + h * Int32(q_nope_stride) + c * Int32(16), v0, v1, v2, v3
+            )
+        elif c < Int32(nope_chunks + scale_chunks):
+            st_shared_v4_u32(
+                q_sc_addr
+                + h * Int32(num_scales * 4)
+                + (c - Int32(nope_chunks)) * Int32(16),
+                v0,
+                v1,
+                v2,
+                v3,
+            )
+        else:
+            st_shared_v4_u32(
+                q_rope_base_addr
+                + h * Int32(q_rope_stride * 2)
+                + (c - Int32(nope_chunks + scale_chunks)) * Int32(16),
+                v0,
+                v1,
+                v2,
+                v3,
+            )
+        i += Int32(num_threads)
     cute.arch.barrier(**bar_kw)
 
 
@@ -1019,8 +1099,13 @@ def s2_qk_rope_bf16(
     q_rope_stride: cutlass.Constexpr,
     valid_hpb: cutlass.Constexpr = 16,
     fp8_rope: cutlass.Constexpr = False,
+    kv_rope_stride_bytes: cutlass.Constexpr = 0,  # 0 -> D_ROPE*2 (separate rope stage)
 ):
     """S2: accumulate Q_rope . K_rope into qk[0..3] via D_ROPE/16=4 bf16 MMAs.
+
+    ``kv_rope_stride_bytes`` is the byte stride between consecutive tokens'
+    rope rows: the default ``D_ROPE * 2`` for the separate rope stage, or the
+    packed record stride when the rope is staged inline after the nope bytes.
 
     A (Q-rope, 16x16 bf16) via ldmatrix.x4 (ldmatrix_load_A_bf16); B (K-rope)
     via per-lane scalar u32 reads -- the N-major rope smem layout can't feed
@@ -1056,7 +1141,8 @@ def s2_qk_rope_bf16(
                 d_rope=d_rope,
             )
         else:
-            row_byte = entry * Int32(d_rope * 2) + ko * Int32(2)
+            rope_row_stride = kv_rope_stride_bytes if kv_rope_stride_bytes else d_rope * 2
+            row_byte = entry * Int32(rope_row_stride) + ko * Int32(2)
             b0 = _ld_u32(kv_rope_base_addr, row_byte + tid * Int32(2) * Int32(2))
             b1 = _ld_u32(
                 kv_rope_base_addr, row_byte + (tid * Int32(2) + Int32(8)) * Int32(2)
@@ -1431,8 +1517,26 @@ def s4_online_softmax(
     num_threads: cutlass.Constexpr,  # 256
     barrier_id: cutlass.Constexpr,  # math-only named-barrier slot
     n_acc_tiles: cutlass.Constexpr = None,  # len(acc_nope); defaults to n_v_chunks
+    skip_unit_rescale: cutlass.Constexpr = False,  # warp-uniform skip when alpha == 1
+    return_state: cutlass.Constexpr = False,  # also return acc/max/sum containers
 ):
     """S4: per-warp + cross-warp max/sum, exp2(qk-max), cross-chunk rescale.
+
+    ``skip_unit_rescale`` skips the accumulator rescale for a chunk in which
+    every lane's cross-chunk factor is exactly 1.0 (the running maximum of
+    both of the lane's heads did not change), decided with a warp vote so the
+    branch is uniform. Multiplying by exactly 1.0 is the identity, so the
+    result is bit-identical; after the first few chunks most chunks skip.
+
+    ``return_state`` additionally returns ``(acc_nope, acc_rope, global_max,
+    global_sum)`` and the unified decode kernel's chunk loop rebinds them from
+    the return value. The accumulator rescale below sits inside ``if rescale:``,
+    which the DSL lowers as a region even when ``rescale`` is the Python
+    constant ``True``; nested-list element assignments made inside such a
+    region do not reach the caller's list objects, so a caller that relies on
+    in-place mutation keeps un-rescaled accumulators whenever the running
+    maximum rises in a later chunk (research
+    ``fp8-ds-mla-perf-20260905/dsl_if_region_probe.py``).
 
     Returns ``(p, warp_rescale0, warp_rescale1)``; mutates ``acc_nope`` /
     ``acc_rope`` (rescaled by the cross-chunk alpha) and ``global_max`` /
@@ -1523,15 +1627,20 @@ def s4_online_softmax(
 
     _n_acc = cutlass.const_expr(n_acc_tiles if n_acc_tiles is not None else n_v_chunks)
     if cutlass.const_expr(not is_first_chunk):
-        for vc in cutlass.range_constexpr(_n_acc):
-            acc_nope[vc][0] = acc_nope[vc][0] * alpha0
-            acc_nope[vc][1] = acc_nope[vc][1] * alpha0
-            acc_nope[vc][2] = acc_nope[vc][2] * alpha1
-            acc_nope[vc][3] = acc_nope[vc][3] * alpha1
-        acc_rope[0] = acc_rope[0] * alpha0
-        acc_rope[1] = acc_rope[1] * alpha0
-        acc_rope[2] = acc_rope[2] * alpha1
-        acc_rope[3] = acc_rope[3] * alpha1
+        rescale = True
+        if cutlass.const_expr(skip_unit_rescale):
+            unit = (alpha0 == Float32(1.0)) & (alpha1 == Float32(1.0))
+            rescale = not cute.arch.vote_all_sync(unit)
+        if rescale:
+            for vc in cutlass.range_constexpr(_n_acc):
+                acc_nope[vc][0] = acc_nope[vc][0] * alpha0
+                acc_nope[vc][1] = acc_nope[vc][1] * alpha0
+                acc_nope[vc][2] = acc_nope[vc][2] * alpha1
+                acc_nope[vc][3] = acc_nope[vc][3] * alpha1
+            acc_rope[0] = acc_rope[0] * alpha0
+            acc_rope[1] = acc_rope[1] * alpha0
+            acc_rope[2] = acc_rope[2] * alpha1
+            acc_rope[3] = acc_rope[3] * alpha1
         global_sum[0] = global_sum[0] * alpha0 + block_local_sum0 * block_rescale0
         global_sum[1] = global_sum[1] * alpha1 + block_local_sum1 * block_rescale1
     else:
@@ -1540,6 +1649,11 @@ def s4_online_softmax(
     global_max[0] = new_gmax0
     global_max[1] = new_gmax1
 
+    if cutlass.const_expr(return_state):
+        # The rescale inside ``if rescale:`` is invisible to the caller's list
+        # objects (see the docstring); hand the containers back explicitly so
+        # the chunk loop accumulates the next chunk onto rescaled values.
+        return p, warp_rescale0, warp_rescale1, acc_nope, acc_rope, global_max, global_sum
     return p, warp_rescale0, warp_rescale1
 
 
@@ -1564,6 +1678,7 @@ def s4_online_softmax_glm_h8_swap_ab(
     barrier_id: cutlass.Constexpr,
     rope_tiles_per_warp: cutlass.Constexpr = 0,
     barrier_threads: cutlass.Constexpr = 0,  # barrier width override (0 -> num_threads)
+    return_state: cutlass.Constexpr = False,  # also return acc/max/sum containers
 ):
     """Online softmax for the swapped 16-candidate x 8-head score tile.
 
@@ -1674,6 +1789,8 @@ def s4_online_softmax_glm_h8_swap_ab(
     global_sum[1] = global_sum[1] * alpha1 + block_sum1 * block_rescale1
     global_max[0] = new_gmax0
     global_max[1] = new_gmax1
+    if cutlass.const_expr(return_state):
+        return p, warp_rescale0, warp_rescale1, acc_nope, acc_rope, global_max, global_sum
     return p, warp_rescale0, warp_rescale1
 
 
@@ -1761,6 +1878,8 @@ def s6_xv_nope(
     sm_p_full_addr: Int32 = None,  # NVFP4 BF16 PV only
     sm_p_stride: cutlass.Constexpr = 0,  # NVFP4: bf16 elems per sm_p row (0 -> BI)
     latent_scale_per_token: cutlass.Constexpr = False,  # NVFP4_E4M3 only
+    v_ldsm_b8: cutlass.Constexpr = False,  # GLM 2-pass: V B-fragments via ldmatrix.b8
+    w_hw_dequant: cutlass.Constexpr = False,  # GLM 2-pass: residual from cvt.f16x2.e4m3x2
 ):
     """S6: accumulate W . V_nope into acc_nope[vc*NT+nt][0..3] via PLAIN fp8 MMAs
     (14 DSV4 / 16 GLM = N_V_CHUNKS * NT_PER_WARP_XV * (BI/32)).
@@ -1798,7 +1917,27 @@ def s6_xv_nope(
     ``scale_format == NVFP4_E4M3`` (const_expr) bypasses the FP8 W machinery
     entirely: BF16 probabilities staged in sm_p (``sm_p_full_addr``) are the A
     operand and V is dequantized in registers from packed E2M1 + E4M3 group-16
-    scales (see ``s6_xv_nope_nvfp4_bf16``)."""
+    scales (see ``s6_xv_nope_nvfp4_bf16``).
+
+    ``v_ldsm_b8`` (const_expr, GLM 2-pass branch only, ``nt_per_warp_xv == 2``)
+    loads the V B-fragments with ``ldmatrix.m16n16.x2.trans.b8`` straight from
+    the row-major smem stage instead of synthesizing them from 8 LDS.32 + 6
+    PRMT per (n-tile, k-step) (``_d2_load_b_fp8``): one ldmatrix per k-step
+    yields both n-tiles, loaded once per V chunk and reused by both W passes.
+    Each warp then owns 16 consecutive dims per V chunk
+    (``vc * V_CHUNK + warp * 16 + nt * 8``) instead of two 8-dim tiles 64 dims
+    apart; the epilogue must use the same mapping (``warp_contiguous_dims``).
+    The loaded bytes and the MMA sequence are unchanged, so the result is
+    bit-identical. The same flag quantizes each lane's candidate pair with one
+    ``cvt.rn.satfinite.e4m3x2.f32`` and stores it as one 16-bit word (the
+    per-value conversion produces the same bytes).
+
+    ``w_hw_dequant`` (const_expr, GLM 2-pass branch only) reconstructs the
+    HIGH byte for the residual with ``cvt.rn.f16x2.e4m3x2`` (exact for every
+    E4M3 value) instead of the scalar software expansion, which mis-decodes
+    E4M3 subnormals and -0 as normal numbers. The LOW byte therefore changes
+    for W values below 2^-6 of the head's chunk maximum; results are not
+    bit-identical to the software path but closer to the fp32 reference."""
     if cutlass.const_expr(scale_format == 2):
         return s6_xv_nope_nvfp4_bf16(
             acc_nope,
@@ -2011,6 +2150,15 @@ def s6_xv_nope(
     # SEPARATE const_expr branch, so DSV4 (above) is untouched.
     for vc in cutlass.range_constexpr(n_v_chunks):
         w_fp8_addr = w_fp8_base_addr + Int32(vc & 1) * Int32(hpb * w_fp8_stride)
+        # v_ldsm_b8: the HIGH byte always uses slot 0 and the LOW residual slot
+        # 1. Every warp writes HIGH(vc+1) only after the barrier that follows
+        # its LOW(vc) store, i.e. after every warp finished the HIGH(vc) MMAs,
+        # and LOW(vc+1) only after the barrier that follows HIGH(vc+1), i.e.
+        # after every warp finished the LOW(vc) MMAs; so neither store needs
+        # the extra serialization barrier of the vc-parity slot scheme.
+        if cutlass.const_expr(v_ldsm_b8):
+            w_fp8_hi_addr = w_fp8_base_addr
+            w_fp8_lo_addr = w_fp8_base_addr + Int32(hpb * w_fp8_stride)
         si0 = Float32(1.0) / w_head_sc_view[Int32(vc) * Int32(hpb) + gid]
         sc0 = w_head_sc_view[Int32(vc) * Int32(hpb) + gid]
         if cutlass.const_expr(hi):
@@ -2031,42 +2179,98 @@ def s6_xv_nope(
             [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
             for _ in range(nt_per_warp_xv)
         ]
+        if cutlass.const_expr(v_ldsm_b8):
+            # V B-fragments for this warp's 16 consecutive dims, both k-steps,
+            # loaded once and shared by the two W passes. Lane ``l`` supplies
+            # the 16-byte-aligned row address of token ``ko + l``.
+            v_dim_base = Int32(vc) * Int32(v_chunk) + warp_id * Int32(8 * nt_per_warp_xv)
+            v_frag = []
+            for kstep in cutlass.range_constexpr(bi // 32):
+                v_row_addr = (
+                    kv_fp8_base_addr
+                    + (Int32(kstep) * Int32(32) + lane) * Int32(kv_smem_stride)
+                    + v_dim_base
+                )
+                v_frag.append(ldmatrix_m16n16x2_trans_b8(v_row_addr))
         for wpass in cutlass.range_constexpr(2):
-            if cutlass.const_expr(wpass > 0):
-                # serialize: the prev pass's MMA reads of w_fp8 must finish before
-                # we overwrite it with the residual bytes (same double-buffer slot).
-                cute.arch.barrier(**bar_kw)
-                # LOW residual = e4m3(Wn - dequant(hi_byte)); halves W's quant error.
-                f00 = _quant_e4m3_residual_byte(wn00)
-                f01 = _quant_e4m3_residual_byte(wn01)
+            if cutlass.const_expr(v_ldsm_b8):
+                w_fp8_addr = w_fp8_lo_addr if wpass > 0 else w_fp8_hi_addr
+            if cutlass.const_expr(v_ldsm_b8):
+                # Pairwise quantization of (cand_e0, cand_e1): one conversion
+                # and one 16-bit store per row (cand_e0 is even).
+                if cutlass.const_expr(wpass == 0):
+                    vc00 = fmax_f32(Float32(_FP8_MIN), fmin_f32(Float32(_FP8_MAX), wn00))
+                    vc01 = fmax_f32(Float32(_FP8_MIN), fmin_f32(Float32(_FP8_MAX), wn01))
+                    fhi2_0 = _cvt_f32x2_to_e4m3x2(vc00, vc01)
+                    word0 = fhi2_0
+                    if cutlass.const_expr(hi):
+                        vc10 = fmax_f32(Float32(_FP8_MIN), fmin_f32(Float32(_FP8_MAX), wn10))
+                        vc11 = fmax_f32(Float32(_FP8_MIN), fmin_f32(Float32(_FP8_MAX), wn11))
+                        fhi2_1 = _cvt_f32x2_to_e4m3x2(vc10, vc11)
+                        word1 = fhi2_1
+                else:
+                    if cutlass.const_expr(w_hw_dequant):
+                        h00, h01 = f16x2_to_f32x2(_cvt_e4m3x2_to_f16x2(fhi2_0))
+                    else:
+                        h00 = fp8_e4m3_to_f32(fhi2_0 & Uint32(0xFF))
+                        h01 = fp8_e4m3_to_f32((fhi2_0 >> Uint32(8)) & Uint32(0xFF))
+                    r00 = fmax_f32(Float32(_FP8_MIN), fmin_f32(Float32(_FP8_MAX), vc00 - h00))
+                    r01 = fmax_f32(Float32(_FP8_MIN), fmin_f32(Float32(_FP8_MAX), vc01 - h01))
+                    word0 = _cvt_f32x2_to_e4m3x2(r00, r01)
+                    if cutlass.const_expr(hi):
+                        if cutlass.const_expr(w_hw_dequant):
+                            h10, h11 = f16x2_to_f32x2(_cvt_e4m3x2_to_f16x2(fhi2_1))
+                        else:
+                            h10 = fp8_e4m3_to_f32(fhi2_1 & Uint32(0xFF))
+                            h11 = fp8_e4m3_to_f32((fhi2_1 >> Uint32(8)) & Uint32(0xFF))
+                        r10 = fmax_f32(Float32(_FP8_MIN), fmin_f32(Float32(_FP8_MAX), vc10 - h10))
+                        r11 = fmax_f32(Float32(_FP8_MIN), fmin_f32(Float32(_FP8_MAX), vc11 - h11))
+                        word1 = _cvt_f32x2_to_e4m3x2(r10, r11)
+                _st_shared_u16(w_fp8_addr + gid * Int32(w_fp8_stride) + cand_e0, word0)
                 if cutlass.const_expr(hi):
-                    f10 = _quant_e4m3_residual_byte(wn10)
-                    f11 = _quant_e4m3_residual_byte(wn11)
+                    _st_shared_u16(
+                        w_fp8_addr + (gid + Int32(8)) * Int32(w_fp8_stride) + cand_e0,
+                        word1,
+                    )
             else:
-                f00 = _quant_e4m3_byte(wn00)
-                f01 = _quant_e4m3_byte(wn01)
+                if cutlass.const_expr(wpass > 0):
+                    # serialize: the prev pass's MMA reads of w_fp8 must finish
+                    # before we overwrite it with the residual bytes (same
+                    # double-buffer slot).
+                    cute.arch.barrier(**bar_kw)
+                    # LOW residual = e4m3(Wn - dequant(hi_byte)); halves W's quant error.
+                    f00 = _quant_e4m3_residual_byte(wn00)
+                    f01 = _quant_e4m3_residual_byte(wn01)
+                    if cutlass.const_expr(hi):
+                        f10 = _quant_e4m3_residual_byte(wn10)
+                        f11 = _quant_e4m3_residual_byte(wn11)
+                else:
+                    f00 = _quant_e4m3_byte(wn00)
+                    f01 = _quant_e4m3_byte(wn01)
+                    if cutlass.const_expr(hi):
+                        f10 = _quant_e4m3_byte(wn10)
+                        f11 = _quant_e4m3_byte(wn11)
+                st_shared_u8(
+                    w_fp8_addr + gid * Int32(w_fp8_stride) + cand_e0, f00.to(cutlass.Uint8)
+                )
+                st_shared_u8(
+                    w_fp8_addr + gid * Int32(w_fp8_stride) + cand_e1, f01.to(cutlass.Uint8)
+                )
                 if cutlass.const_expr(hi):
-                    f10 = _quant_e4m3_byte(wn10)
-                    f11 = _quant_e4m3_byte(wn11)
-            st_shared_u8(
-                w_fp8_addr + gid * Int32(w_fp8_stride) + cand_e0, f00.to(cutlass.Uint8)
-            )
-            st_shared_u8(
-                w_fp8_addr + gid * Int32(w_fp8_stride) + cand_e1, f01.to(cutlass.Uint8)
-            )
-            if cutlass.const_expr(hi):
-                st_shared_u8(
-                    w_fp8_addr + (gid + Int32(8)) * Int32(w_fp8_stride) + cand_e0,
-                    f10.to(cutlass.Uint8),
-                )
-                st_shared_u8(
-                    w_fp8_addr + (gid + Int32(8)) * Int32(w_fp8_stride) + cand_e1,
-                    f11.to(cutlass.Uint8),
-                )
+                    st_shared_u8(
+                        w_fp8_addr + (gid + Int32(8)) * Int32(w_fp8_stride) + cand_e0,
+                        f10.to(cutlass.Uint8),
+                    )
+                    st_shared_u8(
+                        w_fp8_addr + (gid + Int32(8)) * Int32(w_fp8_stride) + cand_e1,
+                        f11.to(cutlass.Uint8),
+                    )
             cute.arch.barrier(**bar_kw)
 
             for nt in cutlass.range_constexpr(nt_per_warp_xv):
-                # dim = vc*V_CHUNK + (nt*N_WARPS + warp_id)*8 (covers the full V_CHUNK).
+                # dim = vc*V_CHUNK + (nt*N_WARPS + warp_id)*8 (covers the full V_CHUNK);
+                # with v_ldsm_b8 the warp's tiles are the 16 consecutive dims
+                # vc*V_CHUNK + warp*16 + nt*8 (see ``v_frag``).
                 dim = Int32(vc) * Int32(v_chunk) + (
                     Int32(nt) * Int32(n_warps) + warp_id
                 ) * Int32(8)
@@ -2078,9 +2282,14 @@ def s6_xv_nope(
                     ko = Int32(kstep) * Int32(32)
                     a_addr = w_fp8_addr + a_row * Int32(w_fp8_stride) + ko + a_col
                     a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(a_addr)
-                    b0, b1 = _d2_load_b_fp8(
-                        kv_fp8_base_addr, ko, dim, lane, kv_smem_stride=kv_smem_stride
-                    )
+                    if cutlass.const_expr(v_ldsm_b8):
+                        # r0/r1: K 0-15 of dims [0,8)/[8,16); r2/r3: K 16-31.
+                        b0 = v_frag[kstep][nt]
+                        b1 = v_frag[kstep][2 + nt]
+                    else:
+                        b0, b1 = _d2_load_b_fp8(
+                            kv_fp8_base_addr, ko, dim, lane, kv_smem_stride=kv_smem_stride
+                        )
                     xv0, xv1, xv2, xv3 = mma_m16n8k32_f32_e4m3(
                         xv0, xv1, xv2, xv3, a0, a1, a2, a3, b0, b1
                     )
@@ -2744,6 +2953,7 @@ def s7_epilogue(
     num_threads: cutlass.Constexpr = 0,
     barrier_id: cutlass.Constexpr = 0,
     coalesced_output: cutlass.Constexpr = False,
+    warp_contiguous_dims: cutlass.Constexpr = False,
 ):
     """S7: normalized O + base-2 LSE epilogue. ``epilogue_mode`` (const_expr)
     selects the destination + normalizer convention; the (gid, d0) output-write
@@ -2817,11 +3027,21 @@ def s7_epilogue(
     for vc in cutlass.range_constexpr(n_v_chunks):
         for nt in cutlass.range_constexpr(nt_per_warp_xv):
             at = vc * nt_per_warp_xv + nt
-            d0 = (
-                Int32(vc) * Int32(v_chunk)
-                + (Int32(nt) * Int32(n_warps) + warp_id) * Int32(8)
-                + tid * Int32(2)
-            )
+            if cutlass.const_expr(warp_contiguous_dims):
+                # S6 with v_ldsm_b8: tile nt of this warp holds dims
+                # vc*V_CHUNK + warp*(8*NT) + nt*8 .. +8.
+                d0 = (
+                    Int32(vc) * Int32(v_chunk)
+                    + warp_id * Int32(8 * nt_per_warp_xv)
+                    + Int32(nt) * Int32(8)
+                    + tid * Int32(2)
+                )
+            else:
+                d0 = (
+                    Int32(vc) * Int32(v_chunk)
+                    + (Int32(nt) * Int32(n_warps) + warp_id) * Int32(8)
+                    + tid * Int32(2)
+                )
             if cutlass.const_expr(coalesced_output):
                 st_shared_bf16_from_f32(
                     staging_base_addr + (gid * Int32(d_v) + d0) * Int32(2),

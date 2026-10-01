@@ -14,7 +14,10 @@ import torch
 
 from b12x.moe import fused_moe
 from b12x.moe._shared.execution import PreparedWeightLayout
-from b12x.moe._shared.kernels.w4a16.prepare import PreparedW4A16MoeWeights
+from b12x.moe._shared.kernels.w4a16.prepare import (
+    PreparedW4A16MoeWeights,
+    TrellisWeightState,
+)
 from b12x.moe.fused_moe._impl import (
     B12XFP4ExpertWeights,
     _PreparedWeightRepresentation,
@@ -57,16 +60,15 @@ def _make_expert_weights(
     assert coupled
     plan = fused_moe.plan_weights(
         quant_modes="w4a8_mx",
-        source_format="qsrt_sqg_e4m3",
+        source_format="btx",
         activation="situ",
         params_dtype=torch.bfloat16,
         num_experts=E,
         hidden_size=K,
         intermediate_size=n,
         trellis_bits=_BITS,
+        trellis_codebook="sqg_e4m3",
         trellis_tile_config=(128, 128, 128, 128),
-        qsrt_storage_format="qsrt_atoms_v2",
-        qsrt_profile="k2_coupled_h512_h128",
         coupled_hadamard=True,
     )
     dummy_scale = torch.zeros(4, dtype=torch.uint8, device=device)
@@ -86,14 +88,16 @@ def _make_expert_weights(
         params_dtype=torch.float16,
         fc1_tile_n=128,
         fc2_tile_n=128,
-        source_format="qsrt_sqg_e4m3",
-        w13_layout="trellis3_t256_proj",
-        weight_layout="trellis3_t256",
+        source_format="btx",
+        w13_layout="trellis_t256_proj",
+        weight_layout="trellis_t256",
         scale_format="e4m3_k32",
-        trellis_codebook="sqg_xor_cheb_t12",
-        trellis_bits=_BITS,
-        intermediate_rotations=rotations,
-        coupled_hadamard=coupled,
+        trellis=TrellisWeightState(
+            codebook="sqg_e4m3",
+            bits=_BITS,
+            intermediate_rotations=rotations,
+            coupled_hadamard=coupled,
+        ),
     )
     scalar_one = torch.ones((), dtype=torch.float32, device=device)
     experts = B12XFP4ExpertWeights(

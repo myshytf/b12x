@@ -1,0 +1,101 @@
+{
+  "status": "qualified",
+  "scope": "Production boot and three short sampled model requests; no long-context or throughput claim",
+  "upstream_pr": "https://github.com/local-inference-lab/b12x/pull/436",
+  "backport_pr": "https://github.com/myshytf/b12x/pull/24",
+  "identity": {
+    "status": "implemented",
+    "runtime_files_changed": [
+      "b12x/_lib/intrinsics.py"
+    ],
+    "intrinsics_sha256": "c900dca63255cc533d42db951981319b34082359da6eefa05f0ec2b2d2fc1350",
+    "compose_sha256": "4d215a004d7ac9f5313a1c15532bec365cf3b1fd8fcd01d0b00111ce6590cf80",
+    "namespace": "iso-67ae8502029a29ea",
+    "container": "ccca20e9c71949a4b68253aee57cecb2f596998fc780142dcf0b8a298a161a71",
+    "started_at": "2026-09-30T17:05:07.335243147Z",
+    "restart_count": 0,
+    "live_source_verified": true
+  },
+  "health": {
+    "healthy_at": "2026-09-30T17:12:49Z",
+    "seconds": 462.12712707000173,
+    "container_id": "ccca20e9c71949a4b68253aee57cecb2f596998fc780142dcf0b8a298a161a71"
+  },
+  "model_comparison": {
+    "qualified": true,
+    "sampling": {
+      "temperature": 1.0,
+      "top_p": 0.95
+    },
+    "seeds": [
+      436,
+      437,
+      438
+    ],
+    "cases": [
+      {
+        "case": 0,
+        "message_exact": true,
+        "logprobs_exact": true,
+        "finish_reason_exact": true,
+        "tokens_exact": true,
+        "reference_sha256": "686d09009b98597b89493ce0d16e63e138db7993c4cb90c7218b3b847e0ddf2d",
+        "candidate_sha256": "686d09009b98597b89493ce0d16e63e138db7993c4cb90c7218b3b847e0ddf2d",
+        "completion_tokens": 141
+      },
+      {
+        "case": 1,
+        "message_exact": true,
+        "logprobs_exact": true,
+        "finish_reason_exact": true,
+        "tokens_exact": true,
+        "reference_sha256": "4a641836931b7119467fbe018b4863d2f1216bccd836b20f7d73fce497058357",
+        "candidate_sha256": "4a641836931b7119467fbe018b4863d2f1216bccd836b20f7d73fce497058357",
+        "completion_tokens": 202
+      },
+      {
+        "case": 2,
+        "message_exact": true,
+        "logprobs_exact": true,
+        "finish_reason_exact": true,
+        "tokens_exact": true,
+        "reference_sha256": "c0486d8de680f6b628f0636edc7780d13260006207ca4919873073235a1309b4",
+        "candidate_sha256": "c0486d8de680f6b628f0636edc7780d13260006207ca4919873073235a1309b4",
+        "completion_tokens": 491
+      }
+    ],
+    "limitation": "Three short-context requests at concurrency one; no long-context or throughput claim"
+  },
+  "gateway": {
+    "request": "gateway",
+    "ok": true,
+    "status": 200,
+    "model": "Kimi-K3",
+    "finish_reason": "stop",
+    "usage": {
+      "completion_tokens": 53,
+      "completion_tokens_details": {
+        "reasoning_tokens": 0
+      },
+      "prompt_tokens": 95,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      },
+      "total_tokens": 148
+    },
+    "text_chars": 2,
+    "reasoning_chars": 178,
+    "text_sha256": "565339bc4d33d728",
+    "contains_ok": true,
+    "seconds": 0.88
+  },
+  "kernel_health": {
+    "journal_exit_code": 0,
+    "since": "2026-09-30 17:01:10 UTC",
+    "new_xids": []
+  },
+  "stopped_at": "2026-09-30T17:01:10Z",
+  "stop_to_health_seconds": 699,
+  "gpu_memory_after_csv": "0, 00000000:09:00.0, 94608 MiB, 2643 MiB, 97887 MiB\n1, 00000000:0C:00.0, 94561 MiB, 2692 MiB, 97887 MiB\n2, 00000000:0D:00.0, 94583 MiB, 2670 MiB, 97887 MiB\n3, 00000000:10:00.0, 94289 MiB, 2964 MiB, 97887 MiB\n4, 00000000:11:00.0, 93993 MiB, 3260 MiB, 97887 MiB\n5, 00000000:19:00.0, 93991 MiB, 3262 MiB, 97887 MiB\n6, 00000000:1A:00.0, 94289 MiB, 2964 MiB, 97887 MiB\n7, 00000000:1D:00.0, 94587 MiB, 2666 MiB, 97887 MiB\n8, 00000000:1E:00.0, 94469 MiB, 2784 MiB, 97887 MiB\n",
+  "raw_evidence_directory": "/home/g0san/kimi-k3-production/candidates/k3-pr436-lut-20261001/evidence"
+}
