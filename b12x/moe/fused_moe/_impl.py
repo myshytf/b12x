@@ -3153,9 +3153,14 @@ def _build_tp_moe_fp4_binding_from_views(
         # An extended arena is initialized at launch: the grouped builder
         # clears its barrier header, or the ordinary launch clears it for
         # M1/M16/prefill. Binding alone does not initialize grouped metadata.
+        from b12x.moe._shared.kernels.w4a16 import kernel as _w4a16_kernel_module
         grouped_arena = (
             k == 3584 and n in (256, 384)
-            and kernel_workspace.numel() == reference_grouped.workspace_layout(n).words
+            and kernel_workspace.numel()
+            == reference_grouped.workspace_layout(n).words
+            + _w4a16_kernel_module.w4a16_resident_workspace_extension_words(
+                int(get_num_sm(a.device))
+            )
         )
         if not grouped_arena:
             kernel_workspace.zero_()
@@ -3642,13 +3647,17 @@ def _plan_core_workspace(
                         "rotation_a_gate", (routed_capacity, int(k)), torch.float16
                     )
                 )
-            kernel_workspace_words = sms * 4 + 2
-            from b12x.moe._shared.kernels.w4a16 import reference_grouped
-            if (
-                reference_grouped.requested() and k == 3584 and n in (256, 384)
-                and trellis_bits == 2 and weight_E == 896
-            ):
-                kernel_workspace_words = reference_grouped.workspace_layout(n).words
+            from b12x.moe._shared.kernels.w4a16 import kernel as _w4a16_kernel_module
+            kernel_workspace_words = (
+                _w4a16_kernel_module.w4a16_resident_workspace_base_words(
+                    physical_sms=sms,
+                    hidden_size=k,
+                    intermediate_size=n,
+                    trellis_bits=trellis_bits,
+                    num_experts=weight_E,
+                )
+                + _w4a16_kernel_module.w4a16_resident_workspace_extension_words(sms)
+            )
             tensor_specs.append(
                 _TensorAllocSpec("kernel_workspace", (kernel_workspace_words,), torch.int32)
             )

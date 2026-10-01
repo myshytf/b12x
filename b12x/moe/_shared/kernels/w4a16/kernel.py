@@ -46,6 +46,7 @@ from b12x._lib.intrinsics import (
     half2_mul,
     half2_to_float2_scaled,
     ld_global_acquire_i32,
+    ld_globaltimer_lo_i32,
     ld_global_nc_u32,
     ld_global_v4_f32,
     ld_shared_f32,
@@ -252,6 +253,71 @@ def _w4a16_token_major_rotation_enabled() -> bool:
     """
 
     return os.environ.get("B12X_W4A16_TOKEN_MAJOR_ROTATION", "0") == "1"
+
+
+# Decode-phase experiments (2026-10-02): research-only, default off. The three
+# switches extend the resident kernel workspace by a region appended after the
+# ordinary header (plain ``4 * SMs + 2`` words) or after the reference-grouped
+# arena; ``w4a16_resident_workspace_extension_words`` sizes it on the host and
+# the fused kernel derives the same offsets.
+_PHASE_TIMER_SLOTS = 16
+_HIER_BARRIER_GROUP = 16
+_HIER_BARRIER_WORDS = 16
+_FINISHER_FLAG_WORDS = 128 * 3  # MAX_ROUTES x coupled blocks (width 384 -> 3)
+_FINISHER_SMEM_WORDS = 12  # count + 8 deferred entries + padding
+_FINISHER_SMEM_ENTRIES = 8
+
+
+def _w4a16_phase_timers_enabled() -> bool:
+    """Per-CTA ``%globaltimer`` stamps at every fused-kernel phase edge."""
+    return os.environ.get("B12X_W4A16_PHASE_TIMERS", "0") == "1"
+
+
+def _w4a16_hier_barrier_enabled() -> bool:
+    """Two-level arrival (groups of 16 CTAs) for the fused grid barrier."""
+    return os.environ.get("B12X_W4A16_HIER_BARRIER", "0") == "1"
+
+
+def _w4a16_finisher_activation_enabled() -> bool:
+    """Activate each coupled block in the FC1 finisher that completes its pair.
+
+    Removes the standalone activation phase and one grid barrier from the
+    decode fused kernel; the activation arithmetic is the unchanged warp-level
+    sequence of ``_run_activation_coupled`` (bit-identical outputs).
+    """
+    return os.environ.get("B12X_W4A16_FINISHER_ACTIVATION", "0") == "1"
+
+
+def w4a16_resident_workspace_base_words(
+    *,
+    physical_sms: int,
+    hidden_size: int,
+    intermediate_size: int,
+    trellis_bits: int,
+    num_experts: int,
+) -> int:
+    """Resident workspace words before the optional extension region."""
+    if (
+        _reference_grouped.requested()
+        and int(hidden_size) == 3584
+        and int(intermediate_size) in (256, 384)
+        and int(trellis_bits) == 2
+        and int(num_experts) == 896
+    ):
+        return int(_reference_grouped.workspace_layout(int(intermediate_size)).words)
+    return int(physical_sms) * 4 + 2
+
+
+def w4a16_resident_workspace_extension_words(physical_sms: int) -> int:
+    """Words appended to the resident workspace by the enabled experiments."""
+    words = 0
+    if _w4a16_hier_barrier_enabled():
+        words += _HIER_BARRIER_WORDS
+    if _w4a16_finisher_activation_enabled():
+        words += _FINISHER_FLAG_WORDS
+    if _w4a16_phase_timers_enabled():
+        words += int(physical_sms) * _PHASE_TIMER_SLOTS
+    return words
 
 
 # Shared memory the fused launch appends after a GEMM's own layout: the
@@ -1398,11 +1464,13 @@ class W4A16GemmKernel:
         self.max_m_blocks = int(max_m_blocks)
         if torch.cuda.is_available():
             props = torch.cuda.get_device_properties(torch.cuda.current_device())
-            self.sms = _fused_sm_budget(int(props.multi_processor_count))
+            self.physical_sms = int(props.multi_processor_count)
+            self.sms = _fused_sm_budget(self.physical_sms)
             max_shared_mem = int(
                 getattr(props, "shared_memory_per_block_optin", _DEFAULT_MAX_SHARED_MEM)
             )
         else:
+            self.physical_sms = 120
             self.sms = 120
             max_shared_mem = _DEFAULT_MAX_SHARED_MEM
         self.max_shared_mem = int(max_shared_mem)
@@ -1918,6 +1986,7 @@ class W4A16GemmKernel:
         grid_x: Int32,
         active_size_m: Int32,
         emit_tile: cutlass.Constexpr = None,
+        finish_hook: cutlass.Constexpr = None,
     ):
         if cutlass.const_expr(self.reference_grouped_phase >= 0):
             self._run_reference_grouped_tasks(
@@ -2137,6 +2206,7 @@ class W4A16GemmKernel:
                             reduce_slice_idx,
                             lock_slot,
                             active_size_m,
+                            finish_hook,
                         )
 
             if has_work != Int32(0):
@@ -2586,6 +2656,7 @@ class W4A16GemmKernel:
         reduce_slice_idx: Int32,
         lock_slot: Int32,
         active_size_m: Int32,
+        finish_hook: cutlass.Constexpr = None,
     ):
         if cutlass.const_expr(self.trellis_pair_dynamic):
             # One expert-static, CTA-uniform branch chooses a fully specialized
@@ -2619,6 +2690,7 @@ class W4A16GemmKernel:
                     lock_slot,
                     active_size_m,
                     2 if cutlass.const_expr(self.trellis_pair_compact_offsets) else 1,
+                    finish_hook,
                 )
             else:
                 self._run_tile_with_pair_override(
@@ -2645,6 +2717,7 @@ class W4A16GemmKernel:
                     lock_slot,
                     active_size_m,
                     0,
+                    finish_hook,
                 )
             return
         self._run_tile_with_pair_override(
@@ -2671,6 +2744,7 @@ class W4A16GemmKernel:
             lock_slot,
             active_size_m,
             -1,
+            finish_hook,
         )
 
     @cute.jit
@@ -2699,6 +2773,7 @@ class W4A16GemmKernel:
         lock_slot: Int32,
         active_size_m: Int32,
         dynamic_pair_override: cutlass.Constexpr[int],
+        finish_hook: cutlass.Constexpr = None,
     ):
         if cutlass.const_expr(self.uses_m_block_8):
             self._run_tile_m8(
@@ -2725,6 +2800,7 @@ class W4A16GemmKernel:
                 lock_slot,
                 active_size_m,
                 dynamic_pair_override,
+                finish_hook,
             )
         else:
             self._run_tile_large_m(
@@ -2944,6 +3020,7 @@ class W4A16GemmKernel:
         lock_slot: Int32,
         active_size_m: Int32,
         dynamic_pair_override: cutlass.Constexpr[int],
+        finish_hook: cutlass.Constexpr = None,
     ):
         (
             global_scale_f32,
@@ -3092,6 +3169,9 @@ class W4A16GemmKernel:
             lock_slot,
             True,
         )
+        if cutlass.const_expr(finish_hook is not None):
+            if reduce_slice_idx == reduce_slice_count - Int32(1):
+                finish_hook(route_block_idx, expert_idx, output_n_tile)
 
     @cute.jit
     def _run_tile_m8_pair(
@@ -7511,6 +7591,21 @@ class W4A16FusedMoeKernel:
         if self.reference_grouped and grouped_phases not in ("both", "fc2"):
             raise ValueError("reference grouped phases must be 'both' or 'fc2'")
         self.reference_grouped_fc1 = self.reference_grouped and grouped_phases == "both"
+        # Decode-phase experiments (2026-10-02); see the module switches.
+        self.phase_timers = _w4a16_phase_timers_enabled()
+        self.hier_barrier = _w4a16_hier_barrier_enabled()
+        self.finisher_activation = bool(
+            _w4a16_finisher_activation_enabled()
+            and self.full_rotation
+            and self.coupled_hadamard
+            and self.activation_is_gated
+            and self.direct_topk_routes
+            and self.use_expert_map
+            and int(moe_block_size) == 8
+            and int(intermediate_size) % 128 == 0
+            and int(intermediate_size) // 128 <= 3
+        )
+        self.finisher_smem_off = -1
         fc1_source_n_rotation = (
             int(intermediate_size)
             if (weight_layout == "modelopt" and w13_layout == "w13" and is_gated)
@@ -7656,6 +7751,10 @@ class W4A16FusedMoeKernel:
             self.shared_words = (
                 self.sqg_xor_cheb_t12_smem_off + self.sqg_xor_cheb_t12_smem_region_bytes
             ) // 4
+            if self.finisher_activation:
+                # Deferred activation list (count + entries) after the staged table.
+                self.finisher_smem_off = self.shared_words
+                self.shared_words += _FINISHER_SMEM_WORDS
             # The typed launch storage appends one 16-byte-aligned Uint64
             # mbarrier after ``words``. Count that field in both launch
             # metadata and the opt-in shared-memory capacity check.
@@ -7683,6 +7782,26 @@ class W4A16FusedMoeKernel:
         )
         if self.reference_grouped_inline and self.sqg_xor_cheb_t12_smem_off < 3 * 128 * 4:
             raise ValueError("inline grouping scratch overlaps the staged direct LUT")
+        self.finisher_activation = bool(
+            self.finisher_activation
+            and self.finisher_smem_off >= 0
+            and self.fc1.uses_m_block_8
+            and self.fc1_trellis_pair_kind is None
+        )
+        self.workspace_ext_base = w4a16_resident_workspace_base_words(
+            physical_sms=self.fc1.physical_sms,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            trellis_bits=self.trellis_bits,
+            num_experts=num_experts,
+        )
+        self.hier_barrier_off = self.workspace_ext_base
+        self.finisher_flag_off = self.hier_barrier_off + (
+            _HIER_BARRIER_WORDS if self.hier_barrier else 0
+        )
+        self.phase_timer_off = self.finisher_flag_off + (
+            _FINISHER_FLAG_WORDS if _w4a16_finisher_activation_enabled() else 0
+        )
 
     @property
     def __cache_key__(self) -> tuple[object, ...]:
@@ -7733,6 +7852,10 @@ class W4A16FusedMoeKernel:
             self.sms,
             self.shared_words,
             self.blocks_per_sm,
+            self.phase_timers,
+            self.hier_barrier,
+            self.finisher_activation,
+            self.workspace_ext_base,
         )
 
     @cute.jit
@@ -7786,6 +7909,7 @@ class W4A16FusedMoeKernel:
         reduce_slice_count: Int32,
         reduce_slice_idx: Int32,
         lock_slot: Int32,
+        finish_hook: cutlass.Constexpr = None,
     ):
         # Direct decode keeps the router's global ids in route-major order.
         # Resolve the compact weight row at the point of use, and reject both
@@ -7819,6 +7943,7 @@ class W4A16FusedMoeKernel:
                     reduce_slice_idx,
                     lock_slot,
                     active_size_m,
+                    finish_hook,
                 )
             else:
                 self.fc2._run_tile(
@@ -8106,6 +8231,7 @@ class W4A16FusedMoeKernel:
         tid = Int32(tidx)
         cta = Int32(bidx)
         grid_x = Int32(grid_x_raw)
+        self._phase_stamp(locks_i32_flat, cta, tid, 0)
 
         smem = cutlass.utils.SmemAllocator()
 
@@ -8122,6 +8248,10 @@ class W4A16FusedMoeKernel:
 
         storage = smem.allocate(Storage)
         smem_base = shared_ptr_to_u32(storage.words.data_ptr())
+        if cutlass.const_expr(self.finisher_activation):
+            if tid == Int32(0):
+                st_shared_i32(smem_base + Int32(self.finisher_smem_off * 4), Int32(0))
+            cute.arch.sync_threads()
         fc1_trellis_lut_addr = get_ptr_as_int64(fc1_trellis_lut_flat, Int32(0))
         fc2_trellis_lut_addr = get_ptr_as_int64(fc2_trellis_lut_flat, Int32(0))
 
@@ -8164,6 +8294,17 @@ class W4A16FusedMoeKernel:
             fc1_phase_lut_addr = table_addr
             fc2_phase_lut_addr = table_addr
 
+        fc1_finish_hook = None
+        if cutlass.const_expr(self.finisher_activation):
+            fc1_finish_hook = partial(
+                self._fc1_finisher_activation,
+                fc1_bf16_flat,
+                activated_bf16_flat,
+                rot_scales_flat,
+                locks_i32_flat,
+                smem_base,
+                tid,
+            )
         fc1_emit_tile = None
         fc2_emit_tile = None
         if cutlass.const_expr(self.use_expert_map):
@@ -8187,6 +8328,7 @@ class W4A16FusedMoeKernel:
                 active_m,
                 weight_num_experts,
                 route_num_experts,
+                finish_hook=fc1_finish_hook,
             )
             fc2_emit_tile = partial(
                 self._emit_expert_map_tile,
@@ -8209,6 +8351,7 @@ class W4A16FusedMoeKernel:
                 weight_num_experts,
                 route_num_experts,
             )
+        self._phase_stamp(locks_i32_flat, cta, tid, 1)
         self._moe_body(
             a_bf16_flat,
             a_alt_bf16_flat,
@@ -8246,6 +8389,7 @@ class W4A16FusedMoeKernel:
             active_m,
             fc1_emit_tile,
             fc2_emit_tile,
+            fc1_finish_hook,
         )
 
     @cute.jit
@@ -8287,6 +8431,7 @@ class W4A16FusedMoeKernel:
         active_m: cutlass.Int32,
         fc1_emit_tile: cutlass.Constexpr = None,
         fc2_emit_tile: cutlass.Constexpr = None,
+        fc1_finish_hook: cutlass.Constexpr = None,
     ):
         # Phase assembly shared by the single-tier fused kernel and the hybrid
         # multi-tier entry: zero prologue, FC1, grid barrier, activation, grid
@@ -8336,7 +8481,8 @@ class W4A16FusedMoeKernel:
                     grid_x,
                     active_m,
                 )
-            self._grid_barrier(locks_i32_flat, tid, grid_x)
+            self._grid_barrier(locks_i32_flat, tid, grid_x, cta)
+        self._phase_stamp(locks_i32_flat, cta, tid, 2)
         if cutlass.const_expr(
             self.tc_decode_fused_sum or self.prefill_fused_sum_fp32
         ):
@@ -8387,51 +8533,64 @@ class W4A16FusedMoeKernel:
                 grid_x,
                 active_m,
                 fc1_emit_tile,
+                fc1_finish_hook,
             )
-            self._grid_barrier(locks_i32_flat, tid, grid_x)
-            if cutlass.const_expr(self.full_rotation):
-                if cutlass.const_expr(self.coupled_hadamard):
-                    self._run_activation_coupled(
-                        fc1_bf16_flat,
-                        activated_bf16_flat,
-                        rot_scales_flat,
-                        packed_route_indices,
-                        block_expert_ids,
-                        packed_route_count,
-                        expert_map_flat,
-                        weight_num_experts,
-                        route_num_experts,
-                        tid,
-                        cta,
-                        grid_x,
-                        active_m,
-                    )
+            self._phase_stamp(locks_i32_flat, cta, tid, 3)
+            if cutlass.const_expr(not self.finisher_activation):
+                self._grid_barrier(locks_i32_flat, tid, grid_x, cta)
+                self._phase_stamp(locks_i32_flat, cta, tid, 4)
+                if cutlass.const_expr(self.full_rotation):
+                    if cutlass.const_expr(self.coupled_hadamard):
+                        self._run_activation_coupled(
+                            fc1_bf16_flat,
+                            activated_bf16_flat,
+                            rot_scales_flat,
+                            packed_route_indices,
+                            block_expert_ids,
+                            packed_route_count,
+                            expert_map_flat,
+                            weight_num_experts,
+                            route_num_experts,
+                            tid,
+                            cta,
+                            grid_x,
+                            active_m,
+                        )
+                    else:
+                        self._run_activation_compact(
+                            fc1_bf16_flat,
+                            activated_bf16_flat,
+                            rot_scales_flat,
+                            packed_route_indices,
+                            block_expert_ids,
+                            packed_route_count,
+                            expert_map_flat,
+                            weight_num_experts,
+                            route_num_experts,
+                            tid,
+                            cta,
+                            grid_x,
+                            active_m,
+                        )
                 else:
-                    self._run_activation_compact(
+                    self._run_activation(
                         fc1_bf16_flat,
                         activated_bf16_flat,
                         rot_scales_flat,
-                        packed_route_indices,
-                        block_expert_ids,
-                        packed_route_count,
-                        expert_map_flat,
-                        weight_num_experts,
-                        route_num_experts,
                         tid,
                         cta,
                         grid_x,
                         active_m,
                     )
             else:
-                self._run_activation(
+                self._run_deferred_finisher_activation(
                     fc1_bf16_flat,
                     activated_bf16_flat,
                     rot_scales_flat,
+                    smem_base,
                     tid,
-                    cta,
-                    grid_x,
-                    active_m,
                 )
+            self._phase_stamp(locks_i32_flat, cta, tid, 5)
         else:
             self.fc1._run_persistent_gemm(
                 a_bf16_flat,
@@ -8454,7 +8613,8 @@ class W4A16FusedMoeKernel:
                 active_m,
                 fc1_emit_tile,
             )
-        self._grid_barrier(locks_i32_flat, tid, grid_x)
+        self._grid_barrier(locks_i32_flat, tid, grid_x, cta)
+        self._phase_stamp(locks_i32_flat, cta, tid, 6)
         if cutlass.const_expr(self.collect_activation_amax):
             self._collect_activation_amax_epilogue(
                 a_bf16_flat,
@@ -8472,7 +8632,7 @@ class W4A16FusedMoeKernel:
             )
         if cutlass.const_expr(self.zero_fc2_output):
             self._zero_fc2_output(fc2_bf16_flat, tid, cta, grid_x, active_m)
-            self._grid_barrier(locks_i32_flat, tid, grid_x)
+            self._grid_barrier(locks_i32_flat, tid, grid_x, cta)
         self.fc2._run_persistent_gemm(
             activated_bf16_flat,
             activated_bf16_flat,
@@ -8494,6 +8654,8 @@ class W4A16FusedMoeKernel:
             active_m * Int32(self.top_k),
             fc2_emit_tile,
         )
+        self._phase_stamp(locks_i32_flat, cta, tid, 7)
+
     @cute.jit
     def _sqg_smem_copy(
         self,
@@ -8515,22 +8677,166 @@ class W4A16FusedMoeKernel:
         locks_i32_flat: cute.Tensor,
         tid: Int32,
         grid_x: Int32,
+        cta: Int32,
     ):
         cute.arch.sync_threads()
         if tid == Int32(0):
             count_addr = get_ptr_as_int64(locks_i32_flat, Int32(self.barrier_count_off))
             sense_addr = get_ptr_as_int64(locks_i32_flat, Int32(self.barrier_sense_off))
             old_sense = ld_global_acquire_i32(sense_addr)
-            old_count = atomic_add_global_i32(count_addr, Int32(1))
-            if old_count == grid_x - Int32(1):
-                st_global_i32(count_addr, Int32(0))
-                threadfence()
-                red_add_global_release_i32(sense_addr, Int32(1))
-            else:
+            if cutlass.const_expr(self.hier_barrier):
+                # Two-level arrival: the last CTA of each 16-CTA group arrives
+                # at the grid counter, cutting same-address atomic serialization
+                # from grid_x to about grid_x / 16 + 16 operations per barrier.
+                group = cta // Int32(_HIER_BARRIER_GROUP)
+                group_size = grid_x - group * Int32(_HIER_BARRIER_GROUP)
+                if group_size > Int32(_HIER_BARRIER_GROUP):
+                    group_size = Int32(_HIER_BARRIER_GROUP)
+                groups = (grid_x + Int32(_HIER_BARRIER_GROUP - 1)) // Int32(
+                    _HIER_BARRIER_GROUP
+                )
+                group_addr = get_ptr_as_int64(
+                    locks_i32_flat, Int32(self.hier_barrier_off) + group
+                )
+                old_group = atomic_add_global_i32(group_addr, Int32(1))
+                if old_group == group_size - Int32(1):
+                    st_global_i32(group_addr, Int32(0))
+                    old_count = atomic_add_global_i32(count_addr, Int32(1))
+                    if old_count == groups - Int32(1):
+                        st_global_i32(count_addr, Int32(0))
+                        threadfence()
+                        red_add_global_release_i32(sense_addr, Int32(1))
                 sense = old_sense
                 while sense == old_sense:
                     sense = ld_global_acquire_i32(sense_addr)
+            else:
+                old_count = atomic_add_global_i32(count_addr, Int32(1))
+                if old_count == grid_x - Int32(1):
+                    st_global_i32(count_addr, Int32(0))
+                    threadfence()
+                    red_add_global_release_i32(sense_addr, Int32(1))
+                else:
+                    sense = old_sense
+                    while sense == old_sense:
+                        sense = ld_global_acquire_i32(sense_addr)
         cute.arch.sync_threads()
+
+    @cute.jit
+    def _phase_stamp(
+        self,
+        locks_i32_flat: cute.Tensor,
+        cta: Int32,
+        tid: Int32,
+        slot: cutlass.Constexpr[int],
+    ):
+        """Record ``%globaltimer`` (low 32 bits) for this CTA at a phase edge."""
+        if cutlass.const_expr(self.phase_timers):
+            if tid == Int32(0):
+                locks_i32_flat[
+                    Int64(self.phase_timer_off)
+                    + Int64(cta) * Int64(_PHASE_TIMER_SLOTS)
+                    + Int64(slot)
+                ] = ld_globaltimer_lo_i32()
+
+    @cute.jit
+    def _fc1_finisher_activation(
+        self,
+        fc1_flat: cute.Tensor,
+        activated_flat: cute.Tensor,
+        rotations_flat: cute.Tensor,
+        locks_i32_flat: cute.Tensor,
+        smem_base: Int32,
+        tid: Int32,
+        route: Int32,
+        expert: Int32,
+        n_tile: Int32,
+    ):
+        """FC1 finisher: the second completed slot tile of a coupled block queues it.
+
+        FC1 output columns ``[128p, 128p + 128)`` of both interleaved slots form
+        coupled block ``p``; its slot tiles are FC1 n-tiles ``p`` and
+        ``p + nblk``. Every finisher fences its tile store and counts on the
+        pair flag; the finisher that observes the first count queues
+        ``(route, p, expert)`` in CTA shared memory and resets the flag. The
+        queue drains in ``_run_deferred_finisher_activation`` before this CTA
+        arrives at the pre-FC2 grid barrier, with the unchanged warp-level
+        arithmetic of ``_run_activation_coupled``.
+        """
+        nblk = self.intermediate_size // 128
+        threadfence()
+        cute.arch.sync_threads()
+        if tid < Int32(32):
+            post_block = n_tile - (n_tile // Int32(nblk)) * Int32(nblk)
+            # 0: not the completing finisher; 1: queued; 2: queue full, activate now.
+            decision = Int32(0)
+            if tid == Int32(0):
+                flag_addr = get_ptr_as_int64(
+                    locks_i32_flat,
+                    Int32(self.finisher_flag_off) + route * Int32(nblk) + post_block,
+                )
+                old = atomic_add_global_i32(flag_addr, Int32(1))
+                if old == Int32(1):
+                    st_global_i32(flag_addr, Int32(0))
+                    count_addr = smem_base + Int32(self.finisher_smem_off * 4)
+                    count = ld_shared_i32_relaxed(count_addr)
+                    if count < Int32(_FINISHER_SMEM_ENTRIES):
+                        st_shared_i32(
+                            count_addr + Int32(4) + count * Int32(4),
+                            route | (post_block << Int32(8)) | (expert << Int32(12)),
+                        )
+                        st_shared_i32(count_addr, count + Int32(1))
+                        decision = Int32(1)
+                    else:
+                        decision = Int32(2)
+            decision = cute.arch.shuffle_sync(decision, Int32(0))
+            if decision == Int32(2):
+                threadfence()
+                self._activate_coupled_unit(
+                    fc1_flat,
+                    activated_flat,
+                    rotations_flat,
+                    route,
+                    expert,
+                    post_block,
+                    tid,
+                )
+
+    @cute.jit
+    def _run_deferred_finisher_activation(
+        self,
+        fc1_flat: cute.Tensor,
+        activated_flat: cute.Tensor,
+        rotations_flat: cute.Tensor,
+        smem_base: Int32,
+        tid: Int32,
+    ):
+        """Drain this CTA's queued coupled blocks, one warp per block."""
+        cute.arch.sync_threads()
+        count_addr = smem_base + Int32(self.finisher_smem_off * 4)
+        count = ld_shared_i32_relaxed(count_addr)
+        lane = tid & Int32(31)
+        warp = tid >> Int32(5)
+        warps = Int32(self.cta_threads // 32)
+        threadfence()
+        entry = warp
+        while entry < count:
+            packed = ld_shared_i32_relaxed(count_addr + Int32(4) + entry * Int32(4))
+            route = packed & Int32(255)
+            post_block = (packed >> Int32(8)) & Int32(15)
+            expert = packed >> Int32(12)
+            self._activate_coupled_unit(
+                fc1_flat,
+                activated_flat,
+                rotations_flat,
+                route,
+                expert,
+                post_block,
+                lane,
+            )
+            entry += warps
+        cute.arch.sync_threads()
+        if tid == Int32(0):
+            st_shared_i32(count_addr, Int32(0))
 
     @cute.jit
     def _run_input_rotation(
@@ -8897,6 +9203,102 @@ class W4A16FusedMoeKernel:
         return h0, h1, h2, h3
 
     @cute.jit
+    def _activate_coupled_unit(
+        self,
+        fc1_flat: cute.Tensor,
+        activated_flat: cute.Tensor,
+        rotations_flat: cute.Tensor,
+        row: Int32,
+        expert: Int32,
+        post_block: Int32,
+        lane: Int32,
+    ):
+        """One warp activates one coupled 128-coordinate block of one route.
+
+        Moved verbatim out of ``_run_activation_coupled`` so the FC1 finisher
+        path executes the identical instruction sequence.
+        """
+        p0 = post_block * Int32(2)
+        a0, a1, a2, a3 = self._load_coupled_pre_quad(
+            fc1_flat, rotations_flat, row, expert, p0, lane
+        )
+        b0, b1, b2, b3 = self._load_coupled_pre_quad(
+            fc1_flat, rotations_flat, row, expert, p0 + Int32(1), lane
+        )
+        if cutlass.const_expr(self.activation_is_situ):
+            beta = cutlass.Float32(SITU_DEFAULT_BETA)
+            linear_beta = cutlass.Float32(SITU_DEFAULT_LINEAR_BETA)
+            aa0 = (
+                beta
+                * cute.math.tanh(a0 / beta, fastmath=self.fast_math)
+                * self._sigmoid_f32(a0)
+                * linear_beta
+                * cute.math.tanh(a1 / linear_beta, fastmath=self.fast_math)
+            )
+            aa1 = (
+                beta
+                * cute.math.tanh(a2 / beta, fastmath=self.fast_math)
+                * self._sigmoid_f32(a2)
+                * linear_beta
+                * cute.math.tanh(a3 / linear_beta, fastmath=self.fast_math)
+            )
+            bb0 = (
+                beta
+                * cute.math.tanh(b0 / beta, fastmath=self.fast_math)
+                * self._sigmoid_f32(b0)
+                * linear_beta
+                * cute.math.tanh(b1 / linear_beta, fastmath=self.fast_math)
+            )
+            bb1 = (
+                beta
+                * cute.math.tanh(b2 / beta, fastmath=self.fast_math)
+                * self._sigmoid_f32(b2)
+                * linear_beta
+                * cute.math.tanh(b3 / linear_beta, fastmath=self.fast_math)
+            )
+        else:
+            aa0 = self._silu_f32(a0) * a1
+            aa1 = self._silu_f32(a2) * a3
+            bb0 = self._silu_f32(b0) * b1
+            bb1 = self._silu_f32(b2) * b3
+
+        source0 = (lane & Int32(15)) << Int32(1)
+        source1 = source0 + Int32(1)
+        av0 = cute.arch.shuffle_sync(aa0, source0)
+        av1 = cute.arch.shuffle_sync(aa1, source0)
+        av2 = cute.arch.shuffle_sync(aa0, source1)
+        av3 = cute.arch.shuffle_sync(aa1, source1)
+        bv0 = cute.arch.shuffle_sync(bb0, source0)
+        bv1 = cute.arch.shuffle_sync(bb1, source0)
+        bv2 = cute.arch.shuffle_sync(bb0, source1)
+        bv3 = cute.arch.shuffle_sync(bb1, source1)
+        v0, v1, v2, v3 = av0, av1, av2, av3
+        if lane >= Int32(16):
+            v0, v1, v2, v3 = bv0, bv1, bv2, bv3
+
+        isz = Int32(self.intermediate_size)
+        col0 = post_block * Int32(128) + lane * Int32(4)
+        rot_base = expert * Int32(6 * self.intermediate_size)
+        sign_base = rot_base + Int32(5 * self.intermediate_size) + col0
+        v0 *= rotations_flat[sign_base + Int32(0)].to(cutlass.Float32)
+        v1 *= rotations_flat[sign_base + Int32(1)].to(cutlass.Float32)
+        v2 *= rotations_flat[sign_base + Int32(2)].to(cutlass.Float32)
+        v3 *= rotations_flat[sign_base + Int32(3)].to(cutlass.Float32)
+        v0, v1, v2, v3 = self._had128_quad(v0, v1, v2, v3, lane)
+
+        down_base = rot_base + Int32(2 * self.intermediate_size) + col0
+        v0 *= rotations_flat[down_base + Int32(0)].to(cutlass.Float32)
+        v1 *= rotations_flat[down_base + Int32(1)].to(cutlass.Float32)
+        v2 *= rotations_flat[down_base + Int32(2)].to(cutlass.Float32)
+        v3 *= rotations_flat[down_base + Int32(3)].to(cutlass.Float32)
+        v0, v1, v2, v3 = self._had128_quad(v0, v1, v2, v3, lane)
+        out_base = row * isz + col0
+        activated_flat[out_base + Int32(0)] = self._cast_elem(v0)
+        activated_flat[out_base + Int32(1)] = self._cast_elem(v1)
+        activated_flat[out_base + Int32(2)] = self._cast_elem(v2)
+        activated_flat[out_base + Int32(3)] = self._cast_elem(v3)
+
+    @cute.jit
     def _run_activation_coupled(
         self,
         fc1_flat: cute.Tensor,
@@ -8946,85 +9348,15 @@ class W4A16FusedMoeKernel:
                 and expert >= Int32(0)
                 and expert < weight_num_experts
             ):
-                p0 = post_block * Int32(2)
-                a0, a1, a2, a3 = self._load_coupled_pre_quad(
-                    fc1_flat, rotations_flat, row, expert, p0, lane
+                self._activate_coupled_unit(
+                    fc1_flat,
+                    activated_flat,
+                    rotations_flat,
+                    row,
+                    expert,
+                    post_block,
+                    lane,
                 )
-                b0, b1, b2, b3 = self._load_coupled_pre_quad(
-                    fc1_flat, rotations_flat, row, expert, p0 + Int32(1), lane
-                )
-                if cutlass.const_expr(self.activation_is_situ):
-                    beta = cutlass.Float32(SITU_DEFAULT_BETA)
-                    linear_beta = cutlass.Float32(SITU_DEFAULT_LINEAR_BETA)
-                    aa0 = (
-                        beta
-                        * cute.math.tanh(a0 / beta, fastmath=self.fast_math)
-                        * self._sigmoid_f32(a0)
-                        * linear_beta
-                        * cute.math.tanh(a1 / linear_beta, fastmath=self.fast_math)
-                    )
-                    aa1 = (
-                        beta
-                        * cute.math.tanh(a2 / beta, fastmath=self.fast_math)
-                        * self._sigmoid_f32(a2)
-                        * linear_beta
-                        * cute.math.tanh(a3 / linear_beta, fastmath=self.fast_math)
-                    )
-                    bb0 = (
-                        beta
-                        * cute.math.tanh(b0 / beta, fastmath=self.fast_math)
-                        * self._sigmoid_f32(b0)
-                        * linear_beta
-                        * cute.math.tanh(b1 / linear_beta, fastmath=self.fast_math)
-                    )
-                    bb1 = (
-                        beta
-                        * cute.math.tanh(b2 / beta, fastmath=self.fast_math)
-                        * self._sigmoid_f32(b2)
-                        * linear_beta
-                        * cute.math.tanh(b3 / linear_beta, fastmath=self.fast_math)
-                    )
-                else:
-                    aa0 = self._silu_f32(a0) * a1
-                    aa1 = self._silu_f32(a2) * a3
-                    bb0 = self._silu_f32(b0) * b1
-                    bb1 = self._silu_f32(b2) * b3
-
-                source0 = (lane & Int32(15)) << Int32(1)
-                source1 = source0 + Int32(1)
-                av0 = cute.arch.shuffle_sync(aa0, source0)
-                av1 = cute.arch.shuffle_sync(aa1, source0)
-                av2 = cute.arch.shuffle_sync(aa0, source1)
-                av3 = cute.arch.shuffle_sync(aa1, source1)
-                bv0 = cute.arch.shuffle_sync(bb0, source0)
-                bv1 = cute.arch.shuffle_sync(bb1, source0)
-                bv2 = cute.arch.shuffle_sync(bb0, source1)
-                bv3 = cute.arch.shuffle_sync(bb1, source1)
-                v0, v1, v2, v3 = av0, av1, av2, av3
-                if lane >= Int32(16):
-                    v0, v1, v2, v3 = bv0, bv1, bv2, bv3
-
-                isz = Int32(self.intermediate_size)
-                col0 = post_block * Int32(128) + lane * Int32(4)
-                rot_base = expert * Int32(6 * self.intermediate_size)
-                sign_base = rot_base + Int32(5 * self.intermediate_size) + col0
-                v0 *= rotations_flat[sign_base + Int32(0)].to(cutlass.Float32)
-                v1 *= rotations_flat[sign_base + Int32(1)].to(cutlass.Float32)
-                v2 *= rotations_flat[sign_base + Int32(2)].to(cutlass.Float32)
-                v3 *= rotations_flat[sign_base + Int32(3)].to(cutlass.Float32)
-                v0, v1, v2, v3 = self._had128_quad(v0, v1, v2, v3, lane)
-
-                down_base = rot_base + Int32(2 * self.intermediate_size) + col0
-                v0 *= rotations_flat[down_base + Int32(0)].to(cutlass.Float32)
-                v1 *= rotations_flat[down_base + Int32(1)].to(cutlass.Float32)
-                v2 *= rotations_flat[down_base + Int32(2)].to(cutlass.Float32)
-                v3 *= rotations_flat[down_base + Int32(3)].to(cutlass.Float32)
-                v0, v1, v2, v3 = self._had128_quad(v0, v1, v2, v3, lane)
-                out_base = row * isz + col0
-                activated_flat[out_base + Int32(0)] = self._cast_elem(v0)
-                activated_flat[out_base + Int32(1)] = self._cast_elem(v1)
-                activated_flat[out_base + Int32(2)] = self._cast_elem(v2)
-                activated_flat[out_base + Int32(3)] = self._cast_elem(v3)
             unit += gw_stride
 
     @cute.jit
@@ -11574,8 +11906,9 @@ def compile_w4a16_fused_moe(
     )
     locks_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (_reference_grouped.workspace_layout(intermediate_size).words
-         if kernel.reference_grouped else 4 * 256 + 2,),
+        ((_reference_grouped.workspace_layout(intermediate_size).words
+          if kernel.reference_grouped else 4 * 256 + 2)
+         + w4a16_resident_workspace_extension_words(256),),
         assumed_align=16,
     )
     rot_scales_fake = make_ptr(
@@ -12512,9 +12845,17 @@ def _w4a16_fused_moe_launch_flat(
             stream=stream_int,
             include_fc1=fused.reference_grouped_fc1,
         )
+        # The standalone builder clears only the resident header; the
+        # experiment extension (barrier groups, finisher flags) self-resets
+        # after its first zeroed launch on this workspace.
+        _clear_resident_extension(workspace)
     elif (
         full_rotation and hidden_size == 3584 and intermediate_size in (256, 384)
-        and workspace.numel() == _reference_grouped.workspace_layout(intermediate_size).words
+        and workspace.numel()
+        == _reference_grouped.workspace_layout(intermediate_size).words
+        + w4a16_resident_workspace_extension_words(
+            int(torch.cuda.get_device_properties(workspace.device).multi_processor_count)
+        )
     ):
         # M1, M16 and prefill retain the ordinary launch while sharing the
         # extended arena. They have no builder, so initialize the header here.
@@ -12665,6 +13006,23 @@ def _resident_header_host_clear_every_launch() -> bool:
     return os.environ.get("B12X_W4A16_HEADER_HOST_CLEAR", "1") != "0"
 
 
+_RESIDENT_EXTENSION_CLEARED: set[tuple[int, int]] = set()
+
+
+def _clear_resident_extension(workspace: torch.Tensor) -> None:
+    """Zero the experiment extension region once per workspace storage."""
+    extension = w4a16_resident_workspace_extension_words(
+        int(torch.cuda.get_device_properties(workspace.device).multi_processor_count)
+    )
+    if not extension:
+        return
+    key = (int(workspace.data_ptr()), int(workspace.device.index or 0))
+    if key in _RESIDENT_EXTENSION_CLEARED:
+        return
+    workspace[workspace.numel() - extension :].zero_()
+    _RESIDENT_EXTENSION_CLEARED.add(key)
+
+
 def _clear_resident_header(workspace: torch.Tensor) -> None:
     """Zero the resident-grid header (locks, barrier count and sense).
 
@@ -12673,13 +13031,20 @@ def _clear_resident_header(workspace: torch.Tensor) -> None:
     those captured into CUDA graphs, rely on the kernel's own resets. A
     captured graph therefore carries no fill node before the MoE kernel.
     """
+    extension = w4a16_resident_workspace_extension_words(
+        int(torch.cuda.get_device_properties(workspace.device).multi_processor_count)
+    )
     if _resident_header_host_clear_every_launch():
         workspace[:_reference_grouped.HEADER_WORDS].zero_()
+        if extension:
+            workspace[workspace.numel() - extension :].zero_()
         return
     key = (int(workspace.data_ptr()), int(workspace.device.index or 0))
     if key in _RESIDENT_HEADER_CLEARED:
         return
     workspace[:_reference_grouped.HEADER_WORDS].zero_()
+    if extension:
+        workspace[workspace.numel() - extension :].zero_()
     _RESIDENT_HEADER_CLEARED.add(key)
 
 

@@ -2144,6 +2144,24 @@ def ld_global_acquire_i32(addr: Int64, *, loc=None, ip=None) -> Int32:
 
 
 @dsl_user_op
+def ld_globaltimer_lo_i32(*, loc=None, ip=None) -> Int32:
+    """Read the low 32 bits of the nanosecond ``%globaltimer`` register."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [],
+            "mov.u32 $0, %globaltimer_lo;",
+            "=r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def st_global_release_i32(addr: Int64, val: Int32, *, loc=None, ip=None):
     """Store int32 to global memory with release semantics."""
     llvm.inline_asm(
