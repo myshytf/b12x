@@ -2386,6 +2386,51 @@ def test_unified_decode_glm_fastpath_bit_identical(monkeypatch, num_tokens, topk
 
 
 @torch.inference_mode()
+@pytest.mark.parametrize("num_tokens,topk", [(1, 512), (4, 2048)])
+@pytest.mark.parametrize("order", ["cache", "reversed", "displaced"])
+def test_unified_decode_glm_contiguous_chunk_bit_identical(
+    monkeypatch, num_tokens, topk, order
+) -> None:
+    """``B12X_MLA_SM120_GLM_CONTIG_CHUNK=1`` stages a chunk of adjacent records
+    with one bulk copy. Candidates in cache order take that copy for every
+    full chunk; partial chunks (the mixed row lengths) and candidates in
+    another order take the row copies: ``reversed`` fails the check of the
+    chunk's first slot, ``displaced`` takes one record of every chunk from the
+    neighbouring chunk, which only the lane that owns that entry can see. The
+    staged bytes are the same, so the output is bit-identical to the fast path
+    without the switch."""
+    device = require_b12x_sparse_mla()
+    import b12x.attention._shared.mla.kernel as launch
+
+    def candidates(kv_cache_flat, q, idx):
+        slots = torch.arange(idx.shape[1], dtype=idx.dtype, device=idx.device)
+        chunks = slots.view(-1, 64)
+        if order == "reversed":
+            chunks = chunks.flip(-1)
+        elif order == "displaced":
+            chunks = chunks.clone()
+            chunks[:, 40] = chunks.view(-1, 2, 64).flip(1).reshape(-1, 64)[:, 40]
+        idx.copy_(chunks.reshape(-1).expand_as(idx))
+
+    forced = min((topk + 63) // 64, 8)
+    monkeypatch.setenv("B12X_MLA_SM120_GLM_FASTPATH", "1")
+    monkeypatch.delenv("B12X_MLA_SM120_GLM_CONTIG_CHUNK", raising=False)
+    rows, exp, lengths = _run_glm_multitoken(
+        device, topk=topk, num_tokens=num_tokens, forced_num_splits=forced,
+        seed=7900 + num_tokens, split_policy="balanced", cache_hook=candidates,
+    )
+    assert launch.LAST_DECODE_PLAN.get("glm_contig_chunk") is False
+    monkeypatch.setenv("B12X_MLA_SM120_GLM_CONTIG_CHUNK", "1")
+    chunk, _, _ = _run_glm_multitoken(
+        device, topk=topk, num_tokens=num_tokens, forced_num_splits=forced,
+        seed=7900 + num_tokens, split_policy="balanced", cache_hook=candidates,
+    )
+    assert launch.LAST_DECODE_PLAN.get("glm_contig_chunk") is True
+    assert torch.equal(rows, chunk)
+    _assert_glm_rows_match_reference(chunk, exp, lengths, label="glm_contig_chunk")
+
+
+@torch.inference_mode()
 @pytest.mark.parametrize("num_tokens", [1, 4])
 def test_unified_decode_glm_serial_chunks_rescale_late_maximum(num_tokens) -> None:
     """A split that walks several chunks serially must rescale its accumulators
