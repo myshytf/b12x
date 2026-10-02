@@ -52,6 +52,7 @@ from b12x._lib.intrinsics import (
     ld_global_nc_v2_u32,
     shared_ptr_to_u32,
     st_shared_u32,
+    warp_reduce,
 )
 
 # DSV4 KV gmem IO stride: DATA portion only (448 nope + 64 rope * 2B = 576),
@@ -115,6 +116,7 @@ def io_issue_gather(
     split_mbar_arrival: cutlass.Constexpr = False,
     overlap_footer_gather: cutlass.Constexpr = False,
     per_token_latent_scale: cutlass.Constexpr = False,
+    contiguous_chunk: cutlass.Constexpr = False,
 ):
     """Producer body for ONE chunk into buffer ``buf`` (caller selects the dst
     addrs + full_mbar_ptr for ``buf``). Mirrors FlashInfer ``issue_gather``:
@@ -146,6 +148,14 @@ def io_issue_gather(
     stride_extra_kv_block. The smem dst layout + per-entry byte geometry are
     IDENTICAL across sections, so this body is section-agnostic and the no-extra
     DSV4 / GLM PTX is unchanged (the caller never emits the extra branch).
+
+    ``contiguous_chunk`` (packed GLM, one IO warp): a dense reader hands this
+    kernel candidates in cache order, so the BI records of a chunk are usually
+    adjacent in gmem. The warp then checks that every entry is valid, that
+    entry ``e`` selects slot ``first + e`` and that the chunk stays inside one
+    page, and the leader stages the chunk with one ``BI * 656``-byte copy
+    instead of BI row copies. The staged bytes and their smem addresses are
+    those of the row copies; any other chunk takes the row copies.
     """
     # Section-agnostic gather: ``kv_cache_u8`` / ``topk_indices`` /
     # ``page_block_size`` / ``stride_kv_block`` are THIS section's pool (the caller
@@ -182,6 +192,14 @@ def io_issue_gather(
         _ROPE = Int32(_GLM_ROPE_BYTES)  # 128 -> kv_rope
         _ROPE_SRC = Int64(_GLM_NOPE_SCALE_BYTES)  # rope follows nope+scales
     _FOOT = Int32(scale_bytes_per_token)
+    # One copy per chunk needs the packed row stride in smem (rows adjacent as
+    # in gmem) and a single IO warp (the vote below spans exactly its lanes).
+    one_copy_chunk = bool(
+        contiguous_chunk
+        and packed_glm
+        and io_threads == _IO_THREADS
+        and kv_smem_stride == _GLM_GMEM_STRIDE
+    )
 
     def _issue_payload_entry(entry: Int32, idx_raw: Int32):
         full_mbar_u32 = shared_ptr_to_u32(full_mbar_ptr)
@@ -225,6 +243,9 @@ def io_issue_gather(
         eo = Int32(0)
         for _ in cutlass.range_constexpr((bi + io_threads - 1) // io_threads):
             entry = eo + io_lane
+            if cutlass.const_expr(one_copy_chunk):
+                if row_copies == Int32(0):
+                    entry = Int32(bi)
             if entry < Int32(bi):
                 cand_pos = g_start + entry
                 idx_raw = Int32(-1)
@@ -309,6 +330,17 @@ def io_issue_gather(
             cute.arch.mbarrier_arrive(full_mbar_ptr)
         return
 
+    if cutlass.const_expr(one_copy_chunk):
+        # This lane's entries continue the chunk's first slot (voted below).
+        adjacent = Int32(0)
+        first_idx = Int32(0)
+        if g_end - g_start == Int32(bi):
+            first_idx = Int32(_section_idx[g_start])
+            if first_idx >= Int32(0):
+                first_local = first_idx - (first_idx // _section_pbs) * _section_pbs
+                if first_local + Int32(bi) <= _section_pbs:
+                    adjacent = Int32(1)
+
     # --- (1) per-entry validity index staging + (DSV4 only) scalar footer gather. ---
     eo = Int32(0)
     for _ in cutlass.range_constexpr((bi + io_threads - 1) // io_threads):
@@ -320,6 +352,9 @@ def io_issue_gather(
                 idx_raw = Int32(_section_idx[cand_pos])
             # gap #9: stage the raw index (incl -1) for the S3 consumer mask.
             token_idx_view[entry] = idx_raw
+            if cutlass.const_expr(one_copy_chunk):
+                if idx_raw != first_idx + entry:
+                    adjacent = Int32(0)
             if cutlass.const_expr(scale_format == 0):
                 # DSV4 grouped UE8M0 footer -> contiguous smem kv_sc. GLM has no
                 # footer (inline scales travel in the kv_fp8 nope bulk).
@@ -383,4 +418,21 @@ def io_issue_gather(
                 cute.arch.mbarrier_arrive_and_expect_tx(
                     full_mbar_ptr, Int32(bulk_tx_bytes)
                 )
+        if cutlass.const_expr(one_copy_chunk):
+            # Uniform across the warp: every lane holds the vote's result.
+            row_copies = Int32(1)
+            if warp_reduce(adjacent, lambda a, b: a & b) != Int32(0):
+                row_copies = Int32(0)
+                if io_lane == Int32(0):
+                    block_idx = first_idx // _section_pbs
+                    local_idx = first_idx - block_idx * _section_pbs
+                    cp_async_bulk_g2s_mbar(
+                        kv_fp8_dst_addr,
+                        get_ptr_as_int64(
+                            _section_kv,
+                            Int64(block_idx) * _section_stride + Int64(local_idx) * _IOS,
+                        ),
+                        Int32(bulk_tx_bytes),
+                        shared_ptr_to_u32(full_mbar_ptr),
+                    )
         _issue_payload()

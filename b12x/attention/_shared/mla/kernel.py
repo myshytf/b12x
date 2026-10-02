@@ -288,6 +288,7 @@ def _wave_balanced_num_splits(
 _MLA_SM120_BALANCED_WAVES_ENV = "B12X_MLA_SM120_BALANCED_WAVES"
 _MLA_SM120_GLM_FASTPATH_ENV = "B12X_MLA_SM120_GLM_FASTPATH"
 _MLA_SM120_GLM_W_HW_DEQUANT_ENV = "B12X_MLA_SM120_GLM_W_HW_DEQUANT"
+_MLA_SM120_GLM_CONTIG_CHUNK_ENV = "B12X_MLA_SM120_GLM_CONTIG_CHUNK"
 
 
 def _env_glm_w_hw_dequant_enabled() -> bool:
@@ -298,6 +299,18 @@ def _env_glm_w_hw_dequant_enabled() -> bool:
     Off by default; requires the fast path.
     """
     raw = os.environ.get(_MLA_SM120_GLM_W_HW_DEQUANT_ENV)
+    return raw is not None and raw.strip().lower() in {"1", "true", "on", "yes"}
+
+
+def _env_glm_contig_chunk_enabled() -> bool:
+    """GLM fast path: stage a chunk whose records are adjacent in the cache
+    with one bulk copy (io.io_issue_gather ``contiguous_chunk``).
+
+    A dense reader lists its candidates in cache order, so nearly every chunk
+    qualifies. Bit-identical; off by default so existing compile keys and PTX
+    are unchanged. Requires the fast path.
+    """
+    raw = os.environ.get(_MLA_SM120_GLM_CONTIG_CHUNK_ENV)
     return raw is not None and raw.strip().lower() in {"1", "true", "on", "yes"}
 
 
@@ -465,6 +478,7 @@ class UnifiedDecodeKernel:
         glm_fastpath=False,
         glm_w_hw_dequant=False,
         q_packed=False,
+        glm_contig_chunk=False,
     ):
         self.traits = traits
         self.layout = layout
@@ -487,6 +501,10 @@ class UnifiedDecodeKernel:
         # Hardware E4M3 -> f16 reconstruction of the W HIGH byte for the LOW
         # residual (fast path only; not bit-identical to the software expansion).
         self.glm_w_hw_dequant = bool(glm_w_hw_dequant and self.glm_fastpath)
+        # One bulk copy per chunk of adjacent records (fast path, single cache).
+        self.glm_contig_chunk = bool(
+            glm_contig_chunk and self.glm_fastpath and not has_extra
+        )
         # Packed query: q_all is a uint8 (rows, heads, 656) record per head
         # (E4M3 nope, four fp32 pow2 tile scales, bf16 rope) and S0 copies it
         # into the Q stages instead of quantizing a bf16 query (GLM generic
@@ -1866,6 +1884,7 @@ class UnifiedDecodeKernel:
                     packed_dsv4=self.native_dsv4_h8 or self.native_dsv4_h16,
                     overlap_footer_gather=self.native_dsv4_h16,
                     per_token_latent_scale=t.latent_scale_per_token,
+                    contiguous_chunk=self.glm_contig_chunk,
                 )
                 # Per-chunk section dispatch (DSV4 dual-cache; FlashInfer
                 # decode_dsv4 :243-322). chunks [0, num_main_chunks) gather from the
@@ -2627,6 +2646,7 @@ def _sparse_mla_decode_grid_flat_launch(
         )
     glm_fastpath = _env_glm_fastpath_enabled()
     glm_w_hw_dequant = _env_glm_w_hw_dequant_enabled()
+    glm_contig_chunk = _env_glm_contig_chunk_enabled()
     heads = int(q_all.shape[1])
     native_glm_h8 = bool(
         int(model_type) == int(ModelType.GLM_NSA)
@@ -2771,6 +2791,7 @@ def _sparse_mla_decode_grid_flat_launch(
         glm_fastpath=glm_fastpath,
         glm_w_hw_dequant=glm_w_hw_dequant,
         q_packed=q_packed,
+        glm_contig_chunk=glm_contig_chunk,
     )
     if q_packed and not kernel.q_packed:
         raise ValueError(
@@ -2783,6 +2804,8 @@ def _sparse_mla_decode_grid_flat_launch(
         key_field("glm_fastpath", int(kernel.glm_fastpath)),
         key_field("glm_w_hw_dequant", int(kernel.glm_w_hw_dequant)),
         key_field("q_packed", int(kernel.q_packed)),
+        # Present only when on: launches without it keep their compile keys.
+        *([key_field("glm_contig_chunk", 1)] if kernel.glm_contig_chunk else []),
         key_field("compute_mode", traits.compute_mode),
         key_field("scale_format", traits.scale_format),
         key_field("fp8_rope", int(traits.fp8_rope)),
@@ -3419,6 +3442,11 @@ def run_unified_decode(
             if workspace.tmp_output is not None
             else None
         ),
+    )
+    LAST_DECODE_PLAN["glm_contig_chunk"] = bool(
+        _env_glm_contig_chunk_enabled()
+        and LAST_DECODE_PLAN["glm_fastpath"]
+        and not has_extra
     )
     # Workspace mid_out/mid_lse must hold num_splits partials per (token, head).
     if num_splits > max_chunks:
